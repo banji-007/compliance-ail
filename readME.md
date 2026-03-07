@@ -7,7 +7,7 @@ As AI agents transition from conversational chatbots to autonomous entities exec
 ## 🚀 The Value Proposition
 
 * **⚡ Framework Agnostic Interception:** AIL operates as an independent middleware layer. It intercepts structured `tool_calls` from any major agent framework (LangGraph, AutoGen, smolagents) *before* execution, requiring zero modifications to the underlying LLM logic.
-* **⚖️ Deterministic Policy Enforcement:** Bypasses LLM hallucinations by routing all intents through Open Policy Agent (OPA). Legal and security teams can define hardcoded, deterministic Rego policies (e.g., spending limits, data residency) that actively block unauthorized agent actions. *(See [Policy Engine Documentation](policy/README_OPA.md) for details).*
+* **⚖️ Deterministic Policy Enforcement:** Bypasses LLM hallucinations by routing all intents through Open Policy Agent (OPA). Legal and security teams can define hardcoded, deterministic Rego policies (e.g., spending limits, data residency) that actively block unauthorized agent actions. *(See [Policy Engine Documentation](main/README_OPA.md) for details).*
 * **🔒 Cryptographic Proof of Intent:** Every intercepted action—both approved and denied—is logged to a local SQLite ledger using SHA-256 hash chaining. This provides enterprise auditors with an unalterable history of what the agent *intended* to do, the policy's decision, and the final execution state.
 
 ## 🛠️ Architecture
