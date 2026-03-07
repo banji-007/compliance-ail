@@ -33,6 +33,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+.windsurfrules
 
 # OS
 .DS_Store
