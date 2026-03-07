@@ -1,0 +1,14 @@
+services:
+  opa:
+    image: openpolicyagent/opa:latest
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--log-format=text"
+      - "--log-level=info"
+      - "--addr=0.0.0.0:8181"
+      - "/policy/cloud_policy.rego"
+    volumes:
+      - ./policy:/policy

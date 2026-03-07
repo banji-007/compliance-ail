@@ -29,6 +29,8 @@ def query_opa_policy(tool_name, tool_args):
             timeout=5
         )
 
+        print(f"[OPA DEBUG] status={response.status_code} body={response.text}")
+
         if response.status_code == 200:
             result = response.json()
             return result.get("result", {})
@@ -36,8 +38,11 @@ def query_opa_policy(tool_name, tool_args):
             # Fail-closed: non-200 treated as policy engine unavailable
             return _DENIED_UNAVAILABLE
 
-    except requests.exceptions.RequestException:
-        # Fail-closed: connection failure treated as policy engine unavailable
+    except requests.exceptions.ConnectionError as e:
+        print(f"[OPA DEBUG] Connection error (OPA not running?): {e}")
+        return _DENIED_UNAVAILABLE
+    except requests.exceptions.RequestException as e:
+        print(f"[OPA DEBUG] Request error: {e}")
         return _DENIED_UNAVAILABLE
 
 def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
