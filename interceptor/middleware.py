@@ -1,12 +1,19 @@
 import json
+import sys
+import os
 
-def intercept_tool_call(tool_name, tool_args):
+# Add the ledger directory to the path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ledger'))
+from sqlite_ledger import get_ledger
+
+def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     """
     Intercept and validate tool calls before execution.
     
     Args:
         tool_name (str): Name of the tool being called
         tool_args (dict): Arguments passed to the tool
+        agent_id (str): Identifier for the agent making the call
         
     Returns:
         dict: Response with 'status' and 'message' keys
@@ -36,6 +43,17 @@ def intercept_tool_call(tool_name, tool_args):
         }
     
     print(f"Interceptor decision: {response['status']} - {response['message']}")
+    
+    # Log to immutable ledger
+    ledger = get_ledger()
+    ledger.log_tool_call(
+        agent_id=agent_id,
+        tool_name=tool_name,
+        payload=tool_args,
+        decision=response["status"]
+    )
+    
+    print("Logged to immutable ledger")
     print("=" * 50)
     
     return response
