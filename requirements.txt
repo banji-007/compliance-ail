@@ -1,3 +1,4 @@
 openai
 python-dotenv
+requests
 # sqlite3 is included in the Python standard library
