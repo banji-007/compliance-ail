@@ -1,7 +1,12 @@
 import os
 import json
+import sys
 from openai import OpenAI
 from dotenv import load_dotenv
+
+# Add the interceptor directory to the path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
+from middleware import intercept_tool_call
 
 # Load environment variables
 load_dotenv()
@@ -54,20 +59,44 @@ class BaseAgent:
         return f"Cloud server provisioning initiated for {instance_type} in {region} at ${cost_per_hour}/hour"
     
     def handle_tool_calls(self, tool_calls):
-        """Handle tool calls from the assistant"""
+        """Handle tool calls from the assistant with interceptor middleware"""
+        tool_results = []
         for tool_call in tool_calls:
             function_name = tool_call.function.name
             function_args = json.loads(tool_call.function.arguments)
             
+            # Pass tool call through interceptor
+            interceptor_response = intercept_tool_call(function_name, function_args)
+            
             if function_name == "provision_cloud_server":
-                result = self.provision_cloud_server(
-                    instance_type=function_args["instance_type"],
-                    region=function_args["region"],
-                    cost_per_hour=function_args["cost_per_hour"]
-                )
-                return result
+                if interceptor_response["status"] == "APPROVED":
+                    result = self.provision_cloud_server(
+                        instance_type=function_args["instance_type"],
+                        region=function_args["region"],
+                        cost_per_hour=function_args["cost_per_hour"]
+                    )
+                    # Add interceptor approval info
+                    result += f"\n[Interceptor: {interceptor_response['message']}]"
+                else:
+                    # Tool call was denied
+                    result = f"Action blocked by interceptor: {interceptor_response['message']}"
+                    
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": function_name,
+                    "content": result
+                })
             else:
-                return f"Unknown tool: {function_name}"
+                result = f"Unknown tool: {function_name}"
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": function_name,
+                    "content": result
+                })
+        
+        return tool_results
     
     def chat_loop(self):
         """Main chat loop"""
@@ -103,24 +132,8 @@ class BaseAgent:
                 
                 # Check if assistant wants to use tools
                 if assistant_message.tool_calls:
-                    # Handle tool calls
-                    tool_results = []
-                    for tool_call in assistant_message.tool_calls:
-                        function_name = tool_call.function.name
-                        function_args = json.loads(tool_call.function.arguments)
-                        
-                        if function_name == "provision_cloud_server":
-                            result = self.provision_cloud_server(
-                                instance_type=function_args["instance_type"],
-                                region=function_args["region"],
-                                cost_per_hour=function_args["cost_per_hour"]
-                            )
-                            tool_results.append({
-                                "tool_call_id": tool_call.id,
-                                "role": "tool",
-                                "name": function_name,
-                                "content": result
-                            })
+                    # Handle tool calls with interceptor
+                    tool_results = self.handle_tool_calls(assistant_message.tool_calls)
                     
                     # Send tool results back to assistant
                     self.messages.extend(tool_results)
