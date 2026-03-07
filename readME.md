@@ -29,7 +29,7 @@ As AI agents transition from conversational chatbots to autonomous entities exec
 ### 1. Installation
 Clone the repository and install the required dependencies:
 ```bash
-git clone [https://github.com/yourusername/compliance-ail.git](https://github.com/yourusername/compliance-ail.git)
+git clone [https://github.com/banji-007/compliance-ail.git](https://github.com/banji-007/compliance-ail.git)
 cd compliance-ail
 python -m venv venv
 
