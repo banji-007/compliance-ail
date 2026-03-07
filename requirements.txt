@@ -1,4 +1,6 @@
 openai
 python-dotenv
 requests
+langgraph
+langchain-openai
 # sqlite3 is included in the Python standard library
