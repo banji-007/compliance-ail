@@ -1,0 +1,14 @@
+# Project Context: Agentic Integrity Ledger (AIL)
+You are an expert Python systems architect. We are building the Agentic Integrity Ledger (AIL), a middleware compliance layer that intercepts, audits, and enforces policies on AI agent tool calls BEFORE they execute. 
+
+# Core Architectural Directives:
+1. THE MIDDLEWARE PATTERN: The AIL must operate completely independently of the AI agent's internal logic. Do not tightly couple the policy enforcement to the LLM's prompt. The agent outputs a tool call, the AIL intercepts it, checks it, and returns an Approved/Denied signal.
+2. ZERO BLOAT: Strictly avoid heavy AI frameworks like LangChain or LlamaIndex unless explicitly asked. Use the standard OpenAI Python SDK, native JSON parsing, and standard HTTP requests.
+3. IMMUTABILITY FIRST: All intercepted tool calls (both approved and denied) must be logged to the SQLite ledger. Every log entry must include a SHA-256 hash that chains to the previous entry's hash to simulate cryptographic immutability.
+4. DETERMINISTIC ENFORCEMENT: Policy decisions must be deterministic. Do not use an LLM to evaluate if a tool call is safe. Use hardcoded Python logic or Open Policy Agent (OPA/Rego) for all compliance checks.
+
+# Coding Style:
+- Keep everything in modular layers: /agent, /interceptor, /ledger, /policy.
+- Prefer the Python Standard Library wherever possible.
+- Write robust error handling for JSON parsing and API failures.
+- Print clear, human-readable terminal outputs showing the step-by-step flow: [Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] -> [Ledger Hash] -> [Execution/Block].

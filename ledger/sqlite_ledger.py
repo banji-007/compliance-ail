@@ -212,3 +212,14 @@ def get_ledger() -> SQLiteLedger:
     if _ledger_instance is None:
         _ledger_instance = SQLiteLedger()
     return _ledger_instance
+
+
+if __name__ == "__main__":
+    import os
+
+    db_path = os.path.join(os.path.dirname(__file__), "..", "compliance_ledger.db")
+    db_path = os.path.normpath(db_path)
+
+    ledger = SQLiteLedger(db_path=db_path)
+    ledger.print_ledger()
+    ledger.close()

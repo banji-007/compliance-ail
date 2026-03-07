@@ -1,18 +1,25 @@
-package compliance.cloud
+package ail.policy
 
-default allow := false
+import rego.v1
 
-allow if {
-    input.action == "provision_cloud_server"
-    input.cost_per_hour < 10
-    input.region == "us-east-1"
+deny contains msg if {
+    payload := input.tool_args
+    payload.tags.environment == "prod"
+    not payload.tags.cost_center
+    msg := "DENIED: Production environments must include a 'cost_center' tag."
 }
 
-decision := {
-    "allowed": allow,
-    "reason": reason_message,
+deny contains msg if {
+    payload := input.tool_args
+    blocked_instances := {"p4d.24xlarge", "p5.48xlarge"}
+    blocked_instances[payload.instance_type]
+    not payload.tags.project == "ml-training"
+    msg := sprintf("DENIED: Instance type %v is restricted. 'project' tag must be 'ml-training'.", [payload.instance_type])
 }
 
-reason_message := "Action approved by policy" if {
-    allow
-} else := "Action denied: cost_per_hour must be less than 10 AND region must be us-east-1"
+deny contains msg if {
+    payload := input.tool_args
+    payload.tags.data_classification == "pci-dss"
+    not payload.region == "eu-central-1"
+    msg := "DENIED: Data Residency Violation. 'pci-dss' workloads must run in 'eu-central-1'."
+}
