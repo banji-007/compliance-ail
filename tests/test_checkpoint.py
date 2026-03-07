@@ -5,7 +5,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 # Add the interceptor directory to the path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'interceptor'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
 from middleware import intercept_tool_call
 
 # Load environment variables
@@ -41,7 +41,7 @@ class TestAgentWithInterceptor:
                 }
             }
         ]
-    
+
     def provision_cloud_server(self, instance_type, region, cost_per_hour):
         """Tool function for provisioning cloud servers"""
         tool_call = {
@@ -56,17 +56,17 @@ class TestAgentWithInterceptor:
         print(json.dumps(tool_call, indent=2))
         print("==================\n")
         return f"Cloud server provisioning initiated for {instance_type} in {region} at ${cost_per_hour}/hour"
-    
+
     def handle_tool_calls(self, tool_calls):
         """Handle tool calls from the assistant with interceptor middleware"""
         tool_results = []
         for tool_call in tool_calls:
             function_name = tool_call.function.name
             function_args = json.loads(tool_call.function.arguments)
-            
+
             # Pass tool call through interceptor
             interceptor_response = intercept_tool_call(function_name, function_args)
-            
+
             if function_name == "provision_cloud_server":
                 if interceptor_response["status"] == "APPROVED":
                     result = self.provision_cloud_server(
@@ -79,23 +79,23 @@ class TestAgentWithInterceptor:
                 else:
                     # Tool call was denied
                     result = f"Action blocked by interceptor: {interceptor_response['message']}"
-                    
+
                 tool_results.append({
                     "tool_call_id": tool_call.id,
                     "role": "tool",
                     "name": function_name,
                     "content": result
                 })
-        
+
         return tool_results
-    
+
     def test_prompt(self, prompt):
         """Test a single prompt"""
         print(f"\nTesting prompt: '{prompt}'")
         print("=" * 60)
-        
+
         messages = [{"role": "user", "content": prompt}]
-        
+
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4",
@@ -103,40 +103,40 @@ class TestAgentWithInterceptor:
                 tools=self.tools,
                 tool_choice="auto"
             )
-            
+
             assistant_message = response.choices[0].message
             print(f"Assistant: {assistant_message.content}")
-            
+
             if assistant_message.tool_calls:
                 print("\nTool calls detected:")
                 tool_results = self.handle_tool_calls(assistant_message.tool_calls)
-                
+
                 # Send tool results back to get final response
                 messages.append(assistant_message)
                 messages.extend(tool_results)
-                
+
                 final_response = self.client.chat.completions.create(
                     model="gpt-4",
                     messages=messages
                 )
-                
+
                 final_message = final_response.choices[0].message
                 print(f"Final response: {final_message.content}")
             else:
                 print("No tool calls made.")
-                
+
         except Exception as e:
             print(f"Error: {e}")
 
 if __name__ == "__main__":
     agent = TestAgentWithInterceptor()
-    
+
     # Test 1: $5/hr (should approve)
     print("\n" + "="*80)
     print("CHECKPOINT TEST 1: $5/hr server (should approve)")
     print("="*80)
     agent.test_prompt("Spin up an AWS t3.micro in us-east-1 for $5/hour.")
-    
+
     # Test 2: $50/hr (should deny and apologize)
     print("\n" + "="*80)
     print("CHECKPOINT TEST 2: $50/hr server (should deny and apologize)")
