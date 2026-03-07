@@ -25,7 +25,7 @@ def query_opa_policy(tool_name, tool_args):
     try:
         response = requests.post(
             "http://localhost:8181/v1/data/compliance/cloud/decision",
-            json=opa_input,
+            json={"input": opa_input},
             timeout=5
         )
 
