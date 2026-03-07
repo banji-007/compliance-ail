@@ -24,16 +24,32 @@ def query_opa_policy(tool_name, tool_args):
 
     try:
         response = requests.post(
-            "http://localhost:8181/v1/data/compliance/cloud/decision",
-            json={"input": opa_input},
+            "http://localhost:8181/v1/data/ail/policy",
+            json={"input": {"tool_args": tool_args}},
             timeout=5
         )
 
         print(f"[OPA DEBUG] status={response.status_code} body={response.text}")
 
         if response.status_code == 200:
-            result = response.json()
-            return result.get("result", {})
+            result = response.json().get("result", {})
+            # Evaluate deny array directly
+            deny_messages = result.get("deny", [])
+            if deny_messages:
+                # Return deny items as DENIED string
+                combined_reason = "; ".join(deny_messages)
+                return {
+                    "allowed": False,
+                    "reason": combined_reason,
+                    "deny": deny_messages
+                }
+            else:
+                # Empty deny array means APPROVED
+                return {
+                    "allowed": True,
+                    "reason": "Action approved by policy",
+                    "deny": []
+                }
         else:
             # Fail-closed: non-200 treated as policy engine unavailable
             return _DENIED_UNAVAILABLE
@@ -66,11 +82,21 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
             "status": "APPROVED",
             "message": opa_decision.get("reason", "Action approved by policy")
         }
+        decision_for_ledger = "APPROVED"
     else:
+        # Handle deny messages list from new policy format
+        deny_messages = opa_decision.get("deny", [])
+        if deny_messages:
+            # Join multiple deny messages with semicolons
+            combined_reason = "; ".join(deny_messages)
+        else:
+            combined_reason = opa_decision.get("reason", "Action denied by policy")
+            
         response = {
             "status": "DENIED",
-            "message": opa_decision.get("reason", "Action denied by policy")
+            "message": combined_reason
         }
+        decision_for_ledger = f"DENIED: {combined_reason}"
 
     print(f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] {response['status']}: {response['message']}")
 
@@ -79,7 +105,7 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         agent_id=agent_id,
         tool_name=tool_name,
         payload=tool_args,
-        decision=response["status"]
+        decision=decision_for_ledger
     )
     record_hash = ledger.get_previous_hash()
 
