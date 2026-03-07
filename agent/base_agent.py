@@ -12,8 +12,9 @@ from middleware import intercept_tool_call
 load_dotenv()
 
 class BaseAgent:
-    def __init__(self):
+    def __init__(self, agent_id="base_agent"):
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.agent_id = agent_id
         self.tools = [
             {
                 "type": "function",
@@ -66,7 +67,7 @@ class BaseAgent:
             function_args = json.loads(tool_call.function.arguments)
             
             # Pass tool call through interceptor
-            interceptor_response = intercept_tool_call(function_name, function_args)
+            interceptor_response = intercept_tool_call(function_name, function_args, self.agent_id)
             
             if function_name == "provision_cloud_server":
                 if interceptor_response["status"] == "APPROVED":
