@@ -1,0 +1,3 @@
+openai
+python-dotenv
+# sqlite3 is included in the Python standard library
