@@ -69,32 +69,43 @@ class ServerProvisionInput(BaseModel):
     instance_type: str = Field(..., description="The cloud instance type (e.g., 't3.micro', 'p4d.24xlarge')")
     region: str = Field(..., description="The cloud region where the server should be provisioned (e.g., 'us-east-1', 'eu-central-1')")
     cost_per_hour: float = Field(..., description="The hourly cost in USD for the instance")
-    tags: dict = Field(default_factory=dict, description="A dictionary of metadata tags for policy evaluation. You MUST extract the keys 'environment', 'project', and 'data_classification' from the user prompt and populate them inside this dictionary. Do not leave the tags dictionary empty if the user mentions any of these values. Also include 'cost_center' if mentioned.")
+    environment: str = Field(..., description="Deployment environment extracted from user prompt (e.g., 'prod', 'dev', 'staging')")
+    project: str = Field(default="unspecified", description="Project name extracted from user prompt (e.g., 'ml-training', 'webapp'). Use 'unspecified' if not mentioned.")
+    data_classification: str = Field(default="unspecified", description="Data classification extracted from user prompt (e.g., 'pci-dss', 'internal', 'public'). Use 'unspecified' if not mentioned.")
+    cost_center: str = Field(default="", description="Cost center extracted from user prompt. Leave empty string if not mentioned — the policy engine will enforce it.")
 
-def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict = None) -> str:
+def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict) -> str:
     """Dummy function that simulates cloud server provisioning."""
-    if tags is None:
-        tags = {}
-    
-    env = tags.get('environment', 'unknown')
-    center = tags.get('cost_center', 'unknown')
-    project = tags.get('project', 'unknown')
-    
-    return f"Cloud server provisioned: {instance_type} in {region} at ${cost_per_hour}/hour [env: {env}, center: {center}, project: {project}]"
+    return (
+        f"Cloud server provisioned: {instance_type} in {region} at ${cost_per_hour}/hour "
+        f"[env: {tags.get('environment','unknown')}, cost_center: {tags.get('cost_center','unknown')}, "
+        f"project: {tags.get('project','unknown')}]"
+    )
 
-@tool(args_schema=ServerProvisionInput)
 # ---------------------------------------------------------------------------
 # LangGraph Execution Block
 # ---------------------------------------------------------------------------
 
-# The LLM Coaching Loop is handled natively by LangGraph's ReAct architecture.
-# When middleware returns a DENIED string, the agent reads it as an observation 
-# and self-corrects its approach based on the deterministic policy feedback.
-
-def provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict = None) -> str:
-    """Use this tool immediately to provision a server. You MUST extract the keys 'environment', 'project', and 'data_classification' from the user prompt and populate them inside the tags dictionary. Do not leave the tags dictionary empty if the user mentions them. Do not ask for missing information before calling this tool."""
+@tool(args_schema=ServerProvisionInput)
+def provision_cloud_server(
+    instance_type: str,
+    region: str,
+    cost_per_hour: float,
+    environment: str,
+    project: str = "unspecified",
+    data_classification: str = "unspecified",
+    cost_center: str = "",
+) -> str:
+    """Provision a cloud server. Extract all tag values from the user prompt and pass them as explicit arguments."""
     print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
-    
+
+    tags = {
+        "environment": environment,
+        "project": project,
+        "data_classification": data_classification,
+        "cost_center": cost_center,
+    }
+
     args = {
         "instance_type": instance_type,
         "region": region,
@@ -113,8 +124,16 @@ def provision_cloud_server(instance_type: str, region: str, cost_per_hour: float
     if decision["status"] == "APPROVED":
         result = execute_provision_cloud_server(instance_type, region, cost_per_hour, tags)
         print(f"{pipeline_prefix} -> [Execution] {result}")
+
     else:
-        result = f"BLOCKED by AIL: {decision['message']}"
+        result = (
+            f"BLOCKED by AIL: {decision['message']}\n"
+            f"Original parameters: instance_type={instance_type}, region={region}, "
+            f"cost_per_hour={cost_per_hour}, environment={environment}, "
+            f"project={project}, data_classification={data_classification}, "
+            f"cost_center={cost_center!r}. "
+            f"Retry the tool with these exact parameters corrected as instructed."
+        )
         print(f"{pipeline_prefix} -> [Block] {decision['message']}")
 
     return result
@@ -124,7 +143,7 @@ def provision_cloud_server(instance_type: str, region: str, cost_per_hour: float
 # ---------------------------------------------------------------------------
 
 # Initialize LLM with strict execution system message
-system_message = """You are an execution agent. You must execute the provision_cloud_server tool immediately. You must carefully extract any tags the user mentions (like environment, project, or data_classification) and put them into the tags dictionary. Do not ask for missing info, just execute with what you have."""
+system_message = """You are an execution agent. You must execute the provision_cloud_server tool immediately using the exact instance_type, region, and cost the user specified. Do not substitute a different instance type or region unless the user explicitly asks you to change them. When the user says to fix a denied request, apply only the corrections they state and keep all other parameters the same. Extract all tags the user mentions (environment, project, data_classification, cost_center) and pass them as explicit arguments."""
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools([provision_cloud_server])
 
@@ -193,30 +212,33 @@ if __name__ == "__main__":
     print("Type 'quit' or 'exit' to end the conversation")
     print("Type 'demo' to run predefined test cases")
     print("=" * 70)
-    
+
+    # Persistent conversation history across turns
+    conversation_messages = []
+
     while True:
         try:
             user_input = input("\nUSER: ").strip()
-            
+
             if user_input.lower() in ['quit', 'exit']:
                 print("Goodbye!")
                 break
-            
+
             if user_input.lower() == 'demo':
-                # Run predefined test cases
+                # Run predefined test cases (stateless, each is self-contained)
                 print("\n" + "=" * 70)
                 print("DEMO: Running test cases")
                 print("=" * 70)
-                
+
                 # Should be APPROVED (OPA would allow; OPA unavailable → fail-closed DENIED)
                 run("Provision a t3.micro instance in us-east-1 for $5/hour with tags: environment='prod', cost_center='engineering', project='webapp'.")
-                
+
                 # Should be DENIED (p4d.24xlarge requires project='ml-training' but has 'model-training')
                 run("Provision a p4d.24xlarge instance in us-east-1 for $50/hour with tags: environment='prod', cost_center='ml-research', project='model-training'.")
-                
+
                 # Test complex policy scenario with dev environment
                 run("Provision a t3.small instance in us-west-2 for $8/hour with tags: environment='dev', cost_center='testing', project='cicd'.")
-                
+
                 # Show ledger notice
                 print("\n" + "=" * 70)
                 print("LEDGER NOTICE")
@@ -225,18 +247,21 @@ if __name__ == "__main__":
                 print("ImmuDB is the source of truth for audit records.")
                 print("Use ImmuDB client tools to query the audit trail.")
                 continue
-            
+
             if not user_input:
                 continue
-            
-            # Process user input through LangGraph
+
+            # Process user input through LangGraph, carrying conversation history
             print("\n" + "=" * 70)
             print(f"USER: {user_input}")
             print("=" * 70)
-            result = graph.invoke({"messages": [HumanMessage(content=user_input)]})
-            final = result["messages"][-1].content
+            conversation_messages.append(HumanMessage(content=user_input))
+            result = graph.invoke({"messages": conversation_messages})
+            # Replace history with the full updated message list from the graph
+            conversation_messages = result["messages"]
+            final = conversation_messages[-1].content
             print(f"\nAGENT: {final}")
-            
+
         except KeyboardInterrupt:
             print("\nGoodbye!")
             break
