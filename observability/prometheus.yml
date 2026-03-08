@@ -1,0 +1,24 @@
+# Prometheus Configuration for AIL Observability
+# Epic 4: Real-time CISO Dashboard
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # Add AIL-specific alerting rules here in future
+
+scrape_configs:
+  # OPA Metrics Scrape Job
+  - job_name: 'opa'
+    static_configs:
+      - targets: ['opa:8181']
+    scrape_interval: 5s
+    metrics_path: /metrics
+    # OPA natively exposes Prometheus metrics for policy decisions,
+    # bundle loading, and performance telemetry
+    
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

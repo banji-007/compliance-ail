@@ -1,13 +1,15 @@
 # VERSION: 1.0.0
+# Internal FinOps Framework - Cost Control Rules
 
-package ail.policy
+package ail.frameworks.finops
 
 import rego.v1
 
 deny contains msg if {
     payload := input.tool_args
     payload.tags.environment == "prod"
-    not payload.tags.cost_center
+    # object.get returns "" as default so both missing key and empty string are caught
+    object.get(payload.tags, "cost_center", "") == ""
     msg := "DENIED: Production environments must include a 'cost_center' tag."
 }
 
@@ -21,9 +23,5 @@ deny contains msg if {
     msg := sprintf("DENIED: Instance type %v is restricted. 'project' tag must be 'ml-training'.", [payload.instance_type])
 }
 
-deny contains msg if {
-    payload := input.tool_args
-    payload.tags.data_classification == "pci-dss"
-    not payload.region == "eu-central-1"
-    msg := "DENIED: Data Residency Violation. 'pci-dss' workloads must run in 'eu-central-1'."
-}
+# Additional FinOps rules could be added here
+# Examples: budget enforcement, resource tagging, cost allocation, etc.
