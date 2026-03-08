@@ -8,7 +8,7 @@ echo "OPA will be available at http://localhost:8181"
 docker run -p 8181:8181 \
   -v "$(pwd)/policy:/policy" \
   openpolicyagent/opa:latest \
-  run --server /policy
+  run --server --addr=0.0.0.0:8181 /policy
 
 echo "OPA started. Use 'docker ps' to check the container."
-echo "Test with: curl http://localhost:8181/v1/data/compliance/cloud/decision"
+echo "Test with: curl http://localhost:8181/v1/data/ail/policy"

@@ -1,13 +1,36 @@
 import json
+import logging
 import sys
 import os
+import time
 import requests
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 # Add the ledger directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ledger'))
-from sqlite_ledger import get_ledger
 
-_DENIED_UNAVAILABLE = {"allowed": False, "reason": "Policy Engine Unavailable"}
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
+# Configure retry strategy for OPA requests
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[500, 502, 503, 504]
+)
+
+# Create session with retry adapter
+session = requests.Session()
+session.mount('http://', HTTPAdapter(max_retries=retry_strategy))
+
+_DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
 
 def query_opa_policy(tool_name, tool_args):
     """
@@ -20,16 +43,14 @@ def query_opa_policy(tool_name, tool_args):
     Returns:
         dict: OPA policy decision
     """
-    opa_input = {"action": tool_name, **tool_args}
-
     try:
-        response = requests.post(
+        response = session.post(
             "http://localhost:8181/v1/data/ail/policy",
             json={"input": {"tool_args": tool_args}},
             timeout=5
         )
 
-        print(f"[OPA DEBUG] status={response.status_code} body={response.text}")
+        logging.debug(f"OPA status={response.status_code} body={response.text}")
 
         if response.status_code == 200:
             result = response.json().get("result", {})
@@ -55,10 +76,13 @@ def query_opa_policy(tool_name, tool_args):
             return _DENIED_UNAVAILABLE
 
     except requests.exceptions.ConnectionError as e:
-        print(f"[OPA DEBUG] Connection error (OPA not running?): {e}")
+        logging.error(f"OPA connection error (not running?): {e}")
         return _DENIED_UNAVAILABLE
     except requests.exceptions.RequestException as e:
-        print(f"[OPA DEBUG] Request error: {e}")
+        logging.error(f"OPA request error: {e}")
+        return _DENIED_UNAVAILABLE
+    except Exception as e:
+        logging.error(f"OPA retry failed after 3 attempts: {e}")
         return _DENIED_UNAVAILABLE
 
 def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
@@ -73,7 +97,7 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     Returns:
         dict: Response with 'status', 'message', and 'record_hash' keys
     """
-    print(f"[Agent Request] -> [AIL Intercept] {tool_name} | args={json.dumps(tool_args)}")
+    logging.info(f"Agent Request -> AIL Intercept: {tool_name} | args={json.dumps(tool_args)}")
 
     opa_decision = query_opa_policy(tool_name, tool_args)
 
@@ -98,18 +122,32 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         }
         decision_for_ledger = f"DENIED: {combined_reason}"
 
-    print(f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] {response['status']}: {response['message']}")
+    logging.info(f"Policy Engine Decision: {response['status']}: {response['message']}")
 
-    ledger = get_ledger()
-    ledger.log_tool_call(
-        agent_id=agent_id,
-        tool_name=tool_name,
-        payload=tool_args,
-        decision=decision_for_ledger
-    )
-    record_hash = ledger.get_previous_hash()
-
-    print(f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] -> [Ledger Hash] {record_hash[:16]}...")
+    # Fail-closed: Log to ImmuDB ledger or block execution if unavailable
+    try:
+        from immudb_ledger import get_ledger
+        ledger = get_ledger()
+        
+        # Extract policy version for audit trail
+        policy_version = "1.0.0"
+        
+        ledger.log_tool_call(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            payload=tool_args,
+            decision=f"{decision_for_ledger} (policy: {policy_version})",
+        )
+        record_hash = ledger.get_previous_hash()
+        logging.info(f"Ledger Hash: {record_hash[:16]}")
+    except Exception as e:
+        logging.error(f"ImmuDB ledger unavailable: {e}")
+        # Fail-closed: Block execution if audit ledger is unavailable
+        return {
+            "status": "DENIED",
+            "message": "Audit ledger unavailable. Execution blocked.",
+            "record_hash": "unavailable"
+        }
 
     response["record_hash"] = record_hash
     return response

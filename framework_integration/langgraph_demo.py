@@ -24,10 +24,8 @@ from pydantic import BaseModel, Field
 
 # Add AIL layers to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'ledger'))
 
 from middleware import intercept_tool_call
-from sqlite_ledger import get_ledger
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -44,6 +42,23 @@ load_dotenv()
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
+
+class ComplianceAgent:
+    def __init__(self, model="gpt-4", tools=None, system_prompt=None):
+        """Initialize the compliance agent with system prompt and tools."""
+        if system_prompt is None:
+            # Default coaching prompt for policy compliance
+            system_prompt = """You are a helpful cloud infrastructure assistant. 
+
+If a tool returns a DENIED message with policy violations, you must read the violations, explain them to the user, and ask for missing information to try again. Common violations include:
+- Missing cost_center tag for production environments
+- Restricted instance types without proper project=ml-training tag  
+- PCI-DSS data in wrong region (must be eu-central-1)
+
+Always help users comply with policy rather than bypassing it."""
+        
+        self.client = ChatOpenAI(model=model, temperature=0).bind_tools(tools or [])
+        self.graph = create_react_agent(self.client, system_prompt=system_prompt)
 
 # ---------------------------------------------------------------------------
 # Tool definition
@@ -68,6 +83,14 @@ def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hou
     return f"Cloud server provisioned: {instance_type} in {region} at ${cost_per_hour}/hour [env: {env}, center: {center}, project: {project}]"
 
 @tool(args_schema=ServerProvisionInput)
+# ---------------------------------------------------------------------------
+# LangGraph Execution Block
+# ---------------------------------------------------------------------------
+
+# The LLM Coaching Loop is handled natively by LangGraph's ReAct architecture.
+# When middleware returns a DENIED string, the agent reads it as an observation 
+# and self-corrects its approach based on the deterministic policy feedback.
+
 def provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict = None) -> str:
     """Use this tool immediately to provision a server. You MUST extract the keys 'environment', 'project', and 'data_classification' from the user prompt and populate them inside the tags dictionary. Do not leave the tags dictionary empty if the user mentions them. Do not ask for missing information before calling this tool."""
     print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
@@ -188,17 +211,19 @@ if __name__ == "__main__":
                 # Should be APPROVED (OPA would allow; OPA unavailable → fail-closed DENIED)
                 run("Provision a t3.micro instance in us-east-1 for $5/hour with tags: environment='prod', cost_center='engineering', project='webapp'.")
                 
-                # Should be DENIED (cost exceeds policy threshold)
+                # Should be DENIED (p4d.24xlarge requires project='ml-training' but has 'model-training')
                 run("Provision a p4d.24xlarge instance in us-east-1 for $50/hour with tags: environment='prod', cost_center='ml-research', project='model-training'.")
                 
                 # Test complex policy scenario with dev environment
                 run("Provision a t3.small instance in us-west-2 for $8/hour with tags: environment='dev', cost_center='testing', project='cicd'.")
                 
-                # Show ledger tail
+                # Show ledger notice
                 print("\n" + "=" * 70)
-                print("LEDGER (last 2 records)")
+                print("LEDGER NOTICE")
                 print("=" * 70)
-                get_ledger().print_ledger(limit=2)
+                print("All intercepts are logged to ImmuDB cryptographic ledger.")
+                print("ImmuDB is the source of truth for audit records.")
+                print("Use ImmuDB client tools to query the audit trail.")
                 continue
             
             if not user_input:

@@ -35,6 +35,13 @@ class BaseAgent:
                             "cost_per_hour": {
                                 "type": "number",
                                 "description": "The cost per hour for the instance in USD"
+                            },
+                            "tags": {
+                                "type": "object",
+                                "description": "A dictionary of metadata tags for policy evaluation. Include keys like 'environment', 'project', 'data_classification', and 'cost_center' if mentioned.",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
                             }
                         },
                         "required": ["instance_type", "region", "cost_per_hour"]
@@ -44,9 +51,11 @@ class BaseAgent:
         ]
         self.messages = []
 
-    def provision_cloud_server(self, instance_type, region, cost_per_hour):
+    def provision_cloud_server(self, instance_type, region, cost_per_hour, tags=None):
         """Tool function for provisioning cloud servers"""
-        return f"Cloud server provisioning initiated for {instance_type} in {region} at ${cost_per_hour}/hour"
+        if tags is None:
+            tags = {}
+        return f"Cloud server provisioning initiated for {instance_type} in {region} at ${cost_per_hour}/hour with tags: {tags}"
 
     def handle_tool_calls(self, tool_calls):
         """Handle tool calls from the assistant with interceptor middleware"""
@@ -66,7 +75,8 @@ class BaseAgent:
                     result = self.provision_cloud_server(
                         instance_type=function_args["instance_type"],
                         region=function_args["region"],
-                        cost_per_hour=function_args["cost_per_hour"]
+                        cost_per_hour=function_args["cost_per_hour"],
+                        tags=function_args.get("tags", {})
                     )
                     print(f"{pipeline_prefix} -> [Execution] {result}")
                     result += f"\n[Interceptor: {interceptor_response['message']}]"

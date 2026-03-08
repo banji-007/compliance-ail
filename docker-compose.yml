@@ -12,3 +12,12 @@ services:
       - "/policy/cloud_policy.rego"
     volumes:
       - ./policy:/policy
+
+  immudb:
+    image: codenotary/immudb:latest
+    ports:
+      - "3322:3322"
+    environment:
+      - IMMUDB_USER=${IMMUDB_USER}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
+    restart: unless-stopped
