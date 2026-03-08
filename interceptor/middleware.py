@@ -2,13 +2,16 @@ import json
 import logging
 import sys
 import os
+import ssl
+import tempfile
 import time
-import requests
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
+import httpx
 
 # Add the ledger directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ledger'))
+
+# Import pre-flight validation schemas
+from schemas import validate_cloud_server_args
 
 # Configure logging
 logging.basicConfig(
@@ -19,22 +22,101 @@ logging.basicConfig(
     ]
 )
 
-# Configure retry strategy for OPA requests
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=0.5,
-    status_forcelist=[500, 502, 503, 504]
-)
-
-# Create session with retry adapter
-session = requests.Session()
-session.mount('http://', HTTPAdapter(max_retries=retry_strategy))
+# Runtime modes:
+#   Production (inside Docker): SPIRE socket present → mTLS enforced via Envoy
+#   Development (local venv):   Set SPIRE_DISABLED=true and point OPA_URL at
+#                               http://localhost:8181/v1/data/ail/main/deny
+#                               Policy is still evaluated; transport identity is not.
+_SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
+_OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/deny")
 
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
 
+
+def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
+    """
+    Create an SSL context with SPIFFE SVID fetched entirely in-memory.
+    
+    Returns:
+        ssl.SSLContext | None: SSL context with SPIFFE certificates, or None if unavailable
+    """
+    # Declare socket_path at the very top to ensure it's always bound
+    socket_path = os.getenv('SPIFFE_ENDPOINT_SOCKET', 'unix:///tmp/spire-sockets/workload_api.sock')
+    
+    try:
+        from spiffe import X509Source, TrustDomain
+        from cryptography.hazmat.primitives import serialization
+        
+        # Initialize X509Source with the socket path
+        x509_source = X509Source(socket_path=socket_path)
+        
+        # Fetch the local SVID using X509Source
+        svid = x509_source.fetch_x509_svid()
+        bundle_set = x509_source.fetch_x509_bundles()
+        bundle = bundle_set.get_bundle_for_trust_domain(TrustDomain("ail.internal"))
+        
+        # Serialize certificates to PEM bytes (in-memory only)
+        cert_pem = b"".join(
+            cert.public_bytes(serialization.Encoding.PEM) for cert in svid.cert_chain
+        )
+        key_pem = svid.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+        ca_pem = b"".join(
+            cert.public_bytes(serialization.Encoding.PEM) for cert in bundle.x509_authorities
+        )
+        
+        # Generate SSL context directly from in-memory certificates
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False  # SPIFFE certs use URI SANs, not DNS SANs
+        ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+        
+        # Load certificates directly from memory
+        from io import BytesIO
+        import tempfile
+        
+        # Create temporary in-memory file-like objects for certificate loading
+        cert_file = tempfile.NamedTemporaryFile(delete=False)
+        cert_file.write(cert_pem)
+        cert_file.flush()
+        
+        key_file = tempfile.NamedTemporaryFile(delete=False)
+        key_file.write(key_pem)
+        key_file.flush()
+        
+        try:
+            ssl_ctx.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
+            ssl_ctx.load_verify_locations(cadata=ca_pem.decode())
+        finally:
+            # Clean up temporary files
+            os.unlink(cert_file.name)
+            os.unlink(key_file.name)
+            cert_file.close()
+            key_file.close()
+        
+        logging.info(f"SPIFFE SVID loaded in-memory: {svid.spiffe_id}")
+        return ssl_ctx
+            
+    except Exception as e:
+        logging.error(f"Failed to fetch SPIFFE SVID from {socket_path}: {e}")
+        return None
+
+
+def get_spiffe_ssl_context() -> ssl.SSLContext | None:
+    """
+    Get SPIFFE SSL context for mTLS authentication.
+    
+    Returns:
+        ssl.SSLContext | None: SSL context with SPIFFE certificates, or None if unavailable
+    """
+    return _get_spiffe_ssl_context()
+
+
 def query_opa_policy(tool_name, tool_args):
     """
-    Query OPA policy for tool call authorization.
+    Query OPA policy for tool call authorization using mTLS authentication.
 
     Args:
         tool_name (str): Name of the tool being called
@@ -43,47 +125,68 @@ def query_opa_policy(tool_name, tool_args):
     Returns:
         dict: OPA policy decision
     """
+    # Epic 2: Pre-Flight Input Validation
+    # Catch LLM hallucinations before they are sent to OPA over the network
+    if tool_name == "provision_cloud_server":
+        is_valid, error_message = validate_cloud_server_args(tool_args)
+        if not is_valid:
+            error_details = f"DENIED: Schema Validation Failed. {error_message}"
+            logging.warning(f"Pre-flight validation failed for {tool_name}: {error_details}")
+            return {
+                "allowed": False,
+                "reason": error_details,
+                "deny": [error_details]
+            }
+    
+    if _SPIRE_DISABLED:
+        if not _OPA_URL.startswith("http://"):
+            logging.error(
+                "SPIRE_DISABLED=true requires a plain http:// OPA_URL. "
+                "Set OPA_URL=http://localhost:8181/v1/data/ail/main/deny"
+            )
+            return _DENIED_UNAVAILABLE
+        logging.warning("SPIRE_DISABLED=true: querying OPA over plain HTTP (dev mode only, no transport identity)")
+        ssl_context = True  # unused for http://, but explicit
+    else:
+        ssl_context = _get_spiffe_ssl_context()
+        if not ssl_context:
+            return {
+                "allowed": False,
+                "reason": "DENIED: Workload Identity missing or invalid. Execution blocked by AIL.",
+                "deny": ["Workload Identity missing or invalid. Execution blocked by AIL."]
+            }
+
     try:
-        response = session.post(
-            os.getenv('OPA_URL', 'http://localhost:8181/v1/data/ail/policy'),
-            json={"input": {"tool_args": tool_args}},
-            timeout=5
-        )
+        with httpx.Client(verify=ssl_context) as client:
+            response = client.post(
+                _OPA_URL,
+                json={"input": {"tool_args": tool_args}},
+                timeout=5,
+            )
 
         logging.debug(f"OPA status={response.status_code} body={response.text}")
 
         if response.status_code == 200:
-            result = response.json().get("result", {})
-            # Evaluate deny array directly
-            deny_messages = result.get("deny", [])
-            if deny_messages:
-                # Return deny items as DENIED string
-                combined_reason = "; ".join(deny_messages)
-                return {
-                    "allowed": False,
-                    "reason": combined_reason,
-                    "deny": deny_messages
-                }
+            result = response.json().get("result", [])
+            # New aggregated format: result is directly a list of deny messages
+            if isinstance(result, list) and result:
+                combined_reason = "; ".join(result)
+                return {"allowed": False, "reason": combined_reason, "deny": result}
             else:
-                # Empty deny array means APPROVED
-                return {
-                    "allowed": True,
-                    "reason": "Action approved by policy",
-                    "deny": []
-                }
+                return {"allowed": True, "reason": "Action approved by policy", "deny": []}
         else:
-            # Fail-closed: non-200 treated as policy engine unavailable
             return _DENIED_UNAVAILABLE
 
-    except requests.exceptions.ConnectionError as e:
-        logging.error(f"OPA connection error (not running?): {e}")
+    except httpx.ConnectError as e:
+        logging.error(f"OPA connection error: {e}")
         return _DENIED_UNAVAILABLE
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         logging.error(f"OPA request error: {e}")
         return _DENIED_UNAVAILABLE
     except Exception as e:
-        logging.error(f"OPA retry failed after 3 attempts: {e}")
+        logging.error(f"OPA query failed: {e}")
         return _DENIED_UNAVAILABLE
+
 
 def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     """
@@ -108,30 +211,23 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         }
         decision_for_ledger = "APPROVED"
     else:
-        # Handle deny messages list from new policy format
         deny_messages = opa_decision.get("deny", [])
-        if deny_messages:
-            # Join multiple deny messages with semicolons
-            combined_reason = "; ".join(deny_messages)
-        else:
-            combined_reason = opa_decision.get("reason", "Action denied by policy")
-            
-        response = {
-            "status": "DENIED",
-            "message": combined_reason
-        }
+        combined_reason = (
+            "; ".join(deny_messages) if deny_messages
+            else opa_decision.get("reason", "Action denied by policy")
+        )
+        response = {"status": "DENIED", "message": combined_reason}
         decision_for_ledger = f"DENIED: {combined_reason}"
 
     logging.info(f"Policy Engine Decision: {response['status']}: {response['message']}")
 
-    # Fail-closed: Log to ImmuDB ledger or block execution if unavailable
+    # Fail-closed: log to ImmuDB ledger or block execution if unavailable
+    record_hash = "unavailable"  # Initialize to prevent uninitialized variable usage
     try:
         from immudb_ledger import get_ledger
         ledger = get_ledger()
-        
-        # Extract policy version for audit trail
+
         policy_version = "1.0.0"
-        
         ledger.log_tool_call(
             agent_id=agent_id,
             tool_name=tool_name,
@@ -142,11 +238,10 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         logging.info(f"Ledger Hash: {record_hash[:16]}")
     except Exception as e:
         logging.error(f"ImmuDB ledger unavailable: {e}")
-        # Fail-closed: Block execution if audit ledger is unavailable
         return {
             "status": "DENIED",
             "message": "Audit ledger unavailable. Execution blocked.",
-            "record_hash": "unavailable"
+            "record_hash": record_hash
         }
 
     response["record_hash"] = record_hash

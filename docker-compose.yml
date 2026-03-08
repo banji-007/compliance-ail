@@ -9,7 +9,7 @@ services:
       - "--log-format=text"
       - "--log-level=info"
       - "--addr=0.0.0.0:8181"
-      - "/policy/cloud_policy.rego"
+      - "/policy"
     volumes:
       - ./policy:/policy
     restart: unless-stopped
@@ -22,3 +22,135 @@ services:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
     restart: unless-stopped
+
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.11.1
+    user: "0:0"
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./spire/server/server.conf:/opt/spire/conf/server/server.conf
+      - spire-server-data:/opt/spire/data
+      - ./scripts/init-spire-data.sh:/docker-entrypoint-initdb.d/init-spire-data.sh
+    restart: unless-stopped
+    command: ["/opt/spire/bin/spire-server", "run", "-config", "/opt/spire/conf/server/server.conf"]
+
+  spire-agent:
+    image: ghcr.io/spiffe/spire-agent:1.11.1
+    user: "0:0"
+    depends_on:
+      - spire-server
+    volumes:
+      - ./spire/agent/agent.conf:/opt/spire/conf/agent/agent.conf
+      - spire-sockets:/tmp/spire-sockets
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - spire-agent-data:/opt/spire/data
+    restart: unless-stopped
+    command: ["/opt/spire/bin/spire-agent", "run", "-config", "/opt/spire/conf/agent/agent.conf"]
+
+  envoy:
+    image: envoyproxy/envoy:v1.27-latest
+    pid: "service:spire-agent"
+    ports:
+      - "8443:8443"
+      - "9901:9901"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml
+      - spire-sockets:/tmp/spire-sockets
+    depends_on:
+      - spire-agent
+      - opa
+    restart: always
+    command: ["/usr/local/bin/envoy", "-c", "/etc/envoy/envoy.yaml"]
+
+  python-mtls-test:
+    image: python:3.11-slim
+    pid: "service:spire-agent"
+    environment:
+      - SPIFFE_ENDPOINT_SOCKET=unix:///tmp/spire-sockets/workload_api.sock
+    volumes:
+      - ./test_mtls_flow.py:/app/test_mtls_flow.py
+      - spire-sockets:/tmp/spire-sockets
+    working_dir: /app
+    command: ["sh", "-c", "pip install httpx spiffe==0.2.5 && python test_mtls_flow.py"]
+    depends_on:
+      - envoy
+      - spire-agent
+
+  workload-registrar:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts/register-workloads-container.sh:/opt/register.sh
+    depends_on:
+      - spire-agent
+    restart: "no"
+    entrypoint: ["/bin/sh", "/opt/register.sh"]
+
+  langgraph-demo:
+    image: python:3.11-slim
+    stdin_open: true
+    tty: true
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - IMMUDB_HOST=immudb
+      - IMMUDB_PORT=3322
+      - IMMUDB_USER=${IMMUDB_USER}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
+      - SPIFFE_ENDPOINT_SOCKET=unix:///tmp/spire-sockets/workload_api.sock
+      - OPA_URL=https://envoy:8443/v1/data/ail/main/deny
+    volumes:
+      - .:/app
+      - spire-sockets:/tmp/spire-sockets
+    working_dir: /app
+    command:
+      - bash
+      - -c
+      - |
+        pip uninstall -y spiffe
+        pip install --no-cache-dir spiffe httpx pydantic
+        pip install -q langchain-openai langgraph langchain-core python-dotenv cryptography ecdsa google-api-core grpcio 'protobuf>=4.21.0,<5.0.0' pem PyJWT pyasn1 pyasn1-modules && pip install -q --no-deps 'immudb-py==1.4.0'
+        echo 'Waiting for SPIRE workload socket...'
+        until [ -S /tmp/spire-sockets/workload_api.sock ]; do sleep 2; done
+        echo 'SPIRE ready. Starting demo...'
+        python framework_integration/langgraph_demo.py
+    depends_on:
+      - spire-agent
+      - opa
+      - immudb
+      - envoy
+
+  # Epic 4: Observability & Telemetry
+  prometheus:
+    image: prom/prometheus:latest
+    user: "0:0"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--storage.tsdb.retention.time=200h"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    platform: linux/amd64
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  spire-server-data:
+  spire-sockets:
+  spire-agent-data:
