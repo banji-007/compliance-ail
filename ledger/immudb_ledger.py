@@ -15,7 +15,7 @@ class ImmuDBLedger:
     Enterprise-grade cryptographic ledger using ImmuDB for true Merkle-tree immutability.
     """
     
-    def __init__(self, host='localhost', port=3322, user=None, password=None, database='defaultdb'):
+    def __init__(self, host=None, port=None, user=None, password=None, database='defaultdb'):
         """
         Initialize ImmuDB connection.
         
@@ -26,8 +26,8 @@ class ImmuDBLedger:
             password (str): ImmuDB password
             database (str): Database name
         """
-        self.host = host
-        self.port = port
+        self.host = host or os.getenv('IMMUDB_HOST', 'localhost')
+        self.port = int(port or os.getenv('IMMUDB_PORT', 3322))
         self.user = user
         self.password = password
         self.database = database
@@ -83,7 +83,7 @@ class ImmuDBLedger:
             # Use verifiedSet for cryptographic anchoring to Merkle tree
             result = self.client.verifiedSet(key.encode(), serialized_entry.encode())
             
-            transaction_hash = hashlib.sha256(f"{key}:{serialized_entry}:{result.id}".encode()).hexdigest()[:16]
+            transaction_hash = hashlib.sha256(f"{key}:{serialized_entry}:{result.id}".encode()).hexdigest()
             logging.info(f"Logged tool call with verifiedSet - TX: {result.id} Hash: {transaction_hash}")
             
             return transaction_hash
@@ -108,8 +108,7 @@ class ImmuDBLedger:
             logging.error(f"Failed to get current ImmuDB state: {e}")
             return "unknown"
 
-# DEV-ONLY: Fallback credentials for local testing. 
-# Production environments must inject strict environment variables.
+# Strict enforcement: System fails closed if credentials are missing.
 
 # Global ledger instance
 _ledger_instance = None

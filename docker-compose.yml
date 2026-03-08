@@ -12,6 +12,7 @@ services:
       - "/policy/cloud_policy.rego"
     volumes:
       - ./policy:/policy
+    restart: unless-stopped
 
   immudb:
     image: codenotary/immudb:latest
