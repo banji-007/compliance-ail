@@ -45,7 +45,7 @@ def query_opa_policy(tool_name, tool_args):
     """
     try:
         response = session.post(
-            "http://localhost:8181/v1/data/ail/policy",
+            os.getenv('OPA_URL', 'http://localhost:8181/v1/data/ail/policy'),
             json={"input": {"tool_args": tool_args}},
             timeout=5
         )
