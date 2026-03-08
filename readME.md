@@ -8,14 +8,14 @@ As AI agents transition from conversational chatbots to autonomous entities exec
 
 * **⚡ Framework Agnostic Interception:** AIL operates as an independent middleware layer. It intercepts structured `tool_calls` from any major agent framework (LangGraph, AutoGen, smolagents) *before* execution, requiring zero modifications to the underlying LLM logic.
 * **⚖️ Deterministic Policy Enforcement:** Bypasses LLM hallucinations by routing all intents through Open Policy Agent (OPA). Legal and security teams can define hardcoded, deterministic Rego policies (e.g., spending limits, data residency) that actively block unauthorized agent actions. *(See [Policy Engine Documentation](/README_OPA.md) for details).*
-* **🔒 Cryptographic Proof of Intent:** Every intercepted action—both approved and denied—is logged to a local SQLite ledger using SHA-256 hash chaining. This provides enterprise auditors with an unalterable history of what the agent *intended* to do, the policy's decision, and the final execution state.
+* **🔒 Cryptographic Proof of Intent:** Every intercepted action—both approved and denied—is logged to an ImmuDB cryptographic ledger using Merkle-tree immutability. This provides enterprise auditors with an unalterable history of what the agent *intended* to do, the policy's decision, and final execution state.
 
 ## 🛠️ Architecture
 
 1. **The Agent Layer:** A LangGraph agent equipped with execution tools.
 2. **The Interceptor (Middleware):** Catches the LLM's JSON payload before the tool executes.
 3. **The Policy Engine:** An Open Policy Agent (OPA) Docker container evaluating the payload against strict `Rego` rules.
-4. **The Ledger:** A cryptographically chained SQLite database recording the "Proof of Intent."
+4. **The Ledger:** An ImmuDB cryptographic ledger recording "Proof of Intent."
 
 ---
 
@@ -23,11 +23,11 @@ As AI agents transition from conversational chatbots to autonomous entities exec
 
 ### Prerequisites
 * Python 3.10+
-* Docker Desktop (for running OPA)
+* Docker Desktop (for running OPA and ImmuDB)
 * OpenAI API Key
 
 ### 1. Installation
-Clone the repository and install the required dependencies:
+Clone the repository and install required dependencies:
 ```bash
 git clone [https://github.com/banji-007/compliance-ail.git](https://github.com/banji-007/compliance-ail.git)
 cd compliance-ail
@@ -41,12 +41,19 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Set your OpenAI API key in your environment or a `.env` file:
+### 2. Environment Configuration
+Copy the environment template and configure your credentials:
 ```bash
-export OPENAI_API_KEY="sk-your-key-here"
+cp .env.example .env
+# Edit .env with your actual values:
+# OPENAI_API_KEY=your_openai_api_key_here
+# IMMUDB_USER=immudb
+# IMMUDB_PASSWORD=immudb
 ```
 
-### 2. Start the Policy Engine (OPA)
+**Note:** The ImmuDB ledger includes development fallback credentials for local testing only. Production environments must inject strict environment variables.
+
+### 3. Start the Policy Engine (OPA)
 Spin up the Open Policy Agent container via Docker:
 ```bash
 docker-compose up -d
@@ -96,11 +103,11 @@ Force the agent to attempt a highly restricted action that violates Data Residen
 
 ---
 
-## 🔍 Verifying the Proof of Intent (The Audit Trail)
+## 🔍 Verifying the Cryptographic Audit Trail
 
-To prove to auditors that the system is immutable, view the cryptographic ledger:
-
+To prove to auditors that the system is immutable, view the ImmuDB cryptographic ledger:
 ```bash
-python ledger/sqlite_ledger.py
+python verify_hash_chain.py
 ```
-You will see a clean, tabular output showing every intercepted tool call alongside its chaining SHA-256 hash.
+
+This will verify the ImmuDB connection and confirm Merkle-tree immutability guarantees.

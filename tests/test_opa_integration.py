@@ -4,18 +4,16 @@ import sys
 
 # Add paths
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ledger'))
 
 from middleware import intercept_tool_call, query_opa_policy
-from sqlite_ledger import get_ledger
 
 def test_opa_policy():
     """Test OPA policy decisions directly"""
     print("Testing OPA Policy Directly")
     print("=" * 50)
 
-    # Test 1: Should be approved (cost < 10, region = us-east-1)
-    print("\n1. Testing APPROVED case:")
+    # Test 1: Small instance without restricted tags (likely approved)
+    print("\n1. Testing small instance (t3.micro):")
     args1 = {
         "instance_type": "t3.micro",
         "region": "us-east-1",
@@ -25,8 +23,8 @@ def test_opa_policy():
     print(f"Input: {args1}")
     print(f"Decision: {decision1}")
 
-    # Test 2: Should be denied (cost > 10)
-    print("\n2. Testing DENIED case (high cost):")
+    # Test 2: Large restricted instance without proper project tag (denied)
+    print("\n2. Testing restricted instance without project tag:")
     args2 = {
         "instance_type": "p4d.24xlarge",
         "region": "us-east-1",
@@ -36,8 +34,8 @@ def test_opa_policy():
     print(f"Input: {args2}")
     print(f"Decision: {decision2}")
 
-    # Test 3: Should be denied (wrong region)
-    print("\n3. Testing DENIED case (wrong region):")
+    # Test 3: Small instance in different region (approved - no region restriction)
+    print("\n3. Testing small instance in different region:")
     args3 = {
         "instance_type": "t3.micro",
         "region": "us-west-2",
@@ -47,12 +45,13 @@ def test_opa_policy():
     print(f"Input: {args3}")
     print(f"Decision: {decision3}")
 
-    # Test 4: Should be denied (both conditions fail)
-    print("\n4. Testing DENIED case (both conditions fail):")
+    # Test 4: Large instance with wrong project tag (denied)
+    print("\n4. Testing restricted instance with wrong project tag:")
     args4 = {
         "instance_type": "p4d.24xlarge",
         "region": "eu-west-1",
-        "cost_per_hour": 25
+        "cost_per_hour": 25,
+        "tags": {"project": "webapp"}
     }
     decision4 = query_opa_policy("provision_cloud_server", args4)
     print(f"Input: {args4}")
@@ -89,18 +88,15 @@ def test_ledger_after_opa():
     """Show ledger state after OPA tests"""
     print("\n\nLedger State After OPA Tests")
     print("=" * 50)
-
-    ledger = get_ledger()
-    ledger.print_ledger(limit=5)  # Show last 5 records
-
-    # Show statistics
-    stats = ledger.get_statistics()
-    print(f"\nStatistics: {json.dumps(stats, indent=2)}")
+    
+    print("All test records logged to ImmuDB cryptographic ledger.")
+    print("SQLite ledger is not used in production flow.")
+    print("Use ImmuDB client tools to view the actual audit trail.")
 
 if __name__ == "__main__":
     print("OPA Integration Test Suite")
     print("Make sure OPA is running on localhost:8181")
-    print("And the policy is loaded: docker run -p 8181:8181 -v $(pwd)/policy:/policy openpolicyagent/opa:latest run --server /policy")
+    print("And the policy is loaded: docker run -p 8181:8181 -v $(pwd)/policy:/policy openpolicyagent/opa:latest run --server --addr=0.0.0.0:8181 /policy")
 
     try:
         test_opa_policy()

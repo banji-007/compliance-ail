@@ -34,6 +34,13 @@ class TestAgentWithInterceptor:
                             "cost_per_hour": {
                                 "type": "number",
                                 "description": "The cost per hour for the instance in USD"
+                            },
+                            "tags": {
+                                "type": "object",
+                                "description": "A dictionary of metadata tags for policy evaluation. Include keys like 'environment', 'project', 'data_classification', and 'cost_center' if mentioned.",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
                             }
                         },
                         "required": ["instance_type", "region", "cost_per_hour"]
@@ -42,20 +49,23 @@ class TestAgentWithInterceptor:
             }
         ]
 
-    def provision_cloud_server(self, instance_type, region, cost_per_hour):
+    def provision_cloud_server(self, instance_type, region, cost_per_hour, tags=None):
         """Tool function for provisioning cloud servers"""
+        if tags is None:
+            tags = {}
         tool_call = {
             "tool_name": "provision_cloud_server",
             "parameters": {
                 "instance_type": instance_type,
                 "region": region,
-                "cost_per_hour": cost_per_hour
+                "cost_per_hour": cost_per_hour,
+                "tags": tags
             }
         }
         print("\n=== TOOL CALL ===")
         print(json.dumps(tool_call, indent=2))
         print("==================\n")
-        return f"Cloud server provisioning initiated for {instance_type} in {region} at ${cost_per_hour}/hour"
+        return f"Cloud server provisioning initiated for {instance_type} in {region} at ${cost_per_hour}/hour with tags: {tags}"
 
     def handle_tool_calls(self, tool_calls):
         """Handle tool calls from the assistant with interceptor middleware"""
@@ -72,7 +82,8 @@ class TestAgentWithInterceptor:
                     result = self.provision_cloud_server(
                         instance_type=function_args["instance_type"],
                         region=function_args["region"],
-                        cost_per_hour=function_args["cost_per_hour"]
+                        cost_per_hour=function_args["cost_per_hour"],
+                        tags=function_args.get("tags", {})
                     )
                     # Add interceptor approval info
                     result += f"\n[Interceptor: {interceptor_response['message']}]"
@@ -131,14 +142,14 @@ class TestAgentWithInterceptor:
 if __name__ == "__main__":
     agent = TestAgentWithInterceptor()
 
-    # Test 1: Under $10 (should be approved)
+    # Test 1: Small instance (likely approved based on environment/project rules)
     print("\n" + "="*80)
-    print("TEST 1: Under budget ($5/hour)")
+    print("TEST 1: Small instance (t3.micro)")
     print("="*80)
     agent.test_prompt("Spin up an AWS t3.micro in us-east-1 for $5/hour.")
 
-    # Test 2: Over $10 (should be denied)
+    # Test 2: Large instance (may be denied based on instance type restrictions)
     print("\n" + "="*80)
-    print("TEST 2: Over budget ($32/hour)")
+    print("TEST 2: Large instance (p4d.24xlarge)")
     print("="*80)
     agent.test_prompt("Spin up an AWS p4d.24xlarge in us-east-1 for $32/hour.")
