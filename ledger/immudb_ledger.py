@@ -28,8 +28,8 @@ class ImmuDBLedger:
         """
         self.host = host or os.getenv('IMMUDB_HOST', 'localhost')
         self.port = int(port or os.getenv('IMMUDB_PORT', 3322))
-        self.user = user
-        self.password = password
+        self.user = user or os.getenv('IMMUDB_USER')
+        self.password = password or os.getenv('IMMUDB_PASSWORD')
         self.database = database
         self.client = None
         
