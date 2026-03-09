@@ -39,8 +39,6 @@ urllib3==2.6.3
 uuid_utils==0.14.1
 xxhash==3.6.0
 zstandard==0.25.0
-immudb-py==1.4.0
 prometheus-client
-protobuf>=4.0.0
 # SPIFFE library for mTLS authentication (production/Docker only)
 spiffe==0.2.5

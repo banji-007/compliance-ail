@@ -1,113 +1,75 @@
-# 🛡️ Agentic Integrity Ledger (AIL) - Proof of Concept
+# Enterprise AI Compliance Gateway (AIL)
 
-AIL is a zero-trust compliance middleware for autonomous AI agents. 
+[![Architecture: Zero-Trust](https://img.shields.io/badge/Architecture-Zero%20Trust-blue)](#) [![Identity: SPIFFE/SPIRE](https://img.shields.io/badge/Identity-SPIFFE%2FSPIRE-green)](#) [![Policy: OPA](https://img.shields.io/badge/Policy-Open%20Policy%20Agent-orange)](#) [![Audit: ImmuDB](https://img.shields.io/badge/Audit-ImmuDB-red)](#)
 
-As AI agents transition from conversational chatbots to autonomous entities executing financial, infrastructure, and legal commands, enterprises face a massive liability bottleneck. AIL solves this by providing a cryptographic audit trail and pre-execution policy enforcement required for SOC2, GDPR, and the EU AI Act.
+The Enterprise AI Compliance Gateway is a verifiable, observable, zero-trust security perimeter designed for autonomous AI agents. 
 
-## 🚀 The Value Proposition
+As Large Language Models (LLMs) transition from read-only chatbots to autonomous agents capable of mutating cloud infrastructure and touching customer data, traditional API gateways are insufficient. This project provides a hard fail-closed interceptor that guarantees every action an AI agent attempts is cryptographically authenticated, rigorously evaluated against regulatory frameworks (SOC2, GDPR, FinOps), and permanently recorded in a tamper-evident ledger.
 
-* **⚡ Framework Agnostic Interception:** AIL operates as an independent middleware layer. It intercepts structured `tool_calls` from any major agent framework (LangGraph, AutoGen, smolagents) *before* execution, requiring zero modifications to the underlying LLM logic.
-* **⚖️ Deterministic Policy Enforcement:** Bypasses LLM hallucinations by routing all intents through Open Policy Agent (OPA). Legal and security teams can define hardcoded, deterministic Rego policies (e.g., spending limits, data residency) that actively block unauthorized agent actions. *(See [Policy Engine Documentation](/README_OPA.md) for details).*
-* **🔒 Cryptographic Proof of Intent:** Every intercepted action—both approved and denied—is logged to an ImmuDB cryptographic ledger using Merkle-tree immutability. This provides enterprise auditors with an unalterable history of what the agent *intended* to do, the policy's decision, and final execution state.
+![Architecture Diagram](docs/architecture.png)
 
-## 🛠️ Architecture
+## 🎯 The Problem
+AI agents (built on frameworks like LangGraph, AutoGen, or CrewAI) generate dynamic, unpredictable payloads. If an agent hallucinates or is subjected to a prompt injection attack, it can provision out-of-compliance infrastructure, violate data residency laws, or breach cost center constraints. 
 
-1. **The Agent Layer:** A LangGraph agent equipped with execution tools.
-2. **The Interceptor (Middleware):** Catches the LLM's JSON payload before the tool executes.
-3. **The Policy Engine:** An Open Policy Agent (OPA) Docker container evaluating the payload against strict `Rego` rules.
-4. **The Ledger:** An ImmuDB cryptographic ledger recording "Proof of Intent."
+## 🛡️ The Solution
+This gateway acts as a definitive boundary between the AI's "brain" and the executing environment. Before any tool execution reaches the real world, it must pass through a 4-stage validation pipeline.
 
----
+### 1. Cryptographic Workload Identity (SPIFFE/SPIRE & Envoy)
+We do not rely on static API keys, which can be leaked or stolen. The AI agent and the policy engine are mutually authenticated using **SPIFFE/SPIRE**.
+* Upon boot, the Python agent is dynamically issued an ephemeral, cryptographically signed X.509 SVID (SPIFFE Verifiable Identity Document).
+* All traffic between the AI agent and the Policy Engine is routed through an **Envoy Proxy** enforcing strict mutual TLS (mTLS). If the agent cannot prove its physical container identity, the request is dropped at the network layer.
 
-## 💻 Quickstart & Setup
+### 2. Multi-Framework Policy Enforcement (Open Policy Agent)
+The gateway delegates all authorization logic to **Open Policy Agent (OPA)**, evaluating the agent's proposed JSON payload against modular `Rego` policies. The AI cannot bypass these checks.
+* **Data Residency (GDPR):** Ensures specific workloads are constrained to legal geographic regions (e.g., `eu-central-1`).
+* **Security Standards (SOC2):** Enforces mandatory security parameters (e.g., `encryption_at_rest = true`).
+* **FinOps Constraints:** Blocks restricted instance types (e.g., `p4d.24xlarge`) unless properly tagged with authorized cost centers.
 
-### Prerequisites
-* Python 3.10+
-* Docker Desktop (for running OPA and ImmuDB)
-* OpenAI API Key
+### 3. Tamper-Evident Audit Ledger (ImmuDB)
+Every decision made by the policy engine—whether Approved or Denied—is permanently hashed and stored in **ImmuDB**, an immutable database. 
+* We utilize ImmuDB's REST API to log the exact execution payload, the OPA decision, and a localized SHA-256 fingerprint.
+* This ensures that security auditors can cryptographically verify the historical ledger to prove that no agent actions were altered or deleted after the fact.
 
-### 1. Installation
-Clone the repository and install required dependencies:
-```bash
-git clone [https://github.com/banji-007/compliance-ail.git](https://github.com/banji-007/compliance-ail.git)
-cd compliance-ail
-python -m venv venv
+### 4. Real-Time CISO Observability (Prometheus & Grafana)
+The Python middleware is natively instrumented with the `prometheus_client`. 
+* Telemetry data is scraped in real-time, providing explicit visibility into `APPROVED` vs `DENIED` agent actions.
+* The included Grafana dashboard provides Security and Operations teams with immediate, single-pane-of-glass visibility into AI agent behavior, policy violation spikes, and network latency.
 
-# Activate venv (Windows)
-.\venv\Scripts\activate
-# Activate venv (Mac/Linux)
-source venv/bin/activate
-
-pip install -r requirements.txt
-```
-
-### 2. Environment Configuration
-Copy the environment template and configure your credentials:
-```bash
-cp .env.example .env
-# Edit .env with your actual values:
-# OPENAI_API_KEY=your_openai_api_key_here
-# IMMUDB_USER=immudb
-# IMMUDB_PASSWORD=immudb
-```
-
-**Note:** The ImmuDB ledger includes development fallback credentials for local testing only. Production environments must inject strict environment variables.
-
-### 3. Start the Policy Engine (OPA)
-Spin up the Open Policy Agent container via Docker:
-```bash
-docker-compose up -d
-```
-
-### 3. Load the Compliance Policies
-Upload the deterministic Rego policies to the running OPA container. 
-*(Note: If you are on Windows PowerShell, use `curl.exe`. On Mac/Linux, standard `curl` works).*
-
-```bash
-curl.exe -X PUT -H "Content-Type: text/plain" --data-binary @policy/cloud_policy.rego http://localhost:8181/v1/policies/cloud_policy
-```
-*A successful upload will return an empty JSON object: `{}`*
+![Grafana Dashboard](docs/dashboard.png)
 
 ---
 
-## 🎬 Running the Demo: "The Rogue FinOps Agent"
+## 🏗️ Architectural Decision Records (ADR) Highlights
 
-This demo showcases a LangGraph AI agent acting as a cloud infrastructure assistant. We will test it against two scenarios.
+**ADR-001: ImmuDB REST API over gRPC SDK**
+* **Context:** The native `immudb-py` SDK requires an outdated version of Google Protobuf that conflicts with modern SPIFFE/SPIRE security libraries.
+* **Decision:** We migrated to ImmuDB's REST API. 
+* **Trade-off:** We traded in-process Merkle tree verification (client-side tamper-evidence) for the ability to enable strict SPIRE mTLS (transport-layer zero-trust). Tamper-evidence guarantees are now deferred to out-of-band verification by auditors against the ImmuDB server. This provides a vastly superior active security posture for the agent.
 
-Start the demo script:
+---
+
+## 🚀 Quick Start (Local Developer Loop)
+
+This stack is entirely containerized and orchestrated via Docker Compose.
+
+### 1. Boot the Gateway
 ```bash
-python framework_integration/langgraph_demo.py
+docker compose up -d --build
+```
+*Note: The initialization sequence includes an automated token generator that seamlessly bootstraps the SPIRE mTLS mesh. No manual tokens are required.*
+
+### 2. Attach to the Agent
+```bash
+docker attach compliance-ail-langgraph-demo-1
 ```
 
-### Scenario A: The Compliant Path
-Ask the agent to perform an action that is within budget and policy limits. 
+### 3. Test the Compliance Engine
 
-**Prompt:**
-> *"Deploy a small test server in us-east-1 for $1.50 an hour. Tag the environment as 'dev' and the project as 'testing'."*
-
-**Expected Result:** The AIL intercepts the call, OPA approves it, the hash is logged, and the dummy server executes.
-
-### Scenario B: The Disaster Path (Compliance Coach)
-Force the agent to attempt a highly restricted action that violates Data Residency (PCI-DSS), FinOps tagging limits, and compute restrictions simultaneously.
-
-**Prompt:**
+**Trigger a Denial (Fail SOC2 & FinOps):**
 > *"Deploy a p4d.24xlarge instance in us-east-1 for $32/hr. Tag it for the 'prod' environment, but don't add a cost center. Also tag the data classification as 'pci-dss'."*
 
-**Expected Result:** 
-1. The agent blindly generates the malformed payload.
-2. The AIL middleware intercepts it mid-air.
-3. OPA denies the request and returns the specific legal violations.
-4. The ledger cryptographically seals the blocked intent.
-5. The LLM reads the deterministic errors and actively coaches the user on how to fix their request.
+**Trigger an Approval (Pass All Frameworks):**
+> *"Deploy a t3.medium instance in eu-central-1 for $0.04/hr. Tag it for the 'prod' environment with project 'ml-training' and cost_center 'engineering'. Set data classification to 'pci-dss' and ensure encryption_at_rest is 'true'."*
 
-
----
-
-## 🔍 Verifying the Cryptographic Audit Trail
-
-To prove to auditors that the system is immutable, view the ImmuDB cryptographic ledger:
-```bash
-python verify_hash_chain.py
-```
-
-This will verify the ImmuDB connection and confirm Merkle-tree immutability guarantees.
+### 4. View the CISO Dashboard
+Navigate to `http://localhost:3000` to view the live Grafana dashboard tracking the policy decisions.
