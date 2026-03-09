@@ -75,6 +75,7 @@ register_workload() {
 
 register_workload "spiffe://ail.internal/workload/envoy" "unix:uid:101"
 register_workload "spiffe://ail.internal/workload/agent" "unix:uid:1000"
+register_workload "spiffe://ail.internal/workload/test"  "unix:uid:0"
 
 echo "=== Registered entries ==="
 docker exec "$SERVER" /opt/spire/bin/spire-server entry show \

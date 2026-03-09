@@ -6,6 +6,7 @@ services:
     command:
       - "run"
       - "--server"
+      - "--watch"
       - "--log-format=text"
       - "--log-level=info"
       - "--addr=0.0.0.0:8181"
@@ -101,8 +102,12 @@ services:
     working_dir: /app
     command: ["sh", "-c", "pip install httpx spiffe==0.2.5 && python test_mtls_flow.py"]
     depends_on:
-      - envoy
-      - spire-agent
+      envoy:
+        condition: service_started
+      spire-agent:
+        condition: service_started
+      workload-registrar:
+        condition: service_completed_successfully
 
   workload-registrar:
     image: docker:cli
