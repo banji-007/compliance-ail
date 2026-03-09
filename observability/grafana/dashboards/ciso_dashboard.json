@@ -262,9 +262,9 @@
             "type": "prometheus",
             "uid": "ail-prometheus"
           },
-          "expr": "http_request_duration_seconds_count{handler=\"v1/data\", code=\"200\"}",
+          "expr": "increase(ail_policy_decisions_total{status=\"DENIED\"}[5m])",
           "interval": "",
-          "legendFormat": "Total OPA Decisions",
+          "legendFormat": "Denied — {{tool_name}}",
           "refId": "A"
         },
         {
@@ -272,13 +272,13 @@
             "type": "prometheus",
             "uid": "ail-prometheus"
           },
-          "expr": "rate(http_request_duration_seconds_count{handler=\"v1/data\"}[1m])",
+          "expr": "increase(ail_policy_decisions_total{status=\"APPROVED\"}[5m])",
           "interval": "",
-          "legendFormat": "Decision Rate (1m)",
+          "legendFormat": "Approved — {{tool_name}}",
           "refId": "B"
         }
       ],
-      "title": "Policy Decisions",
+      "title": "Policy Decisions (Approved vs Denied)",
       "type": "timeseries"
     },
     {
@@ -381,6 +381,61 @@
       ],
       "title": "Request Latency",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ail-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Approved" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Denied" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 16 },
+      "id": 5,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ail-prometheus" },
+          "expr": "sum(ail_policy_decisions_total{status=\"APPROVED\"})",
+          "legendFormat": "Approved",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "ail-prometheus" },
+          "expr": "sum(ail_policy_decisions_total{status=\"DENIED\"})",
+          "legendFormat": "Denied",
+          "refId": "B"
+        }
+      ],
+      "title": "All-Time Totals",
+      "type": "stat"
     }
   ],
   "refresh": "5s",
@@ -402,6 +457,6 @@
   "timezone": "",
   "title": "AIL Compliance Dashboard",
   "uid": "ail-compliance",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }
