@@ -40,13 +40,37 @@ echo ""
 register_workload() {
     SPIFFE_ID="$1"
     SELECTOR="$2"
+    MAX_ATTEMPTS=5
+    ATTEMPT=0
+
     echo "Registering: $SPIFFE_ID"
-    docker exec "$SERVER" /opt/spire/bin/spire-server entry create \
-        -socketPath "$SOCKET" \
-        -spiffeID   "$SPIFFE_ID" \
-        -parentID   "$AGENT_ID" \
-        -selector   "$SELECTOR" 2>&1 | head -4 || true
-    echo ""
+    while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        OUTPUT=$(docker exec "$SERVER" /opt/spire/bin/spire-server entry create \
+            -socketPath "$SOCKET" \
+            -spiffeID   "$SPIFFE_ID" \
+            -parentID   "$AGENT_ID" \
+            -selector   "$SELECTOR" 2>&1)
+        EXIT_CODE=$?
+
+        # Success or "already exists" are both acceptable outcomes
+        if [ $EXIT_CODE -eq 0 ] || echo "$OUTPUT" | grep -qi "already exists"; then
+            echo "  OK (attempt $ATTEMPT)"
+            echo "$OUTPUT" | head -4
+            echo ""
+            return 0
+        fi
+
+        echo "  attempt $ATTEMPT/$MAX_ATTEMPTS failed: $OUTPUT"
+        if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+            BACKOFF=$((ATTEMPT * 3))
+            echo "  retrying in ${BACKOFF}s..."
+            sleep "$BACKOFF"
+        fi
+    done
+
+    echo "ERROR: Failed to register $SPIFFE_ID after $MAX_ATTEMPTS attempts."
+    exit 1
 }
 
 register_workload "spiffe://ail.internal/workload/envoy" "unix:uid:101"

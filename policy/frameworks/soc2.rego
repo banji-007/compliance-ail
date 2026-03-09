@@ -3,8 +3,6 @@
 
 package ail.frameworks.soc2
 
-import rego.v1
-
 deny contains msg if {
     payload := input.tool_args
     payload.tags.environment == "prod"

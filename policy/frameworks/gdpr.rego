@@ -3,8 +3,6 @@
 
 package ail.frameworks.gdpr
 
-import rego.v1
-
 deny contains msg if {
     payload := input.tool_args
     payload.tags.data_classification == "pci-dss"
