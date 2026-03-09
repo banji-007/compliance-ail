@@ -139,10 +139,10 @@ def query_opa_policy(tool_name, tool_args):
             }
     
     if _SPIRE_DISABLED:
-        if not _OPA_URL.startswith("http://"):
+        if not (_OPA_URL.startswith("http://localhost") or _OPA_URL.startswith("http://127.0.0.1") or _OPA_URL.startswith("http://opa")):
             logging.error(
-                "SPIRE_DISABLED=true requires a plain http:// OPA_URL. "
-                "Set OPA_URL=http://localhost:8181/v1/data/ail/main/deny"
+                "SPIRE_DISABLED=true requires a plain http:// OPA_URL pointing to localhost or opa. "
+                "Set OPA_URL=http://localhost:8181/v1/data/ail/main/deny or OPA_URL=http://opa:8181/v1/data/ail/main/deny"
             )
             return _DENIED_UNAVAILABLE
         logging.warning("SPIRE_DISABLED=true: querying OPA over plain HTTP (dev mode only, no transport identity)")
