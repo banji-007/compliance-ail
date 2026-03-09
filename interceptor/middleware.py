@@ -6,6 +6,7 @@ import ssl
 import tempfile
 import time
 import httpx
+from prometheus_client import Counter, start_http_server
 
 # Add the ledger directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ledger'))
@@ -31,6 +32,19 @@ _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
 _OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/deny")
 
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
+
+# Prometheus metrics
+_POLICY_DECISIONS = Counter(
+    "ail_policy_decisions_total",
+    "Total AIL policy decisions by status and tool",
+    ["status", "tool_name"],
+)
+
+try:
+    start_http_server(8000)
+    logging.info("Prometheus metrics server started on :8000")
+except OSError:
+    pass  # port already bound (e.g. module reloaded)
 
 
 def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
@@ -220,6 +234,7 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         decision_for_ledger = f"DENIED: {combined_reason}"
 
     logging.info(f"Policy Engine Decision: {response['status']}: {response['message']}")
+    _POLICY_DECISIONS.labels(status=response["status"], tool_name=tool_name).inc()
 
     # Fail-closed: log to ImmuDB ledger or block execution if unavailable
     record_hash = "unavailable"  # Initialize to prevent uninitialized variable usage

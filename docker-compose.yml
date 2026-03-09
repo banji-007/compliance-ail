@@ -110,7 +110,7 @@ services:
       - |
         pip uninstall -y spiffe
         pip install --no-cache-dir spiffe httpx pydantic
-        pip install -q langchain-openai langgraph langchain-core python-dotenv cryptography ecdsa google-api-core grpcio 'protobuf>=4.21.0,<5.0.0' pem PyJWT pyasn1 pyasn1-modules && pip install -q --no-deps 'immudb-py==1.4.0'
+        pip install -q langchain-openai langgraph langchain-core python-dotenv cryptography ecdsa google-api-core grpcio 'protobuf>=4.21.0,<5.0.0' pem PyJWT pyasn1 pyasn1-modules prometheus-client && pip install -q --no-deps 'immudb-py==1.4.0'
         echo 'Waiting for SPIRE workload socket...'
         until [ -S /tmp/spire-sockets/workload_api.sock ]; do sleep 2; done
         echo 'SPIRE ready. Starting demo...'

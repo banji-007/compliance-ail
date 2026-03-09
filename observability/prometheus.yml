@@ -18,6 +18,12 @@ scrape_configs:
     # OPA natively exposes Prometheus metrics for policy decisions,
     # bundle loading, and performance telemetry
     
+  # AIL Interceptor middleware metrics
+  - job_name: 'ail-middleware'
+    static_configs:
+      - targets: ['langgraph-demo:8000']
+    scrape_interval: 5s
+
   # Prometheus self-monitoring
   - job_name: 'prometheus'
     static_configs:
