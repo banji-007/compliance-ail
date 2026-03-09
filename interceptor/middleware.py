@@ -6,7 +6,7 @@ import ssl
 import tempfile
 import time
 import httpx
-from prometheus_client import Counter, start_http_server
+from prometheus_client import Counter, start_http_server, REGISTRY
 
 # Add the ledger directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ledger'))
@@ -37,12 +37,16 @@ _OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/allow")
 
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
 
-# Prometheus metrics
-_POLICY_DECISIONS = Counter(
-    "ail_policy_decisions_total",
-    "Total AIL policy decisions by status, tool, and policy",
-    ["status", "tool_name", "policy"],
-)
+# Prometheus metrics — guard against double-registration when the module is
+# re-imported in the same process (e.g. pytest collecting multiple test files).
+try:
+    _POLICY_DECISIONS = Counter(
+        "ail_policy_decisions_total",
+        "Total AIL policy decisions by status, tool, and policy",
+        ["status", "tool_name", "policy"],
+    )
+except ValueError:
+    _POLICY_DECISIONS = REGISTRY._names_to_collectors["ail_policy_decisions_total"]
 
 try:
     start_http_server(8000)
