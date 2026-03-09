@@ -12,6 +12,14 @@ services:
       - "/policy"
     volumes:
       - ./policy:/policy
+    # OPA image is distroless (no shell/wget). Use OPA binary to eval the
+    # loaded policy — confirms binary is functional and policies compile cleanly.
+    healthcheck:
+      test: ["CMD", "/opa", "eval", "--data", "/policy", "data.ail.main"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   immudb:
@@ -22,6 +30,12 @@ services:
     environment:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
+    healthcheck:
+      test: ["CMD", "immuadmin", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
 
   spire-server:
@@ -35,6 +49,12 @@ services:
       - spire-server-data:/opt/spire/data
       - spire-server-socket:/tmp/spire-server
       - ./scripts/init-spire-data.sh:/docker-entrypoint-initdb.d/init-spire-data.sh
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck", "-socketPath", "/tmp/spire-server/private/api.sock"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     restart: unless-stopped
     command: ["/opt/spire/bin/spire-server", "run", "-config", "/opt/spire/conf/server/server.conf"]
 
@@ -43,7 +63,7 @@ services:
     user: "0:0"
     depends_on:
       spire-server:
-        condition: service_started
+        condition: service_healthy
       token-generator:
         condition: service_completed_successfully
     volumes:
@@ -63,8 +83,10 @@ services:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml
       - spire-sockets:/tmp/spire-sockets
     depends_on:
-      - spire-agent
-      - opa
+      spire-agent:
+        condition: service_started
+      opa:
+        condition: service_healthy
     restart: always
     command: ["/usr/local/bin/envoy", "-c", "/etc/envoy/envoy.yaml"]
 
@@ -89,7 +111,10 @@ services:
       - spire-server-socket:/tmp/spire-server
       - ./scripts/register-workloads-container.sh:/opt/register.sh
     depends_on:
-      - spire-agent
+      spire-server:
+        condition: service_healthy
+      spire-agent:
+        condition: service_started
     restart: "no"
     entrypoint: ["/bin/sh", "/opt/register.sh"]
 
@@ -104,7 +129,7 @@ services:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
       - SPIFFE_ENDPOINT_SOCKET=unix:///tmp/spire-sockets/workload_api.sock
-      - OPA_URL=https://envoy:8443/v1/data/ail/main/deny
+      - OPA_URL=https://envoy:8443/v1/data/ail/main/allow
       - SPIRE_DISABLED=false
     volumes:
       - .:/app
@@ -121,10 +146,16 @@ services:
         echo 'SPIRE ready. Starting demo...'
         exec su -s /bin/bash ail-agent -c 'python /app/framework_integration/langgraph_demo.py'
     depends_on:
-      - spire-agent
-      - opa
-      - immudb
-      - envoy
+      spire-agent:
+        condition: service_started
+      opa:
+        condition: service_healthy
+      immudb:
+        condition: service_healthy
+      envoy:
+        condition: service_started
+      policy-validator:
+        condition: service_completed_successfully
 
   # Epic 4: Observability & Telemetry
   prometheus:
@@ -153,6 +184,7 @@ services:
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
+      - grafana-data:/var/lib/grafana
       - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
       - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
@@ -163,7 +195,8 @@ services:
   token-generator:
     image: docker:cli
     depends_on:
-      - spire-server
+      spire-server:
+        condition: service_healthy
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - spire-tokens:/opt/spire/tokens
@@ -232,6 +265,16 @@ services:
         echo "agent.conf written"
         echo "=== Token generation complete ==="
 
+  # Validates all Rego policies compile cleanly before the agent starts.
+  # If any policy has a syntax or type error, this service exits non-zero
+  # and the langgraph-demo will not start — preventing silent fail-open.
+  policy-validator:
+    image: openpolicyagent/opa:latest
+    volumes:
+      - ./policy:/policy:ro
+    command: ["check", "--strict", "/policy"]
+    restart: "no"
+
 volumes:
   spire-server-data:
   spire-server-socket:
@@ -239,3 +282,4 @@ volumes:
   spire-agent-data:
   spire-agent-config:
   spire-tokens:
+  grafana-data:

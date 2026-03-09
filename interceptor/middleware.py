@@ -29,15 +29,19 @@ logging.basicConfig(
 #                               http://localhost:8181/v1/data/ail/main/deny
 #                               Policy is still evaluated; transport identity is not.
 _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
-_OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/deny")
+# Query the explicit /allow endpoint, not /deny.
+# If the policy fails to compile, OPA returns {"result": null} for this path,
+# which the middleware treats as DENIED (fail-closed). Checking allow == True
+# is strictly safer than checking absence of denials.
+_OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/allow")
 
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
 
 # Prometheus metrics
 _POLICY_DECISIONS = Counter(
     "ail_policy_decisions_total",
-    "Total AIL policy decisions by status and tool",
-    ["status", "tool_name"],
+    "Total AIL policy decisions by status, tool, and policy",
+    ["status", "tool_name", "policy"],
 )
 
 try:
@@ -129,13 +133,14 @@ def get_spiffe_ssl_context() -> ssl.SSLContext | None:
 def query_opa_policy(tool_name, tool_args):
     """
     Query OPA policy for tool call authorization using mTLS authentication.
+    Implements two-query fallback: primary /allow check, then /deny for details.
 
     Args:
         tool_name (str): Name of the tool being called
         tool_args (dict): Arguments passed to the tool
 
     Returns:
-        dict: OPA policy decision
+        dict: OPA policy decision with denial reasons if applicable
     """
     # Epic 2: Pre-Flight Input Validation
     # Catch LLM hallucinations before they are sent to OPA over the network
@@ -168,6 +173,7 @@ def query_opa_policy(tool_name, tool_args):
                 "deny": ["Workload Identity missing or invalid. Execution blocked by AIL."]
             }
 
+    # Primary query to /allow endpoint
     try:
         with httpx.Client(verify=ssl_context) as client:
             response = client.post(
@@ -176,16 +182,62 @@ def query_opa_policy(tool_name, tool_args):
                 timeout=5,
             )
 
-        logging.debug(f"OPA status={response.status_code} body={response.text}")
+        logging.debug(f"OPA /allow status={response.status_code} body={response.text}")
 
         if response.status_code == 200:
-            result = response.json().get("result", [])
-            # New aggregated format: result is directly a list of deny messages
-            if isinstance(result, list) and result:
-                combined_reason = "; ".join(result)
-                return {"allowed": False, "reason": combined_reason, "deny": result}
-            else:
+            result = response.json().get("result")
+            # result must be explicitly True. Any other value — False, null,
+            # or missing (policy not loaded / compile error) — is DENIED.
+            if result is None:
+                logging.error(
+                    "OPA returned null for /allow — policy not loaded or failed to compile. "
+                    "Fail-closed policy enforced."
+                )
+                return _DENIED_UNAVAILABLE
+            if result is True:
                 return {"allowed": True, "reason": "Action approved by policy", "deny": []}
+            else:
+                # allow is False, execute second query to /deny for specific reasons
+                deny_url = _OPA_URL.replace("/allow", "/deny")
+                try:
+                    with httpx.Client(verify=ssl_context) as client:
+                        deny_response = client.post(
+                            deny_url,
+                            json={"input": {"tool_args": tool_args}},
+                            timeout=5,
+                        )
+                    
+                    logging.debug(f"OPA /deny status={deny_response.status_code} body={deny_response.text}")
+                    
+                    if deny_response.status_code == 200:
+                        deny_result = deny_response.json().get("result", [])
+                        # Ensure deny_result is a list of strings
+                        if isinstance(deny_result, list) and deny_result:
+                            combined_reason = "; ".join(deny_result)
+                            return {
+                                "allowed": False,
+                                "reason": f"DENIED: {combined_reason}",
+                                "deny": deny_result
+                            }
+                        else:
+                            return {
+                                "allowed": False,
+                                "reason": "DENIED: Action did not pass policy evaluation.",
+                                "deny": ["Action did not pass policy evaluation."]
+                            }
+                    else:
+                        return {
+                            "allowed": False,
+                            "reason": "DENIED: Action did not pass policy evaluation.",
+                            "deny": ["Action did not pass policy evaluation."]
+                        }
+                except Exception as e:
+                    logging.error(f"OPA /deny query failed: {e}")
+                    return {
+                        "allowed": False,
+                        "reason": "DENIED: Action did not pass policy evaluation.",
+                        "deny": ["Action did not pass policy evaluation."]
+                    }
         else:
             return _DENIED_UNAVAILABLE
 
@@ -222,6 +274,8 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
             "message": opa_decision.get("reason", "Action approved by policy")
         }
         decision_for_ledger = "APPROVED"
+        # For approved requests, use "approved" as policy label
+        policy_label = "approved"
     else:
         deny_messages = opa_decision.get("deny", [])
         combined_reason = (
@@ -230,9 +284,19 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         )
         response = {"status": "DENIED", "message": combined_reason}
         decision_for_ledger = f"DENIED: {combined_reason}"
+        
+        # Extract policy name from denial reason for Prometheus labeling
+        # Get the first denial message and extract first word (e.g., "SOC2", "FinOps")
+        if deny_messages and deny_messages[0]:
+            first_denial = deny_messages[0]
+            # Extract first word, removing any "DENIED:" prefix
+            policy_label = first_denial.replace("DENIED:", "").strip().split()[0].lower()
+        else:
+            # Fallback: extract from combined reason
+            policy_label = combined_reason.replace("DENIED:", "").strip().split()[0].lower()
 
     logging.info(f"Policy Engine Decision: {response['status']}: {response['message']}")
-    _POLICY_DECISIONS.labels(status=response["status"], tool_name=tool_name).inc()
+    _POLICY_DECISIONS.labels(status=response["status"], tool_name=tool_name, policy=policy_label).inc()
 
     # Fail-closed: log to ImmuDB ledger or block execution if unavailable
     record_hash = "unavailable"  # Initialize to prevent uninitialized variable usage

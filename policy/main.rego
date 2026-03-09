@@ -1,10 +1,8 @@
-# VERSION: 1.0.0
+# VERSION: 1.1.0
 # AIL Main Policy Aggregator
 # Imports and aggregates all compliance frameworks
 
 package ail.main
-
-import rego.v1
 
 # Import all framework policies
 import data.ail.frameworks.gdpr
@@ -13,18 +11,26 @@ import data.ail.frameworks.finops
 
 # Aggregate all deny messages from all frameworks
 deny contains msg if {
-    # Collect violations from GDPR framework
     gdpr.deny[msg]
 }
 
 deny contains msg if {
-    # Collect violations from SOC2 framework
     soc2.deny[msg]
 }
 
 deny contains msg if {
-    # Collect violations from FinOps framework
     finops.deny[msg]
+}
+
+# Explicit allow gate — default is DENY.
+# This rule must be the affirmative result checked by the middleware.
+# If this package fails to compile, OPA returns null for /allow → middleware
+# treats null as DENIED (fail-closed). An empty deny set is NOT sufficient;
+# allow must be explicitly true.
+default allow := false
+
+allow if {
+    count(deny) == 0
 }
 
 # Helper rule to get all violations for debugging/audit purposes
