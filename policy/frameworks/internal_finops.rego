@@ -1,14 +1,17 @@
-# VERSION: 1.0.0
+# VERSION: 1.1.0
 # Internal FinOps Framework - Cost Control Rules
 
 package ail.frameworks.finops
 
+# Approved cost center values. A missing, blank, or unrecognised value is denied.
+approved_cost_centers := {"engineering", "marketing", "finance", "operations"}
+
 deny contains msg if {
     payload := input.tool_args
     payload.tags.environment == "prod"
-    # object.get returns "" as default so both missing key and empty string are caught
-    object.get(payload.tags, "cost_center", "") == ""
-    msg := "DENIED: Production environments must include a 'cost_center' tag."
+    cc := object.get(payload.tags, "cost_center", "")
+    not approved_cost_centers[cc]
+    msg := "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: engineering, marketing, finance, operations."
 }
 
 deny contains msg if {

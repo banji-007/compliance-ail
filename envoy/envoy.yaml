@@ -54,6 +54,9 @@ static_resources:
                 - san_type: URI
                   matcher:
                     exact: "spiffe://ail.internal/workload/agent"
+                - san_type: URI
+                  matcher:
+                    exact: "spiffe://ail.internal/workload/test"
               validation_context_sds_secret_config:
                 name: "spiffe://ail.internal"
                 sds_config:
