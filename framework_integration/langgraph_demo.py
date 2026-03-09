@@ -73,6 +73,7 @@ class ServerProvisionInput(BaseModel):
     project: str = Field(default="unspecified", description="Project name extracted from user prompt (e.g., 'ml-training', 'webapp'). Use 'unspecified' if not mentioned.")
     data_classification: str = Field(default="unspecified", description="Data classification extracted from user prompt (e.g., 'pci-dss', 'internal', 'public'). Use 'unspecified' if not mentioned.")
     cost_center: str = Field(default="", description="Cost center extracted from user prompt. Leave empty string if not mentioned — the policy engine will enforce it.")
+    encryption_at_rest: bool = Field(default=False, description="Whether encryption at rest is enabled. Required for SOC2 compliance in production environments. Set to True when the user mentions encryption, compliance, or SOC2.")
 
 def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict) -> str:
     """Dummy function that simulates cloud server provisioning."""
@@ -95,8 +96,17 @@ def provision_cloud_server(
     project: str = "unspecified",
     data_classification: str = "unspecified",
     cost_center: str = "",
+    encryption_at_rest: bool = False,
 ) -> str:
-    """Provision a cloud server. Extract all tag values from the user prompt and pass them as explicit arguments."""
+    """Provision a cloud server. Extract all tag values from the user prompt and pass them as explicit arguments.
+
+    Tags guide policy enforcement:
+    - environment: deployment tier ('prod', 'dev', 'staging')
+    - project: project name ('ml-training', 'webapp', etc.)
+    - data_classification: data sensitivity ('pci-dss', 'internal', 'public')
+    - cost_center: required for production environments
+    - encryption_at_rest: set True for SOC2-compliant prod deployments
+    """
     print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
 
     tags = {
@@ -104,6 +114,7 @@ def provision_cloud_server(
         "project": project,
         "data_classification": data_classification,
         "cost_center": cost_center,
+        "encryption_at_rest": str(encryption_at_rest).lower(),
     }
 
     args = {
@@ -131,7 +142,7 @@ def provision_cloud_server(
             f"Original parameters: instance_type={instance_type}, region={region}, "
             f"cost_per_hour={cost_per_hour}, environment={environment}, "
             f"project={project}, data_classification={data_classification}, "
-            f"cost_center={cost_center!r}. "
+            f"cost_center={cost_center!r}, encryption_at_rest={encryption_at_rest}. "
             f"Retry the tool with these exact parameters corrected as instructed."
         )
         print(f"{pipeline_prefix} -> [Block] {decision['message']}")
@@ -143,7 +154,7 @@ def provision_cloud_server(
 # ---------------------------------------------------------------------------
 
 # Initialize LLM with strict execution system message
-system_message = """You are an execution agent. You must execute the provision_cloud_server tool immediately using the exact instance_type, region, and cost the user specified. Do not substitute a different instance type or region unless the user explicitly asks you to change them. When the user says to fix a denied request, apply only the corrections they state and keep all other parameters the same. Extract all tags the user mentions (environment, project, data_classification, cost_center) and pass them as explicit arguments."""
+system_message = """You are an execution agent. You must execute the provision_cloud_server tool immediately using the exact instance_type, region, and cost the user specified. Do not substitute a different instance type or region unless the user explicitly asks you to change them. When the user says to fix a denied request, apply only the corrections they state and keep all other parameters the same. Extract all tags the user mentions (environment, project, data_classification, cost_center, encryption_at_rest) and pass them as explicit arguments. For SOC2-compliant or production deployments, set encryption_at_rest=True unless the user explicitly says not to."""
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools([provision_cloud_server])
 

@@ -1,20 +1,19 @@
 #!/bin/sh
 # SPIRE Workload Registration
-# Runs inside docker:cli container; uses docker exec to call the SPIRE server
-# binary without needing a shell in the distroless spire-server image.
+# Waits for the server socket via shared volume, then uses docker exec to call
+# the spire-server binary (distroless image has no shell of its own).
 
-SERVER="compliance-ail-spire-server-1"
+SERVER="spire-server"
 SOCKET="/tmp/spire-server/private/api.sock"
 
 echo "=== SPIRE Workload Registrar ==="
 
-# Wait until the SPIRE server is responsive
-echo "Waiting for SPIRE server..."
-until docker exec "$SERVER" /opt/spire/bin/spire-server agent list \
-    -socketPath "$SOCKET" >/dev/null 2>&1; do
-    sleep 3
+# Wait until the SPIRE server socket file appears (shared via spire-server-socket volume)
+echo "Waiting for SPIRE server socket..."
+until [ -S "$SOCKET" ]; do
+    sleep 2
 done
-echo "Server ready."
+echo "Server socket ready."
 
 # Wait for agent to attest (up to 90s)
 echo "Waiting for SPIRE agent to attest..."
@@ -50,8 +49,8 @@ register_workload() {
     echo ""
 }
 
-register_workload "spiffe://ail.internal/workload/envoy" "unix:path:/usr/local/bin/envoy"
-register_workload "spiffe://ail.internal/workload/agent" "unix:path:/usr/local/bin/python3.11"
+register_workload "spiffe://ail.internal/workload/envoy" "unix:uid:101"
+register_workload "spiffe://ail.internal/workload/agent" "unix:uid:1000"
 
 echo "=== Registered entries ==="
 docker exec "$SERVER" /opt/spire/bin/spire-server entry show \

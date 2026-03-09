@@ -18,6 +18,7 @@ services:
     image: codenotary/immudb:latest
     ports:
       - "3322:3322"
+      - "8080:8080"
     environment:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
@@ -25,12 +26,14 @@ services:
 
   spire-server:
     image: ghcr.io/spiffe/spire-server:1.11.1
+    container_name: spire-server
     user: "0:0"
     ports:
       - "8081:8081"
     volumes:
       - ./spire/server/server.conf:/opt/spire/conf/server/server.conf
       - spire-server-data:/opt/spire/data
+      - spire-server-socket:/tmp/spire-server
       - ./scripts/init-spire-data.sh:/docker-entrypoint-initdb.d/init-spire-data.sh
     restart: unless-stopped
     command: ["/opt/spire/bin/spire-server", "run", "-config", "/opt/spire/conf/server/server.conf"]
@@ -39,11 +42,13 @@ services:
     image: ghcr.io/spiffe/spire-agent:1.11.1
     user: "0:0"
     depends_on:
-      - spire-server
+      spire-server:
+        condition: service_started
+      token-generator:
+        condition: service_completed_successfully
     volumes:
-      - ./spire/agent/agent.conf:/opt/spire/conf/agent/agent.conf
+      - spire-agent-config:/opt/spire/conf/agent
       - spire-sockets:/tmp/spire-sockets
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - spire-agent-data:/opt/spire/data
     restart: unless-stopped
     command: ["/opt/spire/bin/spire-agent", "run", "-config", "/opt/spire/conf/agent/agent.conf"]
@@ -81,6 +86,7 @@ services:
     image: docker:cli
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - spire-server-socket:/tmp/spire-server
       - ./scripts/register-workloads-container.sh:/opt/register.sh
     depends_on:
       - spire-agent
@@ -89,17 +95,17 @@ services:
 
   langgraph-demo:
     image: python:3.11-slim
+    pid: "service:spire-agent"
     stdin_open: true
     tty: true
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - IMMUDB_HOST=immudb
-      - IMMUDB_PORT=3322
+      - IMMUDB_URL=http://immudb:8080
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
       - SPIFFE_ENDPOINT_SOCKET=unix:///tmp/spire-sockets/workload_api.sock
-      - OPA_URL=http://opa:8181/v1/data/ail/main/deny
-      - SPIRE_DISABLED=true
+      - OPA_URL=https://envoy:8443/v1/data/ail/main/deny
+      - SPIRE_DISABLED=false
     volumes:
       - .:/app
       - spire-sockets:/tmp/spire-sockets
@@ -108,13 +114,12 @@ services:
       - bash
       - -c
       - |
-        pip uninstall -y spiffe
-        pip install --no-cache-dir spiffe httpx pydantic
-        pip install -q langchain-openai langgraph langchain-core python-dotenv cryptography ecdsa google-api-core grpcio 'protobuf>=4.21.0,<5.0.0' pem PyJWT pyasn1 pyasn1-modules prometheus-client && pip install -q --no-deps 'immudb-py==1.4.0'
+        pip install -r requirements.txt
+        useradd -u 1000 -m ail-agent 2>/dev/null || true
         echo 'Waiting for SPIRE workload socket...'
         until [ -S /tmp/spire-sockets/workload_api.sock ]; do sleep 2; done
         echo 'SPIRE ready. Starting demo...'
-        python framework_integration/langgraph_demo.py
+        exec su -s /bin/bash ail-agent -c 'python /app/framework_integration/langgraph_demo.py'
     depends_on:
       - spire-agent
       - opa
@@ -155,7 +160,82 @@ services:
       - prometheus
     restart: unless-stopped
 
+  token-generator:
+    image: docker:cli
+    depends_on:
+      - spire-server
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - spire-tokens:/opt/spire/tokens
+      - spire-server-socket:/tmp/spire-server
+      - spire-agent-config:/opt/spire/agent-config
+    restart: "no"
+    entrypoint: ["/bin/sh"]
+    command:
+      - "-c"
+      - |
+        echo "=== SPIRE Token Generator ==="
+        SOCKET="/tmp/spire-server/private/api.sock"
+
+        echo "Waiting for SPIRE server admin socket..."
+        until [ -S "$$SOCKET" ]; do
+          echo "  Socket not ready, waiting..."
+          sleep 2
+        done
+
+        echo "Server socket ready. Generating join token..."
+        TOKEN_OUTPUT=$$(docker exec spire-server \
+          /opt/spire/bin/spire-server token generate \
+          -spiffeID spiffe://ail.internal/agent/local \
+          -socketPath "$$SOCKET" 2>&1)
+
+        echo "Token generation result: $$TOKEN_OUTPUT"
+
+        TOKEN=$$(echo "$$TOKEN_OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+        if [ -z "$$TOKEN" ]; then
+          echo "ERROR: Failed to extract token from output"
+          exit 1
+        fi
+
+        echo "Generated token: $${TOKEN:0:8}..."
+        echo "$$TOKEN" > /opt/spire/tokens/join_token
+        echo "Token written to shared volume"
+
+        echo "Writing agent.conf with live token..."
+        {
+          echo 'agent {'
+          echo '    data_dir          = "/opt/spire/data"'
+          echo '    log_level         = "INFO"'
+          echo '    server_address    = "spire-server"'
+          echo '    server_port       = "8081"'
+          echo '    socket_path       = "/tmp/spire-sockets/workload_api.sock"'
+          echo '    trust_domain      = "ail.internal"'
+          echo '    insecure_bootstrap = true'
+          echo "    join_token        = \"$$TOKEN\""
+          echo '}'
+          echo ''
+          echo 'plugins {'
+          echo '    NodeAttestor "join_token" {'
+          echo '        plugin_data {}'
+          echo '    }'
+          echo '    KeyManager "disk" {'
+          echo '        plugin_data {'
+          echo '            directory = "/opt/spire/data"'
+          echo '        }'
+          echo '    }'
+          echo '    WorkloadAttestor "unix" {'
+          echo '        plugin_data {}'
+          echo '    }'
+          echo '}'
+        } > /opt/spire/agent-config/agent.conf
+        echo "agent.conf written"
+        echo "=== Token generation complete ==="
+
 volumes:
   spire-server-data:
+  spire-server-socket:
   spire-sockets:
   spire-agent-data:
+  spire-agent-config:
+  spire-tokens:

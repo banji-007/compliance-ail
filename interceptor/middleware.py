@@ -58,16 +58,14 @@ def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
     socket_path = os.getenv('SPIFFE_ENDPOINT_SOCKET', 'unix:///tmp/spire-sockets/workload_api.sock')
     
     try:
-        from spiffe import X509Source, TrustDomain
+        from spiffe import WorkloadApiClient, TrustDomain
         from cryptography.hazmat.primitives import serialization
-        
-        # Initialize X509Source with the socket path
-        x509_source = X509Source(socket_path=socket_path)
-        
-        # Fetch the local SVID using X509Source
-        svid = x509_source.fetch_x509_svid()
-        bundle_set = x509_source.fetch_x509_bundles()
-        bundle = bundle_set.get_bundle_for_trust_domain(TrustDomain("ail.internal"))
+
+        # One-shot fetch — no background watcher thread that can block indefinitely
+        client = WorkloadApiClient(socket_path=socket_path)
+        x509_context = client.fetch_x509_context()
+        svid = x509_context.default_svid
+        bundle = x509_context.x509_bundle_set.get_bundle_for_trust_domain(TrustDomain("ail.internal"))
         
         # Serialize certificates to PEM bytes (in-memory only)
         cert_pem = b"".join(
