@@ -3,8 +3,13 @@
 
 package ail.frameworks.finops
 
-# Approved cost center values. A missing, blank, or unrecognised value is denied.
-approved_cost_centers := {"engineering", "marketing", "finance", "operations"}
+# Approved cost center values.
+# Reads from bundle data.json (injected by the control plane per tenant).
+# Falls back to hardcoded defaults when running outside the bundle API
+# (e.g. local dev, policy-validator CI check).
+approved_cost_centers := {x | x := data.ail.config.allowed_cost_centers[_]} if {
+    count(data.ail.config.allowed_cost_centers) > 0
+} else := {"engineering", "marketing", "finance", "operations"}
 
 deny contains msg if {
     payload := input.tool_args

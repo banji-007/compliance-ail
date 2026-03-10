@@ -1,0 +1,16 @@
+# OPA Bundle API Configuration
+# OPA polls the AIL Control Plane for its active policy bundle.
+# The control plane dynamically builds the bundle based on the tenant's
+# enabled compliance frameworks and custom policy variables.
+
+services:
+  - name: ail-control-plane
+    url: http://ail-control-plane:8002
+
+bundles:
+  ail-policies:
+    service: ail-control-plane
+    resource: /bundles/tenant_default
+    polling:
+      min_delay_seconds: 10
+      max_delay_seconds: 20

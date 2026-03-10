@@ -1,16 +1,25 @@
 services:
-  policy-bootstrapper:
-    image: alpine:3.19
+  ail-control-plane:
+    image: python:3.11-slim
+    ports:
+      - "8002:8002"
     environment:
-      - ENABLE_GDPR=${ENABLE_GDPR:-true}
-      - ENABLE_SOC2=${ENABLE_SOC2:-true}
-      - ENABLE_FINOPS=${ENABLE_FINOPS:-true}
-      - ENABLE_HIPAA=${ENABLE_HIPAA:-false}
+      - DATABASE_URL=sqlite:////data/control_plane.db
     volumes:
-      - ./policy:/policy/source:ro
-      - policy-active:/policy/active
-    entrypoint: ["/bin/sh", "/policy/source/docker-entrypoint.sh"]
-    restart: "no"
+      - ./control_plane:/app
+      - ./policy:/policy:ro
+      - control-plane-data:/data
+    working_dir: /app
+    command: >
+      sh -c "pip install -r requirements.txt -q &&
+             uvicorn main:app --host 0.0.0.0 --port 8002"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
 
   opa:
     image: openpolicyagent/opa:1.14.1
@@ -19,24 +28,24 @@ services:
     command:
       - "run"
       - "--server"
-      - "--watch"
+      - "--config-file=/config/opa-config.yaml"
       - "--log-format=text"
       - "--log-level=info"
       - "--addr=0.0.0.0:8181"
-      - "/policy/active"
     volumes:
-      - policy-active:/policy/active:ro
+      - ./opa-config.yaml:/config/opa-config.yaml:ro
     depends_on:
-      policy-bootstrapper:
-        condition: service_completed_successfully
-    # OPA image is distroless (no shell/wget). Use OPA binary to eval the
-    # loaded policy — confirms binary is functional and policies compile cleanly.
+      ail-control-plane:
+        condition: service_healthy
+    # OPA loads policy via bundle API — no local files to eval against.
+    # Health check verifies the binary is alive; bundle load status is
+    # visible in OPA logs and Prometheus metrics.
     healthcheck:
-      test: ["CMD", "/opa", "eval", "--data", "/policy/active", "data.ail.main"]
+      test: ["CMD", "/opa", "version"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
 
   immudb:
@@ -307,6 +316,5 @@ volumes:
   spire-agent-config:
   spire-tokens:
   grafana-data:
-  # Shared volume between policy-bootstrapper (writer) and opa (reader).
-  # Populated at boot with core policy + enabled compliance packs.
-  policy-active:
+  # Persists SQLite tenant config across docker compose down/up cycles.
+  control-plane-data:
