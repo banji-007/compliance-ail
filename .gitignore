@@ -28,9 +28,10 @@ ENV/
 .env.*
 !.env.example
 
-# IDE
+# IDE / AI tooling
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 .windsurfrules
