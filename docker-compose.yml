@@ -24,10 +24,11 @@ services:
     restart: unless-stopped
 
   immudb:
-    image: codenotary/immudb:latest
+    image: codenotary/immudb:1.9.5
     ports:
       - "3322:3322"
-      - "8080:8080"
+      # Port 8080 (REST API) intentionally not exposed to host — internal Docker
+      # network only. Access via service name 'immudb' from other containers.
     environment:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
