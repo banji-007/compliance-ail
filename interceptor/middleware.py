@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import sys
@@ -55,6 +56,41 @@ except OSError:
     pass  # port already bound (e.g. module reloaded)
 
 
+def _compute_policy_hash() -> str:
+    """
+    Return a SHA-256 fingerprint of all Rego files in policy/frameworks/.
+
+    Files are sorted by name before hashing so the digest is deterministic.
+    Any change to a policy file produces a different hash, making policy
+    drift immediately visible in the ImmuDB audit ledger.
+    """
+    frameworks_dir = os.path.join(os.path.dirname(__file__), '..', 'policy', 'frameworks')
+    h = hashlib.sha256()
+    try:
+        rego_files = sorted(
+            f for f in os.listdir(frameworks_dir) if f.endswith('.rego')
+        )
+        for filename in rego_files:
+            path = os.path.join(frameworks_dir, filename)
+            with open(path, 'rb') as fh:
+                h.update(filename.encode())   # include filename so renames are detected
+                h.update(fh.read())
+        # Also hash the top-level aggregator — a tampered default allow := true
+        # there bypasses all frameworks regardless of framework file contents.
+        aggregator = os.path.join(frameworks_dir, '..', 'main.rego')
+        if os.path.exists(aggregator):
+            with open(aggregator, 'rb') as fh:
+                h.update(b'main.rego')
+                h.update(fh.read())
+
+        digest = h.hexdigest()
+        logging.debug(f"Policy hash computed over {len(rego_files)} files + aggregator: {digest[:16]}…")
+        return digest
+    except Exception as e:
+        logging.error(f"Failed to compute policy hash from {frameworks_dir}: {e}")
+        return "hash-unavailable"
+
+
 def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
     """
     Create an SSL context with SPIFFE SVID fetched entirely in-memory.
@@ -93,28 +129,44 @@ def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
         ssl_ctx.check_hostname = False  # SPIFFE certs use URI SANs, not DNS SANs
         ssl_ctx.verify_mode = ssl.CERT_REQUIRED
         
-        # Load certificates directly from memory
-        from io import BytesIO
-        import tempfile
-        
-        # Create temporary in-memory file-like objects for certificate loading
-        cert_file = tempfile.NamedTemporaryFile(delete=False)
-        cert_file.write(cert_pem)
-        cert_file.flush()
-        
-        key_file = tempfile.NamedTemporaryFile(delete=False)
-        key_file.write(key_pem)
-        key_file.flush()
-        
-        try:
-            ssl_ctx.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
-            ssl_ctx.load_verify_locations(cadata=ca_pem.decode())
-        finally:
-            # Clean up temporary files
-            os.unlink(cert_file.name)
-            os.unlink(key_file.name)
-            cert_file.close()
-            key_file.close()
+        # Load cert/key without writing private key material to the filesystem.
+        if hasattr(os, 'memfd_create'):
+            # Linux production path: anonymous RAM-only FDs — SOC2 compliant.
+            cert_fd = os.memfd_create("spiffe_cert", flags=0)
+            key_fd  = os.memfd_create("spiffe_key",  flags=0)
+            try:
+                os.write(cert_fd, cert_pem)
+                os.write(key_fd,  key_pem)
+                cert_path = f"/proc/self/fd/{cert_fd}"
+                key_path  = f"/proc/self/fd/{key_fd}"
+                ssl_ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+                ssl_ctx.load_verify_locations(cadata=ca_pem.decode())
+            finally:
+                os.close(cert_fd)
+                os.close(key_fd)
+        else:
+            # macOS/Windows dev fallback: disk-backed temp files.
+            # WARNING: private key material touches the filesystem.
+            # This path must never run in production.
+            logging.warning(
+                "os.memfd_create unavailable on this OS — using disk-backed temp files "
+                "for SPIFFE certificate loading. This is a LOCAL DEV fallback only and "
+                "must not run in production (SOC2 violation)."
+            )
+            cert_file = tempfile.NamedTemporaryFile(delete=False)
+            key_file  = tempfile.NamedTemporaryFile(delete=False)
+            try:
+                cert_file.write(cert_pem)
+                cert_file.flush()
+                key_file.write(key_pem)
+                key_file.flush()
+                ssl_ctx.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
+                ssl_ctx.load_verify_locations(cadata=ca_pem.decode())
+            finally:
+                cert_file.close()
+                key_file.close()
+                os.unlink(cert_file.name)
+                os.unlink(key_file.name)
         
         logging.info(f"SPIFFE SVID loaded in-memory: {svid.spiffe_id}")
         return ssl_ctx
@@ -308,7 +360,7 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         from immudb_ledger import get_ledger
         ledger = get_ledger()
 
-        policy_version = "1.0.0"
+        policy_version = _compute_policy_hash()
         ledger.log_tool_call(
             agent_id=agent_id,
             tool_name=tool_name,
