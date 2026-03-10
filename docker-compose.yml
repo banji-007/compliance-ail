@@ -5,6 +5,11 @@ services:
       - "8002:8002"
     environment:
       - DATABASE_URL=sqlite:////data/control_plane.db
+      # ImmuDB credentials — consumed by GET /audit to proxy ledger entries.
+      # immudb:8080 is internal-only (port not exposed to host by design).
+      - IMMUDB_URL=http://immudb:8080
+      - IMMUDB_USER=${IMMUDB_USER}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
     volumes:
       - ./control_plane:/app
       - ./policy:/policy:ro
@@ -307,6 +312,23 @@ services:
       - ./policy/packs:/policy/packs:ro
     command: ["check", "--strict", "/policy/core", "/policy/packs"]
     restart: "no"
+
+  # Phase 3: CISO Control Plane Dashboard (Next.js)
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are baked into the JS bundle at build time.
+        # Browser-side fetches hit localhost:8002 (host-exposed port).
+        NEXT_PUBLIC_API_URL: http://localhost:8002
+        NEXT_PUBLIC_TENANT_ID: tenant_default
+    ports:
+      - "3001:3001"
+    depends_on:
+      ail-control-plane:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   spire-server-data:
