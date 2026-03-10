@@ -58,36 +58,34 @@ except OSError:
 
 def _compute_policy_hash() -> str:
     """
-    Return a SHA-256 fingerprint of all Rego files in policy/frameworks/.
+    Return a SHA-256 fingerprint of all Rego files in policy/active/.
+
+    policy/active/ is populated at boot by the policy-bootstrapper init
+    container: it always contains core/main.rego plus whichever compliance
+    packs are enabled via ENABLE_* env vars. Hashing this directory captures
+    exactly the policy surface that OPA is evaluating, including the aggregator.
 
     Files are sorted by name before hashing so the digest is deterministic.
-    Any change to a policy file produces a different hash, making policy
-    drift immediately visible in the ImmuDB audit ledger.
+    Any change to an active policy file produces a different hash, making
+    policy drift immediately visible in the ImmuDB audit ledger.
     """
-    frameworks_dir = os.path.join(os.path.dirname(__file__), '..', 'policy', 'frameworks')
+    active_dir = os.path.join(os.path.dirname(__file__), '..', 'policy', 'active')
     h = hashlib.sha256()
     try:
         rego_files = sorted(
-            f for f in os.listdir(frameworks_dir) if f.endswith('.rego')
+            f for f in os.listdir(active_dir) if f.endswith('.rego')
         )
         for filename in rego_files:
-            path = os.path.join(frameworks_dir, filename)
+            path = os.path.join(active_dir, filename)
             with open(path, 'rb') as fh:
                 h.update(filename.encode())   # include filename so renames are detected
                 h.update(fh.read())
-        # Also hash the top-level aggregator — a tampered default allow := true
-        # there bypasses all frameworks regardless of framework file contents.
-        aggregator = os.path.join(frameworks_dir, '..', 'main.rego')
-        if os.path.exists(aggregator):
-            with open(aggregator, 'rb') as fh:
-                h.update(b'main.rego')
-                h.update(fh.read())
 
         digest = h.hexdigest()
-        logging.debug(f"Policy hash computed over {len(rego_files)} files + aggregator: {digest[:16]}…")
+        logging.debug(f"Policy hash computed over {len(rego_files)} active file(s): {digest[:16]}…")
         return digest
     except Exception as e:
-        logging.error(f"Failed to compute policy hash from {frameworks_dir}: {e}")
+        logging.error(f"Failed to compute policy hash from {active_dir}: {e}")
         return "hash-unavailable"
 
 
