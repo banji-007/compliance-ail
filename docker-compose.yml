@@ -76,7 +76,7 @@ services:
     command: ["/opt/spire/bin/spire-agent", "run", "-config", "/opt/spire/conf/agent/agent.conf"]
 
   envoy:
-    image: envoyproxy/envoy:v1.27-latest
+    image: envoyproxy/envoy:v1.27.7
     pid: "service:spire-agent"
     ports:
       - "8443:8443"
