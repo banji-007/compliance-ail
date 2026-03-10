@@ -1,6 +1,6 @@
 services:
   opa:
-    image: openpolicyagent/opa:v1.14.1
+    image: openpolicyagent/opa:1.14.1
     ports:
       - "8181:8181"
     command:
@@ -275,7 +275,7 @@ services:
   # If any policy has a syntax or type error, this service exits non-zero
   # and the langgraph-demo will not start — preventing silent fail-open.
   policy-validator:
-    image: openpolicyagent/opa:v1.14.1
+    image: openpolicyagent/opa:1.14.1
     volumes:
       - ./policy:/policy:ro
     command: ["check", "--strict", "/policy"]
