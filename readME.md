@@ -74,7 +74,6 @@ docker attach compliance-ail-langgraph-demo-1
 ### 4. View the CISO Dashboard
 Navigate to `http://localhost:3000` to view the live Grafana dashboard tracking the policy decisions.
 
----
 
 ## 🛡️ Security & Threat Model & Bypass Mitigation
 
