@@ -1,4 +1,17 @@
 services:
+  policy-bootstrapper:
+    image: alpine:3.19
+    environment:
+      - ENABLE_GDPR=${ENABLE_GDPR:-true}
+      - ENABLE_SOC2=${ENABLE_SOC2:-true}
+      - ENABLE_FINOPS=${ENABLE_FINOPS:-true}
+      - ENABLE_HIPAA=${ENABLE_HIPAA:-false}
+    volumes:
+      - ./policy:/policy/source:ro
+      - policy-active:/policy/active
+    entrypoint: ["/bin/sh", "/policy/source/docker-entrypoint.sh"]
+    restart: "no"
+
   opa:
     image: openpolicyagent/opa:1.14.1
     ports:
@@ -10,13 +23,16 @@ services:
       - "--log-format=text"
       - "--log-level=info"
       - "--addr=0.0.0.0:8181"
-      - "/policy"
+      - "/policy/active"
     volumes:
-      - ./policy:/policy
+      - policy-active:/policy/active:ro
+    depends_on:
+      policy-bootstrapper:
+        condition: service_completed_successfully
     # OPA image is distroless (no shell/wget). Use OPA binary to eval the
     # loaded policy — confirms binary is functional and policies compile cleanly.
     healthcheck:
-      test: ["CMD", "/opa", "eval", "--data", "/policy", "data.ail.main"]
+      test: ["CMD", "/opa", "eval", "--data", "/policy/active", "data.ail.main"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -271,14 +287,16 @@ services:
         echo "agent.conf written"
         echo "=== Token generation complete ==="
 
-  # Validates all Rego policies compile cleanly before the agent starts.
-  # If any policy has a syntax or type error, this service exits non-zero
-  # and the langgraph-demo will not start — preventing silent fail-open.
+  # Validates all Rego policies (core + all packs) compile cleanly before
+  # the agent starts. Checks the full source tree regardless of which packs
+  # are enabled — catches syntax/type errors in inactive packs too.
+  # Exits non-zero on any error; langgraph-demo will not start if this fails.
   policy-validator:
     image: openpolicyagent/opa:1.14.1
     volumes:
-      - ./policy:/policy:ro
-    command: ["check", "--strict", "/policy"]
+      - ./policy/core:/policy/core:ro
+      - ./policy/packs:/policy/packs:ro
+    command: ["check", "--strict", "/policy/core", "/policy/packs"]
     restart: "no"
 
 volumes:
@@ -289,3 +307,6 @@ volumes:
   spire-agent-config:
   spire-tokens:
   grafana-data:
+  # Shared volume between policy-bootstrapper (writer) and opa (reader).
+  # Populated at boot with core policy + enabled compliance packs.
+  policy-active:
