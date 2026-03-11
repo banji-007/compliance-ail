@@ -16,6 +16,8 @@ develop-eggs/
 .installed.cfg
 lib/
 lib64/
+# dashboard/lib/ contains TypeScript source (not a venv) — must be tracked
+!dashboard/lib/
 
 # Virtual environments
 venv/

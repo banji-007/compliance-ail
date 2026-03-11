@@ -7,7 +7,6 @@ import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -17,6 +16,7 @@ import { ComplianceToggles } from "@/components/compliance-toggles";
 import { CostCenterInput } from "@/components/cost-center-input";
 import { fetchTenant, updateTenant } from "@/lib/api";
 import { parseCostCenters, serializeCostCenters } from "@/lib/utils";
+
 import type { Tenant } from "@/lib/types";
 
 const TENANT_ID =
@@ -31,6 +31,8 @@ type FormState = {
   enable_finops: boolean;
   enable_hipaa: boolean;
   cost_centers: string[];
+  approved_regions: string[];
+  approved_purposes: string[];
 };
 
 function tenantToForm(t: Tenant): FormState {
@@ -40,6 +42,8 @@ function tenantToForm(t: Tenant): FormState {
     enable_finops: t.enable_finops,
     enable_hipaa: t.enable_hipaa,
     cost_centers: parseCostCenters(t.allowed_cost_centers),
+    approved_regions: parseCostCenters(t.approved_regions),
+    approved_purposes: parseCostCenters(t.approved_purposes),
   };
 }
 
@@ -92,6 +96,14 @@ export default function SettingsPage() {
     setForm((prev) => (prev ? { ...prev, cost_centers: values } : prev));
   }
 
+  function handleApprovedRegions(values: string[]) {
+    setForm((prev) => (prev ? { ...prev, approved_regions: values } : prev));
+  }
+
+  function handleApprovedPurposes(values: string[]) {
+    setForm((prev) => (prev ? { ...prev, approved_purposes: values } : prev));
+  }
+
   function handleSave() {
     if (!form) return;
     mutation.mutate({
@@ -100,6 +112,8 @@ export default function SettingsPage() {
       enable_finops: form.enable_finops,
       enable_hipaa: form.enable_hipaa,
       allowed_cost_centers: serializeCostCenters(form.cost_centers),
+      approved_regions: serializeCostCenters(form.approved_regions),
+      approved_purposes: serializeCostCenters(form.approved_purposes),
     });
   }
 
@@ -109,8 +123,9 @@ export default function SettingsPage() {
         form.enable_soc2 !== tenant.enable_soc2 ||
         form.enable_finops !== tenant.enable_finops ||
         form.enable_hipaa !== tenant.enable_hipaa ||
-        serializeCostCenters(form.cost_centers) !==
-          tenant.allowed_cost_centers
+        serializeCostCenters(form.cost_centers) !== tenant.allowed_cost_centers ||
+        serializeCostCenters(form.approved_regions) !== tenant.approved_regions ||
+        serializeCostCenters(form.approved_purposes) !== tenant.approved_purposes
       : false;
 
   // ---------------------------------------------------------------------------
@@ -194,6 +209,53 @@ export default function SettingsPage() {
             values={form.cost_centers}
             onChange={handleCostCenters}
             disabled={mutation.isPending}
+          />
+        </CardContent>
+      </Card>
+
+      <Separator />
+
+      {/* Approved regions card */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Approved Regions</CardTitle>
+          <CardDescription>
+            Cloud provisioning requests with a{" "}
+            <span className="font-mono text-xs">region</span> not in this list
+            will be denied by the GDPR data residency rules. Type a region and
+            press <kbd className="rounded border px-1 font-mono text-xs">Enter</kbd>{" "}
+            or <kbd className="rounded border px-1 font-mono text-xs">,</kbd> to add.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <CostCenterInput
+            values={form.approved_regions}
+            onChange={handleApprovedRegions}
+            disabled={mutation.isPending}
+            placeholder="Type a region, press Enter… e.g. eu-central-1"
+          />
+        </CardContent>
+      </Card>
+
+      <Separator />
+
+      {/* Approved processing purposes card */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Approved Processing Purposes</CardTitle>
+          <CardDescription>
+            Database queries on PII tables must declare a{" "}
+            <span className="font-mono text-xs">processing_purpose</span> from
+            this list. Undeclared or unapproved purposes are denied by the GDPR
+            purpose-limitation rule (Art. 5(1)(b)).
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <CostCenterInput
+            values={form.approved_purposes}
+            onChange={handleApprovedPurposes}
+            disabled={mutation.isPending}
+            placeholder="Type a purpose, press Enter… e.g. customer_support"
           />
         </CardContent>
       </Card>

@@ -13,7 +13,7 @@ from prometheus_client import Counter, start_http_server, REGISTRY
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ledger'))
 
 # Import pre-flight validation schemas
-from schemas import validate_cloud_server_args
+from schemas import TOOL_VALIDATORS
 
 # Configure logging
 logging.basicConfig(
@@ -197,17 +197,26 @@ def query_opa_policy(tool_name, tool_args):
         dict: OPA policy decision with denial reasons if applicable
     """
     # Epic 2: Pre-Flight Input Validation
-    # Catch LLM hallucinations before they are sent to OPA over the network
-    if tool_name == "provision_cloud_server":
-        is_valid, error_message = validate_cloud_server_args(tool_args)
-        if not is_valid:
-            error_details = f"DENIED: Schema Validation Failed. {error_message}"
-            logging.warning(f"Pre-flight validation failed for {tool_name}: {error_details}")
-            return {
-                "allowed": False,
-                "reason": error_details,
-                "deny": [error_details]
-            }
+    # Catch LLM hallucinations before they are sent to OPA over the network.
+    # Fail-closed: tools not present in TOOL_VALIDATORS are blocked here.
+    validator = TOOL_VALIDATORS.get(tool_name)
+    if validator is None:
+        error_details = f"DENIED: Schema Validation Failed. No registered schema for tool '{tool_name}'."
+        logging.warning(f"Pre-flight validation blocked unregistered tool: {tool_name}")
+        return {
+            "allowed": False,
+            "reason": error_details,
+            "deny": [error_details],
+        }
+    is_valid, error_message = validator(tool_args)
+    if not is_valid:
+        error_details = f"DENIED: Schema Validation Failed. {error_message}"
+        logging.warning(f"Pre-flight validation failed for {tool_name}: {error_details}")
+        return {
+            "allowed": False,
+            "reason": error_details,
+            "deny": [error_details],
+        }
     
     if _SPIRE_DISABLED:
         if not (_OPA_URL.startswith("http://localhost") or _OPA_URL.startswith("http://127.0.0.1") or _OPA_URL.startswith("http://opa")):

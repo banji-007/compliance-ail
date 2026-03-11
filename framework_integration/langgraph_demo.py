@@ -43,25 +43,8 @@ load_dotenv()
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
-class ComplianceAgent:
-    def __init__(self, model="gpt-4", tools=None, system_prompt=None):
-        """Initialize the compliance agent with system prompt and tools."""
-        if system_prompt is None:
-            # Default coaching prompt for policy compliance
-            system_prompt = """You are a helpful cloud infrastructure assistant. 
-
-If a tool returns a DENIED message with policy violations, you must read the violations, explain them to the user, and ask for missing information to try again. Common violations include:
-- Missing cost_center tag for production environments
-- Restricted instance types without proper project=ml-training tag  
-- PCI-DSS data in wrong region (must be eu-central-1)
-
-Always help users comply with policy rather than bypassing it."""
-        
-        self.client = ChatOpenAI(model=model, temperature=0).bind_tools(tools or [])
-        self.graph = create_react_agent(self.client, system_prompt=system_prompt)
-
 # ---------------------------------------------------------------------------
-# Tool definition
+# Tool definitions
 # ---------------------------------------------------------------------------
 
 class ServerProvisionInput(BaseModel):
