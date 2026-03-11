@@ -91,10 +91,14 @@ def test_epic_2_validation():
     print(f"Message: {result.get('message', 'N/A')}")
     print()
     
-    print("Test 6: Non-cloud-server tool (should bypass validation)")
+    print("Test 6: Unregistered tool (fail-closed — must be DENIED before OPA is queried)")
     result = intercept_tool_call('read_file', {'path': '/tmp/test'})
-    print(f"Non-cloud tool result: {result.get('status', 'unknown')}")
+    print(f"Unregistered tool result: {result.get('status', 'unknown')}")
     print(f"Message: {result.get('message', 'N/A')}")
+    assert result.get('status') == 'DENIED', (
+        f"Expected DENIED for unregistered tool 'read_file', got {result.get('status')!r}"
+    )
+    print("✓ Confirmed: unregistered tool blocked fail-closed by TOOL_VALIDATORS registry")
     print()
     
     print("=== Epic 2 Implementation Summary ===")

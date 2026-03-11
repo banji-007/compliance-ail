@@ -67,6 +67,15 @@ class QueryDatabaseInput(BaseModel):
     masking_enabled: bool = Field(default=False, description="Whether PII field masking is enabled. Required for SOC2 compliance on sensitive tables. Set to True when the user mentions masking, compliance, or SOC2.")
 
 
+class DeployToProductionInput(BaseModel):
+    """Input schema for production deployments."""
+    repository_name: str = Field(..., description="Name of the code repository being deployed (e.g., 'auth-service', 'experimental-ml-pipeline')")
+    commit_hash: str = Field(..., description="The full Git commit SHA being deployed (e.g., 'a1b2c3d4e5f6')")
+    environment: str = Field(..., description="Target deployment environment (e.g., 'staging', 'production')")
+    approval_ticket: str = Field(default="", description="Jira or ServiceNow ticket reference authorizing the deployment. Leave empty string if not provided — policy will deny production deploys without one.")
+    bypass_ci: bool = Field(default=False, description="Whether to skip automated CI/CD checks. Policy strictly prohibits setting this to True.")
+
+
 def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict) -> str:
     """Dummy function that simulates cloud server provisioning."""
     return (
@@ -79,6 +88,14 @@ def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hou
 def execute_query_database(target_table: str, query: str, processing_purpose: str) -> str:
     """Dummy function that simulates database query execution."""
     return f"Database queried: table='{target_table}', purpose='{processing_purpose}', query='{query}'"
+
+
+def execute_deploy_to_production(repository_name: str, commit_hash: str, environment: str, approval_ticket: str) -> str:
+    """Dummy function that simulates a production deployment."""
+    return (
+        f"Deployment executed: repo='{repository_name}', commit='{commit_hash[:8]}', "
+        f"environment='{environment}', ticket='{approval_ticket}'"
+    )
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -193,6 +210,54 @@ def query_database(
     return result
 
 
+@tool(args_schema=DeployToProductionInput)
+def deploy_to_production(
+    repository_name: str,
+    commit_hash: str,
+    environment: str,
+    approval_ticket: str = "",
+    bypass_ci: bool = False,
+) -> str:
+    """Deploy a repository to a target environment.
+
+    Policy enforcement:
+    - approval_ticket: SOC2 CC8.1 blocks production deployments with an empty ticket
+    - bypass_ci: SOC2 CC8.1 unconditionally blocks any deployment that skips CI/CD checks
+    - repository_name: FinOps blocks repositories containing 'experimental' from production
+    """
+    print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
+
+    args = {
+        "repository_name": repository_name,
+        "commit_hash": commit_hash,
+        "environment": environment,
+        "approval_ticket": approval_ticket,
+        "bypass_ci": bypass_ci,
+    }
+
+    decision = intercept_tool_call("deploy_to_production", args, agent_id="langgraph_agent")
+
+    record_hash = decision.get("record_hash", "")[:16]
+    pipeline_prefix = (
+        f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] "
+        f"-> [Ledger Hash] {record_hash}..."
+    )
+
+    if decision["status"] == "APPROVED":
+        result = execute_deploy_to_production(repository_name, commit_hash, environment, approval_ticket)
+        print(f"{pipeline_prefix} -> [Execution] {result}")
+    else:
+        result = (
+            f"BLOCKED by AIL: {decision['message']}\n"
+            f"Original parameters: repository_name={repository_name!r}, commit_hash={commit_hash!r}, "
+            f"environment={environment!r}, approval_ticket={approval_ticket!r}, bypass_ci={bypass_ci}. "
+            f"Retry the tool with these exact parameters corrected as instructed."
+        )
+        print(f"{pipeline_prefix} -> [Block] {decision['message']}")
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Tool registry — single source of truth for LLM binding and dispatch
 # ---------------------------------------------------------------------------
@@ -200,6 +265,7 @@ def query_database(
 TOOL_REGISTRY = {
     "provision_cloud_server": provision_cloud_server,
     "query_database": query_database,
+    "deploy_to_production": deploy_to_production,
 }
 
 # ---------------------------------------------------------------------------
@@ -217,7 +283,9 @@ Rules:
 
 For provision_cloud_server: extract instance_type, region, cost_per_hour, environment, project, data_classification, cost_center, and encryption_at_rest from the user prompt and pass them as explicit arguments.
 
-For query_database: extract target_table, query, processing_purpose, and masking_enabled from the user prompt and pass them exactly as stated."""
+For query_database: extract target_table, query, processing_purpose, and masking_enabled from the user prompt and pass them exactly as stated.
+
+For deploy_to_production: extract repository_name, commit_hash, environment, approval_ticket, and bypass_ci from the user prompt and pass them exactly as stated. If no approval ticket is mentioned, pass an empty string."""
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(list(TOOL_REGISTRY.values()))
 
@@ -322,6 +390,9 @@ if __name__ == "__main__":
 
                 # query_database: should be DENIED by GDPR (unapproved processing purpose)
                 run("Query the pii_records table for fraud_detection purposes, with masking enabled.")
+
+                # deploy_to_production: should be DENIED by SOC2 (no approval ticket)
+                run("Deploy the auth-service repo at commit abc123def456 to production with no approval ticket and bypass_ci=false.")
 
                 # Show ledger notice
                 print("\n" + "=" * 70)

@@ -16,11 +16,9 @@ import { ComplianceToggles } from "@/components/compliance-toggles";
 import { CostCenterInput } from "@/components/cost-center-input";
 import { fetchTenant, updateTenant } from "@/lib/api";
 import { parseCostCenters, serializeCostCenters } from "@/lib/utils";
+import { useTenant } from "@/lib/tenant-context";
 
 import type { Tenant } from "@/lib/types";
-
-const TENANT_ID =
-  process.env.NEXT_PUBLIC_TENANT_ID ?? "tenant_default";
 
 // ---------------------------------------------------------------------------
 // Local form state type — mirrors Tenant but cost_centers as array for UI
@@ -53,6 +51,7 @@ function tenantToForm(t: Tenant): FormState {
 
 export default function SettingsPage() {
   const qc = useQueryClient();
+  const { tenantId } = useTenant();
 
   const {
     data: tenant,
@@ -60,13 +59,18 @@ export default function SettingsPage() {
     isError,
     error,
   } = useQuery({
-    queryKey: ["tenant", TENANT_ID],
-    queryFn: () => fetchTenant(TENANT_ID),
+    queryKey: ["tenant", tenantId],
+    queryFn: () => fetchTenant(tenantId),
   });
 
   const [form, setForm] = useState<FormState | null>(null);
 
-  // Sync local form state whenever the server data (re-)loads
+  // Reset form whenever the active tenant switches so stale values don't bleed across.
+  useEffect(() => {
+    setForm(null);
+  }, [tenantId]);
+
+  // Populate form once server data loads (or reloads after tenant switch).
   useEffect(() => {
     if (tenant && !form) {
       setForm(tenantToForm(tenant));
@@ -75,9 +79,9 @@ export default function SettingsPage() {
 
   const mutation = useMutation({
     mutationFn: (update: Parameters<typeof updateTenant>[0]) =>
-      updateTenant(update, TENANT_ID),
+      updateTenant(update, tenantId),
     onSuccess: (updated) => {
-      qc.setQueryData(["tenant", TENANT_ID], updated);
+      qc.setQueryData(["tenant", tenantId], updated);
       setForm(tenantToForm(updated));
     },
   });
@@ -162,7 +166,7 @@ export default function SettingsPage() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Policy Settings</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          {tenant?.name ?? TENANT_ID}
+          {tenant?.name ?? tenantId}
           {" · "}
           Changes trigger a new OPA bundle on the next poll cycle.
         </p>

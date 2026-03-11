@@ -1,0 +1,77 @@
+# docker-compose.test.yml — Minimal CI infrastructure for integration tests.
+#
+# Spins up only the three services pytest needs:
+#   ail-control-plane  — serves OPA policy bundles; seeds default tenant
+#   opa                — policy engine; polls bundle from control plane
+#   immudb             — tamper-evident audit ledger
+#
+# SPIRE, Envoy, Grafana, Prometheus, and the dashboard are NOT included.
+# Tests run with SPIRE_DISABLED=true so mTLS is bypassed.
+#
+# Usage:  make test-integration
+# Requires: Docker Compose v2 (docker compose, not docker-compose)
+
+services:
+
+  ail-control-plane:
+    build:
+      context: ./control_plane
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=sqlite:////data/control_plane.db
+    volumes:
+      - ./policy:/policy:ro
+      - test-control-plane-data:/data
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 25s
+
+  opa:
+    image: openpolicyagent/opa:1.14.1
+    ports:
+      - "8181:8181"
+    environment:
+      - AIL_TENANT_ID=tenant_default
+    command:
+      - "run"
+      - "--server"
+      - "--config-file=/config/opa-config.yaml"
+      - "--log-format=text"
+      - "--log-level=info"
+      - "--addr=0.0.0.0:8181"
+    volumes:
+      - ./opa-config.yaml:/config/opa-config.yaml:ro
+    depends_on:
+      ail-control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/opa", "version"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  immudb:
+    image: codenotary/immudb:1.9.5
+    ports:
+      # Expose REST API to host so pytest (running on host) can reach localhost:8080.
+      # In the production compose this port is intentionally internal-only.
+      - "8080:8080"
+      - "3322:3322"
+    environment:
+      - IMMUDB_USER=${IMMUDB_USER:-immudb}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
+    healthcheck:
+      test: ["CMD", "immuadmin", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  test-control-plane-data:

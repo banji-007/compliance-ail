@@ -10,7 +10,7 @@ services:
 bundles:
   ail-policies:
     service: ail-control-plane
-    resource: /bundles/tenant_default
+    resource: /bundles/${AIL_TENANT_ID}
     polling:
       min_delay_seconds: 10
       max_delay_seconds: 20
