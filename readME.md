@@ -8,7 +8,7 @@
 
 ## 1. The Problem: LLM System Prompts Are Not a Security Boundary
 
-The enterprise security industry is making a critical architectural mistake.
+There is critical architectural gap in the enterprise security industry today. Organizations are deploying autonomous AI agents without proper security controls.
 
 As organizations deploy autonomous AI agents — systems built on LangGraph, AutoGen, CrewAI, or bespoke orchestration frameworks — they are commonly relying on **LLM system prompts** to enforce compliance rules. A typical implementation looks like this:
 
