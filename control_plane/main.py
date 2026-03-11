@@ -57,6 +57,8 @@ async def lifespan(app: FastAPI):
                 enable_finops=True,
                 enable_hipaa=False,
                 allowed_cost_centers="engineering,marketing,finance,operations",
+                approved_regions="eu-central-1,us-east-1",
+                approved_purposes="customer_support,billing",
             ))
             db.commit()
             logger.info("Seeded default tenant: %s", DEFAULT_TENANT_ID)
@@ -89,6 +91,8 @@ class TenantCreate(BaseModel):
     enable_finops: bool = True
     enable_hipaa: bool = False
     allowed_cost_centers: str = "engineering,marketing,finance,operations"
+    approved_regions: str = "eu-central-1,us-east-1"
+    approved_purposes: str = "customer_support,billing"
 
 
 class TenantUpdate(BaseModel):
@@ -99,6 +103,8 @@ class TenantUpdate(BaseModel):
     enable_finops: Optional[bool] = None
     enable_hipaa: Optional[bool] = None
     allowed_cost_centers: Optional[str] = None
+    approved_regions: Optional[str] = None
+    approved_purposes: Optional[str] = None
 
 
 class TenantRead(BaseModel):
@@ -109,6 +115,8 @@ class TenantRead(BaseModel):
     enable_finops: bool
     enable_hipaa: bool
     allowed_cost_centers: str
+    approved_regions: str
+    approved_purposes: str
 
     model_config = {"from_attributes": True}
 

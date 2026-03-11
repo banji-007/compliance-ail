@@ -232,7 +232,7 @@ def query_opa_policy(tool_name, tool_args):
         with httpx.Client(verify=ssl_context) as client:
             response = client.post(
                 _OPA_URL,
-                json={"input": {"tool_args": tool_args}},
+                json={"input": {"tool_name": tool_name, "tool_args": tool_args}},
                 timeout=5,
             )
 
@@ -257,7 +257,7 @@ def query_opa_policy(tool_name, tool_args):
                     with httpx.Client(verify=ssl_context) as client:
                         deny_response = client.post(
                             deny_url,
-                            json={"input": {"tool_args": tool_args}},
+                            json={"input": {"tool_name": tool_name, "tool_args": tool_args}},
                             timeout=5,
                         )
                     
