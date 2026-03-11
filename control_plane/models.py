@@ -17,10 +17,22 @@ class Tenant(Base):
     enable_hipaa = Column(Boolean, default=False, nullable=False)
 
     # Tenant-specific policy variables injected into bundle data.json
-    # Comma-separated list; consumed by finops.rego via data.ail.config.allowed_cost_centers
+    # Comma-separated lists; consumed by Rego packs via data.ail.config.*
     allowed_cost_centers = Column(
         Text,
         default="engineering,marketing,finance,operations",
+        nullable=False,
+    )
+    # Consumed by gdpr.rego: data.ail.config.approved_regions
+    approved_regions = Column(
+        Text,
+        default="eu-central-1,us-east-1",
+        nullable=False,
+    )
+    # Consumed by gdpr.rego: data.ail.config.approved_purposes
+    approved_purposes = Column(
+        Text,
+        default="customer_support,billing",
         nullable=False,
     )
 

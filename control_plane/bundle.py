@@ -59,16 +59,16 @@ def generate_bundle(tenant: Tenant) -> tuple[bytes, str]:
                 files[f"packs/{pack_name}/{rego.name}"] = rego.read_bytes()
 
     # --- Build data.json with tenant-specific config ---
-    allowed_cost_centers = [
-        cc.strip()
-        for cc in tenant.allowed_cost_centers.split(",")
-        if cc.strip()
-    ]
+    def _split(value: str) -> list[str]:
+        return [v.strip() for v in value.split(",") if v.strip()]
+
     data_doc = {
         "ail": {
             "config": {
                 "tenant_id": tenant.id,
-                "allowed_cost_centers": allowed_cost_centers,
+                "allowed_cost_centers": _split(tenant.allowed_cost_centers),
+                "approved_regions": _split(tenant.approved_regions),
+                "approved_purposes": _split(tenant.approved_purposes),
             }
         }
     }

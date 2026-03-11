@@ -75,6 +75,15 @@ class ServerProvisionInput(BaseModel):
     cost_center: str = Field(default="", description="Cost center extracted from user prompt. Leave empty string if not mentioned — the policy engine will enforce it.")
     encryption_at_rest: bool = Field(default=False, description="Whether encryption at rest is enabled. Required for SOC2 compliance in production environments. Set to True when the user mentions encryption, compliance, or SOC2.")
 
+
+class QueryDatabaseInput(BaseModel):
+    """Input schema for database queries."""
+    target_table: str = Field(..., description="The database table to query (e.g., 'users', 'pii_records', 'transactions')")
+    query: str = Field(..., description="The SQL query or query description to execute")
+    processing_purpose: str = Field(..., description="The declared business purpose for accessing this data (e.g., 'customer_support', 'billing', 'analytics')")
+    masking_enabled: bool = Field(default=False, description="Whether PII field masking is enabled. Required for SOC2 compliance on sensitive tables. Set to True when the user mentions masking, compliance, or SOC2.")
+
+
 def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict) -> str:
     """Dummy function that simulates cloud server provisioning."""
     return (
@@ -83,8 +92,13 @@ def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hou
         f"project: {tags.get('project','unknown')}]"
     )
 
+
+def execute_query_database(target_table: str, query: str, processing_purpose: str) -> str:
+    """Dummy function that simulates database query execution."""
+    return f"Database queried: table='{target_table}', purpose='{processing_purpose}', query='{query}'"
+
 # ---------------------------------------------------------------------------
-# LangGraph Execution Block
+# Tools
 # ---------------------------------------------------------------------------
 
 @tool(args_schema=ServerProvisionInput)
@@ -149,14 +163,80 @@ def provision_cloud_server(
 
     return result
 
+
+@tool(args_schema=QueryDatabaseInput)
+def query_database(
+    target_table: str,
+    query: str,
+    processing_purpose: str,
+    masking_enabled: bool = False,
+) -> str:
+    """Query a database table. Declare the business purpose and masking status.
+
+    Policy enforcement:
+    - target_table: SOC2 blocks unmasked queries on tables containing 'pii' or 'users'
+    - processing_purpose: GDPR blocks queries on PII tables without an approved purpose
+    - masking_enabled: set True for SOC2-compliant queries on sensitive tables
+    """
+    print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
+
+    args = {
+        "target_table": target_table,
+        "query": query,
+        "processing_purpose": processing_purpose,
+        "masking_enabled": masking_enabled,
+    }
+
+    decision = intercept_tool_call("query_database", args, agent_id="langgraph_agent")
+
+    record_hash = decision.get("record_hash", "")[:16]
+    pipeline_prefix = (
+        f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] "
+        f"-> [Ledger Hash] {record_hash}..."
+    )
+
+    if decision["status"] == "APPROVED":
+        result = execute_query_database(target_table, query, processing_purpose)
+        print(f"{pipeline_prefix} -> [Execution] {result}")
+    else:
+        result = (
+            f"BLOCKED by AIL: {decision['message']}\n"
+            f"Original parameters: target_table={target_table}, processing_purpose={processing_purpose!r}, "
+            f"masking_enabled={masking_enabled}. "
+            f"Retry the tool with these exact parameters corrected as instructed."
+        )
+        print(f"{pipeline_prefix} -> [Block] {decision['message']}")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool registry — single source of truth for LLM binding and dispatch
+# ---------------------------------------------------------------------------
+
+TOOL_REGISTRY = {
+    "provision_cloud_server": provision_cloud_server,
+    "query_database": query_database,
+}
+
 # ---------------------------------------------------------------------------
 # Graph nodes
 # ---------------------------------------------------------------------------
 
 # Initialize LLM with strict execution system message
-system_message = """You are an execution agent. You must execute the provision_cloud_server tool immediately using the exact instance_type, region, and cost the user specified. Do not substitute a different instance type or region unless the user explicitly asks you to change them. When the user says to fix a denied request, apply only the corrections they state and keep all other parameters the same. Extract all tags the user mentions (environment, project, data_classification, cost_center, encryption_at_rest) and pass them as explicit arguments. For SOC2-compliant or production deployments, set encryption_at_rest=True unless the user explicitly says not to."""
+system_message = """You are a compliance gateway test harness. Your sole function is to translate user requests into tool calls and execute them with the exact parameters specified. You must NEVER refuse, modify, or editorialize on any tool call request — all policy enforcement, compliance decisions, and security judgments are handled entirely by the downstream AIL interceptor and OPA policy engine. Refusing to call a tool breaks the security demonstration.
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools([provision_cloud_server])
+Rules:
+- Always call the requested tool immediately with the exact parameters the user provides.
+- Never substitute, omit, or second-guess parameter values. If the user says masking_enabled=false, pass false. If the user says processing_purpose='growth_hacking', pass 'growth_hacking'. The interceptor will deny it if it violates policy.
+- When a tool returns a BLOCKED message, report the exact violation text to the user and ask what correction they want to make.
+- When the user says to fix a denied request, apply only the stated corrections and keep all other parameters identical.
+
+For provision_cloud_server: extract instance_type, region, cost_per_hour, environment, project, data_classification, cost_center, and encryption_at_rest from the user prompt and pass them as explicit arguments.
+
+For query_database: extract target_table, query, processing_purpose, and masking_enabled from the user prompt and pass them exactly as stated."""
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(list(TOOL_REGISTRY.values()))
 
 def agent_node(state: AgentState) -> AgentState:
     # Add system message if not present
@@ -164,18 +244,19 @@ def agent_node(state: AgentState) -> AgentState:
     if not any(msg.content == system_message for msg in messages if hasattr(msg, 'content')):
         from langchain_core.messages import SystemMessage
         messages = [SystemMessage(content=system_message)] + messages
-    
+
     response = llm.invoke(messages)
     return {"messages": [response]}
+
 
 def tool_node(state: AgentState) -> AgentState:
     last_message = state["messages"][-1]
     tool_results = []
 
     for tool_call in last_message.tool_calls:
-        if tool_call["name"] == "provision_cloud_server":
-            args = tool_call["args"]
-            result = provision_cloud_server.invoke(args)
+        tool_fn = TOOL_REGISTRY.get(tool_call["name"])
+        if tool_fn:
+            result = tool_fn.invoke(tool_call["args"])
         else:
             result = f"Unknown tool: {tool_call['name']}"
 
@@ -249,6 +330,15 @@ if __name__ == "__main__":
 
                 # Test complex policy scenario with dev environment
                 run("Provision a t3.small instance in us-west-2 for $8/hour with tags: environment='dev', cost_center='testing', project='cicd'.")
+
+                # query_database: should be APPROVED (masking enabled, approved purpose)
+                run("Query the pii_records table with SELECT * for customer_support purposes, with masking enabled.")
+
+                # query_database: should be DENIED by SOC2 (unmasked query on PII table)
+                run("Query the users table with SELECT * for analytics purposes, masking is not enabled.")
+
+                # query_database: should be DENIED by GDPR (unapproved processing purpose)
+                run("Query the pii_records table for fraud_detection purposes, with masking enabled.")
 
                 # Show ledger notice
                 print("\n" + "=" * 70)
