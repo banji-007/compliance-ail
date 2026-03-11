@@ -62,6 +62,22 @@ async def lifespan(app: FastAPI):
             ))
             db.commit()
             logger.info("Seeded default tenant: %s", DEFAULT_TENANT_ID)
+
+        if not db.query(Tenant).filter_by(id="tenant_finance").first():
+            db.add(Tenant(
+                id="tenant_finance",
+                name="Finance Tenant",
+                enable_gdpr=True,
+                enable_soc2=True,
+                enable_finops=True,
+                enable_hipaa=False,
+                # Strict spend controls — only finance and executive cost centers approved.
+                allowed_cost_centers="finance,executive",
+                approved_regions="eu-central-1,us-east-1",
+                approved_purposes="customer_support,billing",
+            ))
+            db.commit()
+            logger.info("Seeded finance tenant: tenant_finance")
     finally:
         db.close()
     yield
@@ -166,6 +182,22 @@ def update_tenant(tenant_id: str, payload: TenantUpdate, db: Session = Depends(g
     db.refresh(tenant)
     logger.info("Updated tenant %s: %s", tenant_id, payload.model_dump(exclude_unset=True))
     return tenant
+
+
+@app.head("/bundles/{tenant_id}")
+def head_bundle(tenant_id: str, db: Session = Depends(get_db)):
+    """
+    HEAD /bundles/{tenant_id} — returns the current ETag without streaming bundle bytes.
+    Used by the interceptor's _compute_policy_hash() to record the live bundle version
+    in ledger entries without the overhead of a full tar.gz transfer.
+    """
+    tenant = db.query(Tenant).filter_by(id=tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+
+    _, etag = generate_bundle(tenant)
+    logger.debug("HEAD /bundles/%s → ETag %s…", tenant_id, etag[:12])
+    return Response(headers={"ETag": etag})
 
 
 @app.get("/bundles/{tenant_id}")

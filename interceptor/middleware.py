@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import sys
@@ -29,6 +28,11 @@ logging.basicConfig(
 #   Development (local venv):   Set SPIRE_DISABLED=true and point OPA_URL at
 #                               http://localhost:8181/v1/data/ail/main/deny
 #                               Policy is still evaluated; transport identity is not.
+# Control plane connection — override for Docker vs local dev.
+# Docker: http://ail-control-plane:8002  |  Local dev: http://localhost:8002
+_CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
+_AIL_TENANT_ID = os.getenv("AIL_TENANT_ID", "tenant_default")
+
 _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
 # Query the explicit /allow endpoint, not /deny.
 # If the policy fails to compile, OPA returns {"result": null} for this path,
@@ -58,35 +62,39 @@ except OSError:
 
 def _compute_policy_hash() -> str:
     """
-    Return a SHA-256 fingerprint of all Rego files in policy/active/.
+    Fetch the active bundle ETag from the AIL Control Plane.
 
-    policy/active/ is populated at boot by the policy-bootstrapper init
-    container: it always contains core/main.rego plus whichever compliance
-    packs are enabled via ENABLE_* env vars. Hashing this directory captures
-    exactly the policy surface that OPA is evaluating, including the aggregator.
+    The ETag is a SHA-256 digest of all active Rego files + tenant data.json,
+    computed by control_plane/bundle.py — exactly the policy surface OPA is
+    currently evaluating. Recording it in ImmuDB makes policy drift immediately
+    visible: any change to an enabled pack or tenant config produces a new ETag.
 
-    Files are sorted by name before hashing so the digest is deterministic.
-    Any change to an active policy file produces a different hash, making
-    policy drift immediately visible in the ImmuDB audit ledger.
+    Uses HTTP HEAD to /bundles/{tenant_id}: FastAPI/Starlette strips the
+    response body for HEAD requests on GET routes, so the bundle bytes are
+    never transferred over the wire.
+
+    Falls back to 'bundle-hash-unavailable' on any error, logs a WARNING so
+    the degradation is visible in monitoring, and still allows ledger writes.
     """
-    active_dir = os.path.join(os.path.dirname(__file__), '..', 'policy', 'active')
-    h = hashlib.sha256()
+    bundle_url = f"{_CONTROL_PLANE_URL}/bundles/{_AIL_TENANT_ID}"
     try:
-        rego_files = sorted(
-            f for f in os.listdir(active_dir) if f.endswith('.rego')
+        with httpx.Client(timeout=2) as client:
+            response = client.head(bundle_url)
+        etag = response.headers.get("etag")
+        if etag:
+            logging.debug(f"Bundle ETag from control plane ({_AIL_TENANT_ID}): {etag[:16]}…")
+            return etag
+        logging.warning(
+            f"Control plane at {bundle_url} responded but returned no ETag header. "
+            "Policy version recorded as 'bundle-hash-unavailable'."
         )
-        for filename in rego_files:
-            path = os.path.join(active_dir, filename)
-            with open(path, 'rb') as fh:
-                h.update(filename.encode())   # include filename so renames are detected
-                h.update(fh.read())
-
-        digest = h.hexdigest()
-        logging.debug(f"Policy hash computed over {len(rego_files)} active file(s): {digest[:16]}…")
-        return digest
+        return "bundle-hash-unavailable"
     except Exception as e:
-        logging.error(f"Failed to compute policy hash from {active_dir}: {e}")
-        return "hash-unavailable"
+        logging.warning(
+            f"Control plane unreachable at {bundle_url} — policy version will be "
+            f"recorded as 'bundle-hash-unavailable' in the ledger. Error: {e}"
+        )
+        return "bundle-hash-unavailable"
 
 
 def _get_spiffe_ssl_context() -> ssl.SSLContext | None:

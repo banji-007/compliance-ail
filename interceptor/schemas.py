@@ -41,6 +41,21 @@ class QueryDatabaseSchema(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class DeployToProductionSchema(BaseModel):
+    """
+    Strict schema for production deployment tool arguments.
+    Ensures change-management fields are present and correctly typed
+    before the call reaches OPA (SOC2 CC8.1 / FinOps guardrails).
+    """
+    repository_name: str = Field(..., description="Name of the code repository being deployed")
+    commit_hash: str = Field(..., description="Git commit SHA being deployed")
+    environment: str = Field(..., description="Target environment (e.g., 'staging', 'production')")
+    approval_ticket: str = Field(..., description="Jira/ServiceNow ticket reference; empty string if absent (policy will deny)")
+    bypass_ci: bool = Field(..., description="Whether automated CI/CD checks are being skipped")
+
+    model_config = {"extra": "forbid"}
+
+
 # ---------------------------------------------------------------------------
 # Shared validation helper
 # ---------------------------------------------------------------------------
@@ -69,9 +84,14 @@ def validate_query_database_args(tool_args: dict) -> tuple[bool, Optional[str]]:
     return _validate(QueryDatabaseSchema, tool_args)
 
 
+def validate_deploy_to_production_args(tool_args: dict) -> tuple[bool, Optional[str]]:
+    return _validate(DeployToProductionSchema, tool_args)
+
+
 # Registry used by middleware for dict-based routing.
 # Adding a new tool: (1) define a schema above, (2) add an entry here.
 TOOL_VALIDATORS: Dict[str, Callable[[dict], tuple[bool, Optional[str]]]] = {
     "provision_cloud_server": validate_cloud_server_args,
     "query_database": validate_query_database_args,
+    "deploy_to_production": validate_deploy_to_production_args,
 }

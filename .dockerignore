@@ -1,0 +1,36 @@
+# Version control
+.git/
+.github/
+
+# Frontend — built separately, not part of agent or control-plane image
+dashboard/
+
+# Tests — not needed at runtime
+tests/
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local SQLite databases (runtime data, not baked into image)
+*.db
+
+# Environment files (secrets must never be baked in)
+.env
+.env.*
+
+# IDE and OS artefacts
+.vscode/
+.idea/
+*.DS_Store
+
+# SPIRE key material — never baked into an image
+spire/server/data/
+spire/agent/data/

@@ -17,7 +17,7 @@ deny contains msg if {
     payload.tags.environment == "prod"
     cc := object.get(payload.tags, "cost_center", "")
     not approved_cost_centers[cc]
-    msg := "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: engineering, marketing, finance, operations."
+    msg := sprintf("DENIED: Production environments must include a valid 'cost_center' tag. Approved values: %v.", [approved_cost_centers])
 }
 
 deny contains msg if {
@@ -31,5 +31,14 @@ deny contains msg if {
     msg := sprintf("DENIED: Instance type %v is restricted. 'project' tag must be 'ml-training'.", [payload.instance_type])
 }
 
-# Additional FinOps rules could be added here
-# Examples: budget enforcement, resource tagging, cost allocation, etc.
+# --- deploy_to_production rules ---
+
+# FinOps: Experimental repositories must not be deployed to production.
+# Prevents unreviewed experimental workloads from incurring production-scale costs.
+deny contains msg if {
+    input.tool_name == "deploy_to_production"
+    payload := input.tool_args
+    payload.environment == "production"
+    contains(payload.repository_name, "experimental")
+    msg := "FinOps Violation: Experimental repositories are not authorized for production deployment."
+}

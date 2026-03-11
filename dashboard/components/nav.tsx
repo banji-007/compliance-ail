@@ -4,6 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { ShieldCheck, BookOpen, Settings2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useTenant } from "@/lib/tenant-context";
+import type { TenantId } from "@/lib/tenant-context";
 
 const links = [
   { href: "/settings", label: "Policy Settings", icon: Settings2 },
@@ -12,6 +14,7 @@ const links = [
 
 export function Nav() {
   const pathname = usePathname();
+  const { tenantId, setTenantId, tenants } = useTenant();
 
   return (
     <nav className="flex h-screen w-60 flex-col border-r bg-card px-4 py-6 shrink-0">
@@ -43,10 +46,29 @@ export function Nav() {
         ))}
       </ul>
 
+      {/* Tenant Switcher */}
+      <div className="mt-6 px-2">
+        <p className="mb-1.5 text-xs font-medium text-muted-foreground">
+          Active Tenant
+        </p>
+        <select
+          value={tenantId}
+          onChange={(e) => setTenantId(e.target.value as TenantId)}
+          className="w-full rounded-md border bg-background px-2 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+          aria-label="Switch active tenant"
+        >
+          {tenants.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
       {/* Footer badge */}
       <div className="mt-auto px-2 text-xs text-muted-foreground">
-        <p className="font-medium">Phase 3 — CISO Dashboard</p>
-        <p className="mt-0.5 opacity-60">v3.0.0</p>
+        <p className="font-medium">Phase 5 — Enterprise Ready</p>
+        <p className="mt-0.5 opacity-60">v5.0.0</p>
       </div>
     </nav>
   );

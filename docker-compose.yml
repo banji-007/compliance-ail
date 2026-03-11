@@ -1,6 +1,7 @@
 services:
   ail-control-plane:
-    image: python:3.11-slim
+    build:
+      context: ./control_plane
     ports:
       - "8002:8002"
     environment:
@@ -11,13 +12,10 @@ services:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
     volumes:
-      - ./control_plane:/app
+      # policy/ mounted at runtime — changes on tenant config updates.
       - ./policy:/policy:ro
       - control-plane-data:/data
     working_dir: /app
-    command: >
-      sh -c "pip install -r requirements.txt -q &&
-             uvicorn main:app --host 0.0.0.0 --port 8002"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
       interval: 10s
@@ -30,6 +28,8 @@ services:
     image: openpolicyagent/opa:1.14.1
     ports:
       - "8181:8181"
+    environment:
+      - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
     command:
       - "run"
       - "--server"
@@ -102,6 +102,12 @@ services:
       - spire-agent-config:/opt/spire/conf/agent
       - spire-sockets:/tmp/spire-sockets
       - spire-agent-data:/opt/spire/data
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/tmp/spire-sockets/workload_api.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
     restart: unless-stopped
     command: ["/opt/spire/bin/spire-agent", "run", "-config", "/opt/spire/conf/agent/agent.conf"]
 
@@ -150,12 +156,13 @@ services:
       spire-server:
         condition: service_healthy
       spire-agent:
-        condition: service_started
+        condition: service_healthy
     restart: "no"
     entrypoint: ["/bin/sh", "/opt/register.sh"]
 
   langgraph-demo:
-    image: python:3.11-slim
+    build:
+      context: .
     pid: "service:spire-agent"
     stdin_open: true
     tty: true
@@ -167,16 +174,16 @@ services:
       - SPIFFE_ENDPOINT_SOCKET=unix:///tmp/spire-sockets/workload_api.sock
       - OPA_URL=https://envoy:8443/v1/data/ail/main/allow
       - SPIRE_DISABLED=false
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
     volumes:
-      - .:/app
+      # SPIRE workload socket — runtime mount, not baked into image.
       - spire-sockets:/tmp/spire-sockets
     working_dir: /app
     command:
       - bash
       - -c
       - |
-        pip install -r requirements.txt
-        useradd -u 1000 -m ail-agent 2>/dev/null || true
         echo 'Waiting for SPIRE workload socket...'
         until [ -S /tmp/spire-sockets/workload_api.sock ]; do sleep 2; done
         echo 'SPIRE ready. Starting demo...'

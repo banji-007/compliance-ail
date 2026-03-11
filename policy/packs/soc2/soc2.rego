@@ -29,3 +29,22 @@ deny contains msg if {
 
 sensitive_table(name) if contains(name, "pii")
 sensitive_table(name) if contains(name, "users")
+
+# --- deploy_to_production rules ---
+
+# SOC2 CC8.1: Production deployments require a valid approval ticket.
+deny contains msg if {
+    input.tool_name == "deploy_to_production"
+    payload := input.tool_args
+    payload.environment == "production"
+    payload.approval_ticket == ""
+    msg := "SOC2 CC8.1 Violation: Production deployments require a valid approval ticket reference."
+}
+
+# SOC2 CC8.1: Bypassing CI/CD pipeline checks is strictly prohibited.
+deny contains msg if {
+    input.tool_name == "deploy_to_production"
+    payload := input.tool_args
+    payload.bypass_ci == true
+    msg := "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited."
+}

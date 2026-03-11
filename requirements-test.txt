@@ -1,0 +1,13 @@
+# requirements-test.txt — host-side dependencies for make test-integration.
+# Tests run on the host (not inside a container); only the lightweight
+# pytest stack is needed — the heavy agent deps live in the Docker image.
+#
+# Covers the full import chain:
+#   pytest            — test runner
+#   httpx             — OPA/immudb HTTP calls in middleware.py + test helpers
+#   pydantic          — schema validation in schemas.py
+#   prometheus-client — Counter/REGISTRY imported at module load in middleware.py
+pytest==8.3.5
+httpx==0.28.1
+pydantic==2.12.5
+prometheus-client==0.21.1
