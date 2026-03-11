@@ -1,4 +1,4 @@
-# VERSION: 1.1.0
+# VERSION: 2.0.0
 # Internal FinOps Framework - Cost Control Rules
 
 package ail.frameworks.finops
@@ -12,6 +12,7 @@ approved_cost_centers := {x | x := data.ail.config.allowed_cost_centers[_]} if {
 } else := {"engineering", "marketing", "finance", "operations"}
 
 deny contains msg if {
+    input.tool_name == "provision_cloud_server"  # scope guard
     payload := input.tool_args
     payload.tags.environment == "prod"
     cc := object.get(payload.tags, "cost_center", "")
@@ -20,6 +21,7 @@ deny contains msg if {
 }
 
 deny contains msg if {
+    input.tool_name == "provision_cloud_server"  # scope guard
     payload := input.tool_args
     blocked_instances := {"p4d.24xlarge", "p5.48xlarge"}
     blocked_instances[payload.instance_type]

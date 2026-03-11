@@ -10,9 +10,10 @@ interface Props {
   onChange: (values: string[]) => void;
   disabled?: boolean;
   className?: string;
+  placeholder?: string;
 }
 
-export function CostCenterInput({ values, onChange, disabled, className }: Props) {
+export function CostCenterInput({ values, onChange, disabled, className, placeholder }: Props) {
   const [draft, setDraft] = useState("");
 
   function add() {
@@ -68,7 +69,7 @@ export function CostCenterInput({ values, onChange, disabled, className }: Props
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={handleKeyDown}
           onBlur={add}
-          placeholder={values.length === 0 ? "Type a cost center, press Enter…" : "Add…"}
+          placeholder={values.length === 0 ? (placeholder ?? "Type a value, press Enter…") : "Add…"}
           className="h-auto flex-1 border-0 bg-transparent p-0 text-xs shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 min-w-[8rem]"
           disabled={disabled}
         />
