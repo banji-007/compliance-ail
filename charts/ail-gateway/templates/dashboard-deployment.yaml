@@ -1,0 +1,65 @@
+{{/*
+CISO Control Plane Dashboard — Next.js UI.
+
+Important: NEXT_PUBLIC_API_URL is a build-time argument baked into the JS bundle.
+It cannot be injected at runtime via environment variables in Kubernetes.
+
+For production deployment, rebuild the dashboard image with:
+  docker build \
+    --build-arg NEXT_PUBLIC_API_URL=<your-control-plane-ingress-url> \
+    --build-arg NEXT_PUBLIC_TENANT_ID={{ .Values.tenantId }} \
+    -t <registry>/ail-dashboard:{{ .Chart.AppVersion }} \
+    ./dashboard
+
+The value should be the externally reachable URL of the control-plane Ingress
+or LoadBalancer — NOT the ClusterIP DNS name (that is unreachable from a browser).
+
+See values.yaml: dashboard.controlPlaneExternalUrl for documentation.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-dashboard
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "ail-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: dashboard
+  template:
+    metadata:
+      labels:
+        {{- include "ail-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: dashboard
+    spec:
+      serviceAccountName: {{ include "ail-gateway.serviceAccountName" . }}
+      containers:
+        - name: dashboard
+          image: "{{ .Values.images.dashboard.repository }}:{{ .Values.images.dashboard.tag }}"
+          imagePullPolicy: {{ .Values.images.dashboard.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

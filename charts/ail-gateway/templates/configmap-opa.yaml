@@ -1,0 +1,45 @@
+{{/*
+Blocker 2 Fix — OPA bundle URL uses K8s Service DNS.
+
+Change from Docker Compose opa-config.yaml:
+  url: http://ail-control-plane:8002         (Docker internal DNS)
+  →
+  url: http://ail-control-plane.<namespace>.svc.cluster.local:8002  (K8s DNS)
+
+OPA is a sidecar inside the agent pod. The control plane is a separate
+Deployment with its own ClusterIP Service. OPA polls the control plane's
+/bundles/<tenantId> endpoint to fetch the active policy bundle, exactly
+as in Docker Compose — only the hostname changes.
+
+The bundle resource path is Helm-interpolated from .Values.tenantId so
+multi-tenant operators can deploy isolated releases with different tenantIds.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-opa-config
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: opa-sidecar
+data:
+  opa-config.yaml: |
+    # OPA Bundle API Configuration
+    # OPA polls the AIL Control Plane for its active policy bundle.
+    # The control plane dynamically builds the bundle based on the tenant's
+    # enabled compliance frameworks and custom policy variables.
+
+    services:
+      - name: ail-control-plane
+        # Blocker 2 Fix: K8s Service DNS — resolves within the cluster.
+        # Note: "ail-control-plane" is the static Service name in
+        # control-plane-service.yaml (not helm-fullname-prefixed) so that
+        # this DNS name stays stable across release renames.
+        url: http://{{ include "ail-gateway.controlPlaneHost" . }}:8002
+
+    bundles:
+      ail-policies:
+        service: ail-control-plane
+        resource: /bundles/{{ .Values.tenantId }}
+        polling:
+          min_delay_seconds: 10
+          max_delay_seconds: 20

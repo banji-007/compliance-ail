@@ -1,0 +1,129 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# AIL Gateway — values.yaml
+# The single interface for Fortune 500 infrastructure teams.
+# Override via: helm install ail-gateway charts/ail-gateway -f my-values.yaml
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Global ───────────────────────────────────────────────────────────────────
+tenantId: tenant_default
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ─── Images ───────────────────────────────────────────────────────────────────
+# Push custom images to your registry and override these values.
+images:
+  controlPlane:
+    repository: ail-control-plane
+    tag: latest
+    pullPolicy: IfNotPresent
+  dashboard:
+    repository: ail-dashboard
+    tag: latest
+    pullPolicy: IfNotPresent
+  agent:
+    repository: ail-agent
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Sidecar images — pinned versions from Docker Compose to maintain parity.
+  envoy:
+    repository: envoyproxy/envoy
+    tag: v1.27.7
+    pullPolicy: IfNotPresent
+  opa:
+    repository: openpolicyagent/opa
+    tag: 1.14.1
+    pullPolicy: IfNotPresent
+  immudb:
+    repository: codenotary/immudb
+    tag: 1.9.5
+    pullPolicy: IfNotPresent
+
+# ─── Secrets (Required) ───────────────────────────────────────────────────────
+# Do NOT commit real values. Inject via:
+#   helm install ail-gateway charts/ail-gateway \
+#     --set secrets.openaiApiKey=$OPENAI_API_KEY \
+#     --set secrets.immudb.password=$IMMUDB_PASSWORD
+# Or use an external secrets operator (Vault, ESO) and set existingSecret.
+secrets:
+  openaiApiKey: ""   # Required for langgraph-agent container
+  immudb:
+    user: immudb
+    password: immudb
+
+# ─── Storage ──────────────────────────────────────────────────────────────────
+immudb:
+  storage: 1Gi
+  storageClassName: ""  # "" uses the cluster default StorageClass
+
+controlPlane:
+  storage: 1Gi
+  storageClassName: ""  # "" uses the cluster default StorageClass
+
+# ─── Agent Replicas ───────────────────────────────────────────────────────────
+# The agent pod (langgraph + envoy + opa sidecars) is horizontally scalable.
+# The control plane is intentionally NOT — see control-plane-deployment.yaml.
+agentReplicaCount: 1
+
+# ─── Dashboard ────────────────────────────────────────────────────────────────
+dashboard:
+  # NEXT_PUBLIC_API_URL is baked into the JS bundle at image build time.
+  # This value documents the expected URL — operators must rebuild the image
+  # with: --build-arg NEXT_PUBLIC_API_URL=<your-ingress-or-loadbalancer-url>
+  # A Kubernetes Service ClusterIP URL will NOT work from a user's browser.
+  controlPlaneExternalUrl: "http://localhost:8002"  # Override with Ingress URL
+
+# ─── Observability (opt-in) ───────────────────────────────────────────────────
+prometheus:
+  enabled: true
+
+grafana:
+  enabled: true
+
+# ─── SPIRE — Blocker 1: K8s PSAT Attestation ─────────────────────────────────
+# Replaces Docker Compose join_token bootstrap with Kubernetes-native
+# Projected Service Account Token (PSAT) attestation.
+#
+# Set spire.enabled: false and configure externalSpire if your cluster already
+# runs a SPIRE installation ("Bring-Your-Own-SPIRE" / Option B).
+spire:
+  enabled: true
+
+  # Values forwarded to the spiffe/spire sub-chart.
+  # Ref: https://github.com/spiffe/helm-charts-hardened
+  global:
+    spire:
+      trustDomain: ail.internal
+
+  spire-server:
+    replicaCount: 1
+    nodeAttestor:
+      k8sPsat:
+        # Blocker 1 Fix: k8s_psat replaces join_token.
+        # The SPIRE server verifies the pod's projected service account token
+        # against the Kubernetes TokenReview API — no Docker socket required.
+        enabled: true
+        clusters:
+          ail-cluster:
+            enabled: true
+            serviceAccountAllowList:
+              - "spire/spire-agent"
+
+  spire-agent:
+    nodeAttestor:
+      k8sPsat:
+        enabled: true
+        cluster: ail-cluster
+    workloadAttestors:
+      k8s:
+        enabled: true
+    # Socket path published by the SPIRE agent DaemonSet onto the node FS.
+    # Mounted into agent pods via hostPath volume (see agent-deployment.yaml).
+    socketPath: /run/spire/sockets/agent.sock
+    hostSocketDir: /run/spire/sockets
+
+# ─── External SPIRE (Option B: Bring-Your-Own-SPIRE) ─────────────────────────
+# Ignored when spire.enabled: true.
+externalSpire:
+  socketDir: /run/spire/sockets   # hostPath directory on each node
+  trustDomain: ail.internal

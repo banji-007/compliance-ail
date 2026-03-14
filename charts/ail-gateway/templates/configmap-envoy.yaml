@@ -1,0 +1,136 @@
+{{/*
+Blocker 2 Fix — Envoy sidecar network topology.
+
+Two changes from Docker Compose envoy.yaml:
+  1. opa_cluster address: "opa" → "127.0.0.1"
+     OPA is a sidecar in the same Pod. All inter-container traffic is localhost.
+     This is a mathematical guarantee from the K8s Pod network namespace model —
+     traffic physically cannot leave the node, eliminating any sniffing surface.
+
+  2. spire_agent pipe path: /tmp/spire-sockets → /run/spire/sockets
+     The SPIRE agent DaemonSet (from the bundled sub-chart) publishes its
+     workload API socket to /run/spire/sockets/agent.sock on each node's FS.
+     The agent pod mounts this directory via hostPath (see agent-deployment.yaml).
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-envoy-config
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: envoy-sidecar
+data:
+  envoy.yaml: |
+    node:
+      id: envoy-proxy
+      cluster: ail-internal
+
+    static_resources:
+
+      listeners:
+      - name: mtls_listener
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8443
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: ingress_https
+              route_config:
+                name: local_route
+                virtual_hosts:
+                - name: opa_backend
+                  domains: ["*"]
+                  routes:
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: opa_cluster
+              http_filters:
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                # Pull our own certificate/key from SPIRE via SDS
+                tls_certificate_sds_secret_configs:
+                - name: "spiffe://ail.internal/workload/envoy"
+                  sds_config:
+                    resource_api_version: V3
+                    api_config_source:
+                      api_type: GRPC
+                      transport_api_version: V3
+                      grpc_services:
+                      - envoy_grpc:
+                          cluster_name: spire_agent
+                # Validate client certificates via SPIRE trust bundle
+                combined_validation_context:
+                  default_validation_context:
+                    match_typed_subject_alt_names:
+                    - san_type: URI
+                      matcher:
+                        exact: "spiffe://ail.internal/workload/agent"
+                    - san_type: URI
+                      matcher:
+                        exact: "spiffe://ail.internal/workload/test"
+                  validation_context_sds_secret_config:
+                    name: "spiffe://ail.internal"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                        - envoy_grpc:
+                            cluster_name: spire_agent
+
+      clusters:
+      # ── Blocker 2 Fix ──────────────────────────────────────────────────────
+      # OPA is a sidecar. Use STATIC + 127.0.0.1 instead of STRICT_DNS + "opa".
+      # Traffic stays inside the Pod network namespace — zero network exposure.
+      - name: opa_cluster
+        connect_timeout: 5s
+        type: STATIC
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: opa_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1   # Sidecar: same Pod, same localhost
+                    port_value: 8181
+
+      # ── SPIRE Workload API (SDS source) ────────────────────────────────────
+      # Unix socket published by SPIRE agent DaemonSet onto the node filesystem.
+      # Mounted into this pod via hostPath volume at /run/spire/sockets/.
+      - name: spire_agent
+        connect_timeout: 5s
+        type: STATIC
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        load_assignment:
+          cluster_name: spire_agent
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  pipe:
+                    path: /run/spire/sockets/agent.sock   # K8s node hostPath
+
+    admin:
+      address:
+        socket_address:
+          address: 127.0.0.1   # Admin port: sidecar-local only, not exposed
+          port_value: 9901

@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-immudb
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: immudb
+spec:
+  # ClusterIP only — REST API (8080) and gRPC (3322) are internal.
+  # Mirrors Docker Compose: port 8080 intentionally NOT exposed to host.
+  type: ClusterIP
+  clusterIP: None   # Headless: required by StatefulSet for stable DNS (immudb-0.*)
+  selector:
+    {{- include "ail-gateway.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: immudb
+  ports:
+    - name: grpc
+      port: 3322
+      targetPort: grpc
+      protocol: TCP
+    - name: rest
+      port: 8080
+      targetPort: rest
+      protocol: TCP

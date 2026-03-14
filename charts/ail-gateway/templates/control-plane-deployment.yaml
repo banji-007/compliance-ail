@@ -1,0 +1,91 @@
+{{/*
+AIL Control Plane — FastAPI bundle server + tenant config API.
+
+Blocker 3 Fix:
+  - replicas: 1 is a hard constraint. SQLite does not support concurrent writers.
+    Increasing replicas without migrating to PostgreSQL WILL corrupt the database.
+  - A PVC (ReadWriteOnce) is attached for the SQLite file; it survives pod restarts.
+
+TODO: Phase 7 - Migrate to PostgreSQL for HA Multi-Replica support.
+      Remove the replicas: 1 comment and the PVC when PostgreSQL is in place.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-control-plane
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  # DO NOT increase replicas — SQLite is single-writer.
+  # The PVC accessMode ReadWriteOnce enforces this at the storage layer.
+  # TODO: Phase 7 - Migrate to PostgreSQL for HA Multi-Replica support.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "ail-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: control-plane
+  strategy:
+    # Recreate (not RollingUpdate): ensures old pod releases the RWO PVC
+    # before the new pod tries to mount it. RollingUpdate would deadlock.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "ail-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: {{ include "ail-gateway.serviceAccountName" . }}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.images.controlPlane.repository }}:{{ .Values.images.controlPlane.tag }}"
+          imagePullPolicy: {{ .Values.images.controlPlane.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8002
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              value: "sqlite:////data/control_plane.db"
+            - name: IMMUDB_URL
+              value: "http://{{ include "ail-gateway.immudbHost" . }}:8080"
+            - name: IMMUDB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ail-gateway.fullname" . }}-secrets
+                  key: immudb-user
+            - name: IMMUDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ail-gateway.fullname" . }}-secrets
+                  key: immudb-password
+            - name: AIL_TENANT_ID
+              value: {{ .Values.tenantId | quote }}
+          volumeMounts:
+            - name: control-plane-data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: control-plane-data
+          persistentVolumeClaim:
+            claimName: {{ include "ail-gateway.fullname" . }}-control-plane-data

@@ -1,0 +1,28 @@
+{{/*
+IMPORTANT: This Service is named "ail-control-plane" (static), NOT helm-fullname-prefixed.
+
+Reason: The OPA sidecar ConfigMap (configmap-opa.yaml) resolves this service via
+cluster DNS: http://ail-control-plane.<namespace>.svc.cluster.local:8002
+That DNS name must be stable across Helm release renames for OPA bundle polling
+to continue working without redeploying the ConfigMap.
+
+If you need to rename this, also update configmap-opa.yaml and the controlPlaneHost
+helper in _helpers.tpl.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ail-control-plane
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ail-gateway.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: http
+      port: 8002
+      targetPort: http
+      protocol: TCP

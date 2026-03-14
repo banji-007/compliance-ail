@@ -1,0 +1,28 @@
+apiVersion: v2
+name: ail-gateway
+description: >
+  Enterprise AI Compliance Gateway — cryptographic identity, pre-flight schema
+  validation, OPA policy enforcement, and tamper-evident ImmuDB audit ledger
+  for autonomous AI agent tool calls in distributed Kubernetes clusters.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: AIL Team
+keywords:
+  - ai-compliance
+  - zero-trust
+  - opa
+  - spiffe
+  - immudb
+  - langgraph
+
+# ─── Sub-chart Dependencies ───────────────────────────────────────────────────
+# Blocker 1 Fix: SPIRE is bundled as a toggleable sub-chart.
+# - spire.enabled: true  → self-contained; SPIRE deployed alongside AIL (Option A)
+# - spire.enabled: false → Bring-Your-Own-SPIRE; assumes cluster-wide SPIRE (Option B)
+dependencies:
+  - name: spire
+    version: "~0.21.0"
+    repository: "https://spiffe.github.io/helm-charts-hardened"
+    condition: spire.enabled

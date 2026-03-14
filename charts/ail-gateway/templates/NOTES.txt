@@ -1,0 +1,48 @@
+╔══════════════════════════════════════════════════════════════════╗
+║         AIL Gateway {{ .Chart.Version }} — Deployed                              ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Tenant:    {{ .Values.tenantId }}
+Namespace: {{ .Release.Namespace }}
+Release:   {{ .Release.Name }}
+SPIRE:     {{ if .Values.spire.enabled }}Bundled (k8s_psat attestation){{ else }}External / Bring-Your-Own-SPIRE{{ end }}
+
+── Internal Services (cluster-local DNS) ──────────────────────────
+  Control Plane:  http://ail-control-plane.{{ .Release.Namespace }}.svc.cluster.local:8002
+  ImmuDB REST:    http://{{ include "ail-gateway.fullname" . }}-immudb.{{ .Release.Namespace }}.svc.cluster.local:8080
+  Dashboard:      http://{{ include "ail-gateway.fullname" . }}-dashboard.{{ .Release.Namespace }}.svc.cluster.local:3001
+
+── Required Next Steps ─────────────────────────────────────────────
+1. Set your OpenAI API key (if not already set):
+   helm upgrade {{ .Release.Name }} charts/ail-gateway \
+     --set secrets.openaiApiKey=YOUR_OPENAI_KEY \
+     -n {{ .Release.Namespace }}
+
+2. Pull SPIRE sub-chart dependencies (first install only):
+   helm dependency update charts/ail-gateway/
+
+3. Build and push your custom images, then update values:
+     images.controlPlane.repository / .tag
+     images.dashboard.repository    / .tag
+     images.agent.repository        / .tag
+
+4. Expose the control plane and dashboard via Ingress:
+   kubectl apply -f your-ingress.yaml -n {{ .Release.Namespace }}
+
+   Then rebuild the dashboard image with the Ingress URL:
+   docker build \
+     --build-arg NEXT_PUBLIC_API_URL=https://your-ingress-url \
+     --build-arg NEXT_PUBLIC_TENANT_ID={{ .Values.tenantId }} \
+     -t <registry>/ail-dashboard:{{ .Chart.AppVersion }} ./dashboard
+
+── Architecture Constraints ───────────────────────────────────────
+  Control plane replicas are locked to 1 (SQLite single-writer).
+  TODO: Phase 7 - Migrate to PostgreSQL for HA Multi-Replica support.
+
+  ImmuDB PVC is NOT deleted on helm uninstall (audit log preservation).
+  To destroy: kubectl delete pvc -l app.kubernetes.io/component=immudb -n {{ .Release.Namespace }}
+
+── Verify the Pipeline ─────────────────────────────────────────────
+  kubectl logs -l app.kubernetes.io/component=agent -c opa -n {{ .Release.Namespace }}
+  kubectl logs -l app.kubernetes.io/component=agent -c envoy -n {{ .Release.Namespace }}
+  kubectl logs -l app.kubernetes.io/component=agent -c langgraph-agent -n {{ .Release.Namespace }}
