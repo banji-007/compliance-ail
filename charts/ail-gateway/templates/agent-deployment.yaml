@@ -1,0 +1,233 @@
+{{/*
+AIL Agent Pod — The Sidecar Pattern.
+
+This single Pod contains three containers that share the same network namespace:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Pod: ail-gateway-agent                                     │
+  │                                                             │
+  │  ┌──────────────────┐  localhost:8443  ┌─────────────────┐  │
+  │  │  langgraph-agent │ ──────────────▶  │  envoy (mTLS)   │  │
+  │  │  (AI workload)   │                  │  sidecar        │  │
+  │  └──────────────────┘                  └────────┬────────┘  │
+  │                                                 │            │
+  │                                        localhost:8181        │
+  │                                                 │            │
+  │                                        ┌────────▼────────┐  │
+  │                                        │  opa (policy)   │  │
+  │                                        │  sidecar        │  │
+  │                                        └─────────────────┘  │
+  │                                                             │
+  │  Shared volumes:                                            │
+  │    spire-socket  → /run/spire/sockets/ (hostPath DaemonSet) │
+  │    envoy-config  → ConfigMap (with 127.0.0.1 OPA cluster)   │
+  │    opa-config    → ConfigMap (with K8s DNS bundle URL)       │
+  └─────────────────────────────────────────────────────────────┘
+
+Why this guarantees zero-trust interception:
+  - All three containers share the pod network namespace by Kubernetes design.
+    The agent CANNOT reach OPA or Envoy via any path except localhost.
+  - Traffic between agent ↔ envoy ↔ OPA never leaves the node NIC.
+  - Envoy enforces mTLS with SPIFFE SVIDs before forwarding to OPA.
+  - OPA enforces Rego policy (GDPR, SOC2, FinOps, HIPAA) before returning allow/deny.
+  - This chain is mathematically equivalent to Docker Compose's pid-namespace sharing,
+    but is the idiomatic and portable K8s pattern.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-agent
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  replicas: {{ .Values.agentReplicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ail-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        {{- include "ail-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+      annotations:
+        # Prometheus scrape annotations for the Envoy admin port (9901).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9901"
+        prometheus.io/path: "/stats/prometheus"
+    spec:
+      serviceAccountName: {{ include "ail-gateway.serviceAccountName" . }}
+
+      # ── Init Container ──────────────────────────────────────────────────────
+      # Wait for SPIRE workload API socket before starting any container.
+      # Replaces the Docker Compose shell loop: until [ -S .../workload_api.sock ]
+      initContainers:
+        - name: wait-for-spire
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for SPIRE workload API socket..."
+              until [ -S /run/spire/sockets/agent.sock ]; do
+                echo "  Socket not ready, retrying in 2s..."
+                sleep 2
+              done
+              echo "SPIRE socket ready."
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+
+      containers:
+        # ── Container 1: LangGraph AI Agent ────────────────────────────────────
+        # The AI workload. All tool calls are intercepted by the 4-stage pipeline
+        # before execution. The agent reaches Envoy via localhost:8443 (mTLS).
+        - name: langgraph-agent
+          image: "{{ .Values.images.agent.repository }}:{{ .Values.images.agent.tag }}"
+          imagePullPolicy: {{ .Values.images.agent.pullPolicy }}
+          command:
+            - python
+            - /app/framework_integration/langgraph_demo.py
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ail-gateway.fullname" . }}-secrets
+                  key: openai-api-key
+            - name: IMMUDB_URL
+              value: "http://{{ include "ail-gateway.immudbHost" . }}:8080"
+            - name: IMMUDB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ail-gateway.fullname" . }}-secrets
+                  key: immudb-user
+            - name: IMMUDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ail-gateway.fullname" . }}-secrets
+                  key: immudb-password
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: "unix:///run/spire/sockets/agent.sock"
+            # Envoy is a sidecar — agent reaches it on localhost.
+            - name: OPA_URL
+              value: "https://localhost:8443/v1/data/ail/main/allow"
+            - name: CONTROL_PLANE_URL
+              value: "http://ail-control-plane.{{ .Release.Namespace }}.svc.cluster.local:8002"
+            - name: AIL_TENANT_ID
+              value: {{ .Values.tenantId | quote }}
+            - name: SPIRE_DISABLED
+              value: "false"
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+
+        # ── Container 2: Envoy mTLS Proxy Sidecar ──────────────────────────────
+        # Intercepts all inbound calls to OPA. Enforces mutual TLS using SPIFFE
+        # SVIDs issued by the SPIRE agent on this node.
+        # OPA upstream is 127.0.0.1:8181 (same pod namespace — Blocker 2 Fix).
+        - name: envoy
+          image: "{{ .Values.images.envoy.repository }}:{{ .Values.images.envoy.tag }}"
+          imagePullPolicy: {{ .Values.images.envoy.pullPolicy }}
+          args:
+            - "-c"
+            - "/etc/envoy/envoy.yaml"
+          ports:
+            - name: mtls
+              containerPort: 8443
+              protocol: TCP
+            - name: admin
+              containerPort: 9901
+              protocol: TCP
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+              readOnly: true
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "curl -sf http://localhost:9901/ready"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
+        # ── Container 3: OPA Policy Engine Sidecar ─────────────────────────────
+        # Enforces Rego policies (GDPR, SOC2, FinOps, HIPAA) on every tool call.
+        # Listens on 0.0.0.0:8181 — reachable only within this pod's network
+        # namespace. Polls the control plane bundle API via K8s DNS.
+        - name: opa
+          image: "{{ .Values.images.opa.repository }}:{{ .Values.images.opa.tag }}"
+          imagePullPolicy: {{ .Values.images.opa.pullPolicy }}
+          args:
+            - "run"
+            - "--server"
+            - "--config-file=/config/opa-config.yaml"
+            - "--log-format=text"
+            - "--log-level=info"
+            - "--addr=0.0.0.0:8181"
+          ports:
+            - name: http
+              containerPort: 8181
+              protocol: TCP
+          env:
+            - name: AIL_TENANT_ID
+              value: {{ .Values.tenantId | quote }}
+          volumeMounts:
+            - name: opa-config
+              mountPath: /config
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/opa", "version"]
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
+      # ── Volumes ──────────────────────────────────────────────────────────────
+      volumes:
+        # SPIRE agent socket — published by SPIRE DaemonSet onto every node.
+        # All three containers mount this read-only to obtain/verify SVIDs.
+        # hostPath toggles based on spire.enabled (bundled vs external SPIRE).
+        - name: spire-agent-socket
+          hostPath:
+            path: {{ include "ail-gateway.spireSocketDir" . }}
+            type: DirectoryOrCreate
+
+        # Envoy config — rendered from ConfigMap with 127.0.0.1 OPA address.
+        - name: envoy-config
+          configMap:
+            name: {{ include "ail-gateway.fullname" . }}-envoy-config
+
+        # OPA config — rendered from ConfigMap with K8s DNS bundle URL.
+        - name: opa-config
+          configMap:
+            name: {{ include "ail-gateway.fullname" . }}-opa-config

@@ -1,0 +1,99 @@
+{{/*
+ImmuDB — StatefulSet with PersistentVolumeClaim.
+
+StatefulSet (not Deployment) because:
+  - Stable network identity: immudb-0 DNS name is deterministic
+  - PVC lifecycle is tied to the pod; data survives pod restarts AND rescheduling
+  - The Merkle-tree cryptographic ledger MUST be durable — losing audit logs
+    is a compliance violation, not just data loss
+
+Port 8080 (REST API) is intentionally NOT exposed via a LoadBalancer/NodePort.
+It is cluster-internal only, accessible via:
+  http://{{ include "ail-gateway.fullname" . }}-immudb.<namespace>.svc.cluster.local:8080
+This mirrors the Docker Compose design where port 8080 was not host-exposed.
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-immudb
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: immudb
+spec:
+  serviceName: {{ include "ail-gateway.fullname" . }}-immudb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "ail-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: immudb
+  template:
+    metadata:
+      labels:
+        {{- include "ail-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: immudb
+    spec:
+      serviceAccountName: {{ include "ail-gateway.serviceAccountName" . }}
+      containers:
+        - name: immudb
+          image: "{{ .Values.images.immudb.repository }}:{{ .Values.images.immudb.tag }}"
+          imagePullPolicy: {{ .Values.images.immudb.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: 3322
+              protocol: TCP
+            - name: rest
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: IMMUDB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ail-gateway.fullname" . }}-secrets
+                  key: immudb-user
+            - name: IMMUDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ail-gateway.fullname" . }}-secrets
+                  key: immudb-password
+          volumeMounts:
+            - name: immudb-data
+              mountPath: /var/lib/immudb
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+
+  # PVC template — the cryptographic audit ledger must survive pod restarts.
+  # StatefulSet PVCs are NOT deleted on `helm uninstall` by default.
+  # This is intentional: audit logs must be preserved for forensic investigation.
+  # To destroy: kubectl delete pvc immudb-data-<release>-ail-gateway-immudb-0
+  volumeClaimTemplates:
+    - metadata:
+        name: immudb-data
+        labels:
+          {{- include "ail-gateway.labels" . | nindent 10 }}
+          app.kubernetes.io/component: immudb
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.immudb.storageClassName }}
+        storageClassName: {{ .Values.immudb.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.immudb.storage }}

@@ -1,0 +1,27 @@
+{{/*
+Blocker 3 Fix — Persistent storage for the SQLite tenant config database.
+
+ReadWriteOnce enforces the single-writer constraint at the storage layer.
+If a second control-plane pod is ever scheduled, the PVC mount will fail,
+preventing silent SQLite database corruption from concurrent writes.
+
+TODO: Phase 7 - Migrate to PostgreSQL for HA Multi-Replica support.
+      Replace this PVC with a PostgreSQL StatefulSet or managed RDS endpoint,
+      then remove the replicas: 1 constraint in control-plane-deployment.yaml.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ail-gateway.fullname" . }}-control-plane-data
+  labels:
+    {{- include "ail-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.controlPlane.storageClassName }}
+  storageClassName: {{ .Values.controlPlane.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.controlPlane.storage }}

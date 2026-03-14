@@ -1,0 +1,16 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: ail-agent-workload
+spec:
+  className: ail-system-ail-gateway
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: In
+      values:
+      - ail-system
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/workload/envoy"
