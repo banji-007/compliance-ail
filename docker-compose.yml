@@ -11,6 +11,9 @@ services:
       - IMMUDB_URL=http://immudb:8080
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
+      # API key for mutating control-plane endpoints (PUT/POST /tenants).
+      # Must be set in .env — absent key disables auth with a 503 response.
+      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
     volumes:
       # policy/ mounted at runtime — changes on tenant config updates.
       - ./policy:/policy:ro
@@ -102,6 +105,8 @@ services:
       - spire-agent-config:/opt/spire/conf/agent
       - spire-sockets:/tmp/spire-sockets
       - spire-agent-data:/opt/spire/data
+      # Read-only: trust bundle written by token-generator for secure bootstrap.
+      - spire-bundle:/opt/spire/bundle:ro
     healthcheck:
       test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/tmp/spire-sockets/workload_api.sock"]
       interval: 5s
@@ -125,6 +130,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - spire-server-socket:/tmp/spire-server
       - spire-agent-config:/opt/spire/agent-config
+      - spire-bundle:/opt/spire/bundle
       - ./scripts/spire-watchdog.sh:/opt/spire/watchdog.sh:ro
     entrypoint: ["/bin/sh", "/opt/spire/watchdog.sh"]
     restart: unless-stopped
@@ -242,7 +248,7 @@ services:
       - "3000:3000"
     environment:
       - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
       - grafana-data:/var/lib/grafana
@@ -263,6 +269,7 @@ services:
       - spire-tokens:/opt/spire/tokens
       - spire-server-socket:/tmp/spire-server
       - spire-agent-config:/opt/spire/agent-config
+      - spire-bundle:/opt/spire/bundle
     restart: "no"
     entrypoint: ["/bin/sh"]
     command:
@@ -296,7 +303,15 @@ services:
         echo "$$TOKEN" > /opt/spire/tokens/join_token
         echo "Token written to shared volume"
 
-        echo "Writing agent.conf with live token..."
+        echo "Exporting SPIRE trust bundle for secure bootstrap..."
+        docker exec spire-server \
+          /opt/spire/bin/spire-server bundle show \
+          -format pem \
+          -socketPath "$$SOCKET" \
+          > /opt/spire/bundle/trust_bundle.pem
+        echo "Trust bundle written to shared volume."
+
+        echo "Writing agent.conf with live token (insecure_bootstrap=false)..."
         {
           echo 'agent {'
           echo '    data_dir          = "/opt/spire/data"'
@@ -305,7 +320,8 @@ services:
           echo '    server_port       = "8081"'
           echo '    socket_path       = "/tmp/spire-sockets/workload_api.sock"'
           echo '    trust_domain      = "ail.internal"'
-          echo '    insecure_bootstrap = true'
+          echo '    insecure_bootstrap = false'
+          echo '    trust_bundle_path  = "/opt/spire/bundle/trust_bundle.pem"'
           echo "    join_token        = \"$$TOKEN\""
           echo '}'
           echo ''
@@ -362,6 +378,8 @@ volumes:
   spire-agent-data:
   spire-agent-config:
   spire-tokens:
+  # Shared SPIRE server CA bundle for secure (non-insecure) agent bootstrap.
+  spire-bundle:
   grafana-data:
   # Persists SQLite tenant config across docker compose down/up cycles.
   control-plane-data:

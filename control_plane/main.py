@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -35,6 +35,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 DEFAULT_TENANT_ID = "tenant_default"
+
+# Static API key for mutating control-plane endpoints.
+# Set CONTROL_PLANE_API_KEY in the environment (docker-compose .env).
+# If unset, mutating endpoints return 503 rather than operating unauthenticated.
+_CONTROL_PLANE_API_KEY = os.getenv("CONTROL_PLANE_API_KEY", "")
+
+
+def _require_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
+    """FastAPI dependency: enforces X-API-Key on mutating endpoints."""
+    if not _CONTROL_PLANE_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="API key authentication not configured (CONTROL_PLANE_API_KEY missing)",
+        )
+    if x_api_key != _CONTROL_PLANE_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
 
 # Internal Docker service name; overridable via env for local dev.
 IMMUDB_URL = os.getenv("IMMUDB_URL", "http://immudb:8080")
@@ -155,7 +172,11 @@ def get_tenant(tenant_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/tenants", response_model=TenantRead, status_code=201)
-def create_tenant(payload: TenantCreate, db: Session = Depends(get_db)):
+def create_tenant(
+    payload: TenantCreate,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_api_key),
+):
     if db.query(Tenant).filter_by(id=payload.id).first():
         raise HTTPException(status_code=409, detail=f"Tenant '{payload.id}' already exists")
     tenant = Tenant(**payload.model_dump())
@@ -167,7 +188,12 @@ def create_tenant(payload: TenantCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/tenants/{tenant_id}", response_model=TenantRead)
-def update_tenant(tenant_id: str, payload: TenantUpdate, db: Session = Depends(get_db)):
+def update_tenant(
+    tenant_id: str,
+    payload: TenantUpdate,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_api_key),
+):
     """
     Update a tenant's compliance pack settings and/or allowed cost centers.
     OPA will receive a new bundle on its next poll (the ETag changes because
@@ -197,7 +223,7 @@ def head_bundle(tenant_id: str, db: Session = Depends(get_db)):
 
     _, etag = generate_bundle(tenant)
     logger.debug("HEAD /bundles/%s → ETag %s…", tenant_id, etag[:12])
-    return Response(headers={"ETag": etag})
+    return Response(headers={"ETag": etag, "Cache-Control": "max-age=300, must-revalidate"})
 
 
 @app.get("/bundles/{tenant_id}")
@@ -220,7 +246,7 @@ def get_bundle(tenant_id: str, request: Request, db: Session = Depends(get_db)):
     return Response(
         content=bundle_bytes,
         media_type="application/gzip",
-        headers={"ETag": etag},
+        headers={"ETag": etag, "Cache-Control": "max-age=300, must-revalidate"},
     )
 
 
