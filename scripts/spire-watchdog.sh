@@ -17,6 +17,7 @@ set -e
 SPIFFE_ID="spiffe://ail.internal/agent/local"
 SOCKET_PATH="/tmp/spire-server/private/api.sock"
 AGENT_CONF="/opt/spire/agent-config/agent.conf"
+BUNDLE_PATH="/opt/spire/bundle/trust_bundle.pem"
 # Label used by Docker Compose to tag the agent container.
 AGENT_LABEL="com.docker.compose.service=spire-agent"
 
@@ -48,6 +49,17 @@ generate_token() {
 # ---------------------------------------------------------------------------
 write_agent_conf() {
     TOKEN="$1"
+    # Refresh the trust bundle before writing config so the pinned CA stays
+    # current across SPIRE server restarts (CA rotation).
+    log "Exporting SPIRE trust bundle for secure bootstrap..."
+    docker exec spire-server \
+        /opt/spire/bin/spire-server bundle show \
+        -format pem \
+        -socketPath "$SOCKET_PATH" \
+        > "$BUNDLE_PATH" 2>/dev/null \
+        && log "Trust bundle refreshed at $BUNDLE_PATH." \
+        || log "WARNING: bundle export failed — using existing bundle if present."
+
     cat > "$AGENT_CONF" << EOF
 agent {
     data_dir          = "/opt/spire/data"
@@ -56,7 +68,8 @@ agent {
     server_port       = "8081"
     socket_path       = "/tmp/spire-sockets/workload_api.sock"
     trust_domain      = "ail.internal"
-    insecure_bootstrap = true
+    insecure_bootstrap = false
+    trust_bundle_path  = "$BUNDLE_PATH"
     join_token        = "$TOKEN"
 }
 

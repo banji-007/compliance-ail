@@ -19,8 +19,20 @@ class CloudServerProvisionSchema(BaseModel):
     Strict schema for cloud server provisioning tool arguments.
     Catches LLM hallucinations before they reach OPA.
     """
-    instance_type: str = Field(..., description="EC2 instance type (e.g., 'p4d.24xlarge')")
-    region: str = Field(..., description="AWS region (e.g., 'us-east-1')")
+    # e.g. "t3.micro", "p4d.24xlarge" — alphanumeric with dots/dashes only
+    instance_type: str = Field(
+        ...,
+        pattern=r'^[a-z][a-z0-9\-]*\.[a-z0-9]+$',
+        max_length=32,
+        description="EC2 instance type (e.g., 'p4d.24xlarge')",
+    )
+    # e.g. "us-east-1", "eu-central-1"
+    region: str = Field(
+        ...,
+        pattern=r'^[a-z]{2}-[a-z]+-\d+$',
+        max_length=24,
+        description="AWS region (e.g., 'us-east-1')",
+    )
     cost_per_hour: float = Field(..., gt=0, description="Hourly cost in USD (must be positive)")
     tags: Dict[str, str] = Field(..., description="Dictionary of tags with string keys and values")
 
@@ -33,9 +45,20 @@ class QueryDatabaseSchema(BaseModel):
     Ensures target_table, query, processing_purpose, and masking_enabled are
     all present and correctly typed before the call reaches OPA.
     """
-    target_table: str = Field(..., description="Database table to query (e.g., 'users', 'pii_records')")
-    query: str = Field(..., description="SQL query or query description to execute")
-    processing_purpose: str = Field(..., description="Declared business purpose for accessing this data")
+    # Table names: letters, digits, underscores only — no SQL metacharacters
+    target_table: str = Field(
+        ...,
+        pattern=r'^[a-zA-Z_][a-zA-Z0-9_]*$',
+        max_length=128,
+        description="Database table to query (e.g., 'users', 'pii_records')",
+    )
+    query: str = Field(..., max_length=4096, description="SQL query or query description to execute")
+    processing_purpose: str = Field(
+        ...,
+        pattern=r'^[a-zA-Z0-9_\-]+$',
+        max_length=64,
+        description="Declared business purpose for accessing this data",
+    )
     masking_enabled: bool = Field(..., description="Whether PII field masking is enabled")
 
     model_config = {"extra": "forbid"}
@@ -47,10 +70,31 @@ class DeployToProductionSchema(BaseModel):
     Ensures change-management fields are present and correctly typed
     before the call reaches OPA (SOC2 CC8.1 / FinOps guardrails).
     """
-    repository_name: str = Field(..., description="Name of the code repository being deployed")
-    commit_hash: str = Field(..., description="Git commit SHA being deployed")
-    environment: str = Field(..., description="Target environment (e.g., 'staging', 'production')")
-    approval_ticket: str = Field(..., description="Jira/ServiceNow ticket reference; empty string if absent (policy will deny)")
+    # Repo names: alphanumeric, dash, underscore, dot — no path traversal
+    repository_name: str = Field(
+        ...,
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_\-\.]*$',
+        max_length=255,
+        description="Name of the code repository being deployed",
+    )
+    # Git SHA: hex chars only, 7–64 characters
+    commit_hash: str = Field(
+        ...,
+        pattern=r'^[0-9a-f]{7,64}$',
+        description="Git commit SHA being deployed",
+    )
+    # Environment: lowercase alphanumeric with dashes
+    environment: str = Field(
+        ...,
+        pattern=r'^[a-z][a-z0-9\-]*$',
+        max_length=32,
+        description="Target environment (e.g., 'staging', 'production')",
+    )
+    approval_ticket: str = Field(
+        ...,
+        max_length=64,
+        description="Jira/ServiceNow ticket reference; empty string if absent (policy will deny)",
+    )
     bypass_ci: bool = Field(..., description="Whether automated CI/CD checks are being skipped")
 
     model_config = {"extra": "forbid"}

@@ -3,9 +3,11 @@ import logging
 import sys
 import os
 import ssl
+import socket
 import tempfile
 import time
 import httpx
+from urllib.parse import urlparse
 from prometheus_client import Counter, start_http_server, REGISTRY
 
 # Add the ledger directory to the path
@@ -41,6 +43,72 @@ _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
 _OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/allow")
 
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
+
+# Expected SPIFFE ID of the OPA gateway (Envoy mTLS terminator).
+# Any peer presenting a different URI SAN — even if CA-signed — is rejected.
+_EXPECTED_OPA_SPIFFE_ID = os.getenv(
+    "OPA_SPIFFE_ID", "spiffe://ail.internal/workload/envoy"
+)
+
+
+def _validate_peer_spiffe_san(ssl_ctx: ssl.SSLContext) -> bool:
+    """
+    Establish a raw TLS connection to the OPA/Envoy endpoint and verify that
+    the peer's certificate URI SAN matches _EXPECTED_OPA_SPIFFE_ID.
+
+    check_hostname is disabled globally because SPIFFE certs carry URI SANs,
+    not DNS SANs. This function reinstates identity verification at the
+    application layer by extracting and comparing the URI SAN directly.
+
+    Returns False on any error (fail-closed).
+    """
+    if _SPIRE_DISABLED:
+        return True  # SAN validation only applies when mTLS is active.
+
+    parsed = urlparse(_OPA_URL)
+    host = parsed.hostname or "envoy"
+    port = parsed.port or 443
+
+    try:
+        from cryptography import x509 as _cx509
+
+        raw = socket.create_connection((host, port), timeout=5)
+        tls_sock = ssl_ctx.wrap_socket(raw, server_side=False, server_hostname=host)
+        try:
+            der = tls_sock.getpeercert(binary_form=True)
+        finally:
+            tls_sock.close()
+
+        if not der:
+            logging.error("Peer SPIFFE SAN validation: no peer certificate returned.")
+            return False
+
+        cert = _cx509.load_der_x509_certificate(der)
+        try:
+            san_ext = cert.extensions.get_extension_for_class(
+                _cx509.SubjectAlternativeName
+            )
+            uri_sans = san_ext.value.get_values_for_type(
+                _cx509.UniformResourceIdentifier
+            )
+        except Exception:
+            uri_sans = []
+
+        if _EXPECTED_OPA_SPIFFE_ID in uri_sans:
+            logging.debug("Peer SPIFFE SAN validated: %s", _EXPECTED_OPA_SPIFFE_ID)
+            return True
+
+        logging.error(
+            "Peer SPIFFE SAN mismatch — expected '%s', peer presented: %s. "
+            "Fail-closed: OPA request blocked.",
+            _EXPECTED_OPA_SPIFFE_ID,
+            uri_sans,
+        )
+        return False
+
+    except Exception as exc:
+        logging.error("Peer SPIFFE SAN validation error: %s", exc)
+        return False
 
 # Prometheus metrics — guard against double-registration when the module is
 # re-imported in the same process (e.g. pytest collecting multiple test files).
@@ -242,6 +310,16 @@ def query_opa_policy(tool_name, tool_args):
                 "allowed": False,
                 "reason": "DENIED: Workload Identity missing or invalid. Execution blocked by AIL.",
                 "deny": ["Workload Identity missing or invalid. Execution blocked by AIL."]
+            }
+
+        # Verify the OPA endpoint's SPIFFE URI SAN before transmitting policy
+        # data. Prevents any CA-signed workload from impersonating the policy
+        # engine — only spiffe://ail.internal/workload/envoy is accepted.
+        if not _validate_peer_spiffe_san(ssl_context):
+            return {
+                "allowed": False,
+                "reason": "DENIED: OPA endpoint SPIFFE identity could not be verified. Execution blocked by AIL.",
+                "deny": ["OPA endpoint SPIFFE identity could not be verified. Execution blocked by AIL."]
             }
 
     # Primary query to /allow endpoint

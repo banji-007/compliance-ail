@@ -121,7 +121,7 @@ def provision_cloud_server(
     - cost_center: required for production environments
     - encryption_at_rest: set True for SOC2-compliant prod deployments
     """
-    print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
+    logging.debug("Tool invoked by LLM: %s", __name__)
 
     tags = {
         "environment": environment,
@@ -178,7 +178,7 @@ def query_database(
     - processing_purpose: GDPR blocks queries on PII tables without an approved purpose
     - masking_enabled: set True for SOC2-compliant queries on sensitive tables
     """
-    print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
+    logging.debug("Tool invoked by LLM: %s", __name__)
 
     args = {
         "target_table": target_table,
@@ -225,7 +225,7 @@ def deploy_to_production(
     - bypass_ci: SOC2 CC8.1 unconditionally blocks any deployment that skips CI/CD checks
     - repository_name: FinOps blocks repositories containing 'experimental' from production
     """
-    print('\n>>> [DEBUG] TOOL INVOKED BY LLM <<<')
+    logging.debug("Tool invoked by LLM: %s", __name__)
 
     args = {
         "repository_name": repository_name,

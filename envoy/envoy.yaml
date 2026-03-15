@@ -54,9 +54,8 @@ static_resources:
                 - san_type: URI
                   matcher:
                     exact: "spiffe://ail.internal/workload/agent"
-                - san_type: URI
-                  matcher:
-                    exact: "spiffe://ail.internal/workload/test"
+                # workload/test (unix:uid:0 / root) removed — root identity
+                # must never be a valid mTLS client in production.
               validation_context_sds_secret_config:
                 name: "spiffe://ail.internal"
                 sds_config:
@@ -105,5 +104,6 @@ static_resources:
 admin:
   address:
     socket_address:
-      address: 0.0.0.0
+      # Loopback-only: admin interface must not be reachable from other containers.
+      address: 127.0.0.1
       port_value: 9901
