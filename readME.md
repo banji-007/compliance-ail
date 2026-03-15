@@ -30,7 +30,7 @@ This approach is **not a security control**. It is a polite suggestion written i
 | **Hallucination** | Even a well-intentioned model can produce a tool call payload that violates a constraint it was instructed to follow, especially under complex multi-step reasoning chains. |
 | **Non-Determinism** | The same prompt does not produce the same output. A system that passes compliance testing today may fail in production tomorrow under identical conditions. |
 
-For a SOC2 Type II audit, GDPR Article 25 (Data Protection by Design), or any regulatory framework that requires **demonstrable, verifiable controls**, a language model instruction is inadmissible as a security boundary. An auditor will reject it. A breach attorney will demolish it.
+For a SOC2 Type II audit, GDPR Article 25 (Data Protection by Design), or any regulatory framework that requires **demonstrable, verifiable controls**, a language model instruction is inadmissible as a security boundary. An auditor will reject it and a breach attorney will exploit it.
 
 **The required architecture is an out-of-band, deterministic enforcement gateway.**
 
