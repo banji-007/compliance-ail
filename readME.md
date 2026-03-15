@@ -1,6 +1,6 @@
 # Agentic Integrity Ledger (AIL)
 
-### Enterprise AI Compliance Gateway — Zero-Trust Policy Enforcement for Autonomous AI Agents
+### Enterprise AI Compliance Gateway - Zero-Trust Policy Enforcement for Autonomous AI Agents
 
 [![Architecture: Zero-Trust](https://img.shields.io/badge/Architecture-Zero%20Trust-blue)](#) [![Identity: SPIFFE/SPIRE](https://img.shields.io/badge/Identity-SPIFFE%2FSPIRE-green)](#) [![Policy: OPA](https://img.shields.io/badge/Policy-Open%20Policy%20Agent-orange)](#) [![Audit: ImmuDB](https://img.shields.io/badge/Audit-ImmuDB%20Immutable-red)](#) [![CI: GitHub Actions](https://img.shields.io/badge/CI-GitHub%20Actions-black)](#) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](#)
 
@@ -323,7 +323,7 @@ The Docker Compose stack remains the recommended path for local development and 
 
 ## 5. Security Threat Model
 
-### Prompt Injection — Fully Mitigated
+### Prompt Injection - Fully Mitigated
 
 The gateway's enforcement is **out-of-band**: it operates at the tool call interception layer in the Python interceptor and at the Envoy network layer. The LLM's output is only ever treated as untrusted input to be evaluated. The LLM cannot instruct the gateway to disable itself any more than a SQL injection payload can instruct a firewall to turn off.
 
