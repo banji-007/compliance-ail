@@ -306,6 +306,19 @@ The same gateway binary, the same OPA process, two completely isolated policy br
 | Grafana | `http://localhost:3000` | Prometheus metrics dashboard |
 | Prometheus | `http://localhost:9090` | Raw metrics scrape target |
 
+### 4.7 Enterprise Kubernetes Deployment
+
+For production deployments, AIL ships a **production-ready Helm chart** that translates the full sidecar architecture into Kubernetes-native manifests. The AI agent, Envoy proxy, and OPA policy engine run inside a shared Pod namespace, eliminating node-level network sniffing without any additional network policy configuration.
+
+Workload identity is negotiated using **Kubernetes Projected Service Account Tokens (PSAT)** — the native K8s SPIRE attestation method — integrating cleanly into existing cluster security postures without static secrets.
+
+```bash
+helm dependency update charts/ail-gateway/
+helm install ail-gateway charts/ail-gateway -n ail-system --create-namespace
+```
+
+The Docker Compose stack remains the recommended path for local development and demo environments. The Helm chart is the production path.
+
 ---
 
 ## 5. Security Threat Model
