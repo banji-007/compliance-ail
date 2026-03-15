@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
                 enable_gdpr=True,
                 enable_soc2=True,
                 enable_finops=True,
-                enable_hipaa=False,
+                enable_hipaa=True,
                 allowed_cost_centers="engineering,marketing,finance,operations",
                 approved_regions="eu-central-1,us-east-1",
                 approved_purposes="customer_support,billing",
@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
                 enable_gdpr=True,
                 enable_soc2=True,
                 enable_finops=True,
-                enable_hipaa=False,
+                enable_hipaa=True,
                 # Strict spend controls — only finance and executive cost centers approved.
                 allowed_cost_centers="finance,executive",
                 approved_regions="eu-central-1,us-east-1",

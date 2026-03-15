@@ -108,8 +108,26 @@ services:
       timeout: 3s
       retries: 10
       start_period: 20s
-    restart: unless-stopped
+    # restart: "no" — the spire-agent-watchdog service manages restarts.
+    # It generates a fresh join token before each restart so the one-time
+    # token is never re-used, which is what caused the crash-loop.
+    restart: "no"
     command: ["/opt/spire/bin/spire-agent", "run", "-config", "/opt/spire/conf/agent/agent.conf"]
+
+  spire-agent-watchdog:
+    image: docker:cli
+    depends_on:
+      spire-server:
+        condition: service_healthy
+      spire-agent:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - spire-server-socket:/tmp/spire-server
+      - spire-agent-config:/opt/spire/agent-config
+      - ./scripts/spire-watchdog.sh:/opt/spire/watchdog.sh:ro
+    entrypoint: ["/bin/sh", "/opt/spire/watchdog.sh"]
+    restart: unless-stopped
 
   envoy:
     image: envoyproxy/envoy:v1.27.7

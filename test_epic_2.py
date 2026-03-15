@@ -98,15 +98,15 @@ def test_epic_2_validation():
     assert result.get('status') == 'DENIED', (
         f"Expected DENIED for unregistered tool 'read_file', got {result.get('status')!r}"
     )
-    print("✓ Confirmed: unregistered tool blocked fail-closed by TOOL_VALIDATORS registry")
+    print("[PASS] Confirmed: unregistered tool blocked fail-closed by TOOL_VALIDATORS registry")
     print()
-    
+
     print("=== Epic 2 Implementation Summary ===")
-    print("✅ Dependency: pydantic is available in requirements.txt")
-    print("✅ Schema: CloudServerProvisionSchema defined in interceptor/schemas.py")
-    print("✅ Validation: Pre-flight validation implemented in query_opa_policy()")
-    print("✅ Fail-Closed: ValidationError returns formatted denial to LLM")
-    print("✅ Network Efficiency: Invalid requests blocked before OPA network call")
+    print("[OK] Dependency: pydantic is available in requirements.txt")
+    print("[OK] Schema: CloudServerProvisionSchema defined in interceptor/schemas.py")
+    print("[OK] Validation: Pre-flight validation implemented in query_opa_policy()")
+    print("[OK] Fail-Closed: ValidationError returns formatted denial to LLM")
+    print("[OK] Network Efficiency: Invalid requests blocked before OPA network call")
 
 if __name__ == '__main__':
     test_epic_2_validation()
