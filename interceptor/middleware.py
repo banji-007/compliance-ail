@@ -4,6 +4,7 @@ import sys
 import os
 import ssl
 import socket
+import stat
 import tempfile
 import time
 import httpx
@@ -43,6 +44,28 @@ _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
 _OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/allow")
 
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
+
+# Fields whose values must never appear in container logs.
+# Add any future PII or credential keys here — the helper recurses into nested dicts.
+_SENSITIVE_KEYS = frozenset({"query", "approval_ticket", "commit_hash"})
+
+
+def _redact_args(args: dict) -> dict:
+    """
+    Return a shallow copy of args with sensitive field values replaced by [REDACTED].
+    Recurses one level into nested dicts (e.g. the 'tags' dict in provision_cloud_server).
+    Non-sensitive metadata (region, instance_type, environment, tags, etc.) is preserved
+    in the clear for ops visibility.
+    """
+    redacted = {}
+    for k, v in args.items():
+        if k in _SENSITIVE_KEYS:
+            redacted[k] = "[REDACTED]"
+        elif isinstance(v, dict):
+            redacted[k] = _redact_args(v)
+        else:
+            redacted[k] = v
+    return redacted
 
 # Expected SPIFFE ID of the OPA gateway (Envoy mTLS terminator).
 # Any peer presenting a different URI SAN — even if CA-signed — is rejected.
@@ -122,8 +145,8 @@ except ValueError:
     _POLICY_DECISIONS = REGISTRY._names_to_collectors["ail_policy_decisions_total"]
 
 try:
-    start_http_server(8000)
-    logging.info("Prometheus metrics server started on :8000")
+    start_http_server(8000, addr="127.0.0.1")
+    logging.info("Prometheus metrics server started on 127.0.0.1:8000")
 except OSError:
     pass  # port already bound (e.g. module reloaded)
 
@@ -232,13 +255,23 @@ def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
             try:
                 cert_file.write(cert_pem)
                 cert_file.flush()
+                # Restrict to owner read/write immediately after write —
+                # prevents other processes from reading key material off disk.
+                os.chmod(cert_file.name, stat.S_IRUSR | stat.S_IWUSR)
                 key_file.write(key_pem)
                 key_file.flush()
+                os.chmod(key_file.name, stat.S_IRUSR | stat.S_IWUSR)
                 ssl_ctx.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
                 ssl_ctx.load_verify_locations(cadata=ca_pem.decode())
             finally:
                 cert_file.close()
                 key_file.close()
+                # Overwrite key material with random bytes before unlinking to
+                # close the disk-recovery window (prevents forensic file carving).
+                with open(cert_file.name, "wb") as f:
+                    f.write(os.urandom(len(cert_pem)))
+                with open(key_file.name, "wb") as f:
+                    f.write(os.urandom(len(key_pem)))
                 os.unlink(cert_file.name)
                 os.unlink(key_file.name)
         
@@ -331,7 +364,7 @@ def query_opa_policy(tool_name, tool_args):
                 timeout=5,
             )
 
-        logging.debug(f"OPA /allow status={response.status_code} body={response.text}")
+        logging.debug(f"OPA /allow status={response.status_code} body={response.text[:200]}")
 
         if response.status_code == 200:
             result = response.json().get("result")
@@ -356,7 +389,7 @@ def query_opa_policy(tool_name, tool_args):
                             timeout=5,
                         )
                     
-                    logging.debug(f"OPA /deny status={deny_response.status_code} body={deny_response.text}")
+                    logging.debug(f"OPA /deny status={deny_response.status_code} body={deny_response.text[:200]}")
                     
                     if deny_response.status_code == 200:
                         deny_result = deny_response.json().get("result", [])
@@ -413,7 +446,7 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     Returns:
         dict: Response with 'status', 'message', and 'record_hash' keys
     """
-    logging.info(f"Agent Request -> AIL Intercept: {tool_name} | args={json.dumps(tool_args)}")
+    logging.info(f"Agent Request -> AIL Intercept: {tool_name} | args={json.dumps(_redact_args(tool_args))}")
 
     opa_decision = query_opa_policy(tool_name, tool_args)
 
