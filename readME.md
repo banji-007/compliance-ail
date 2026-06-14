@@ -148,7 +148,7 @@ The control plane persists tenant config in SQLite, which is sufficient for the 
 
 ### 3.4 Cryptographic Auditability
 
-Every policy decision - APPROVED or DENIED - is written to **ImmuDB**, an immutable database backed by a Merkle tree structure.
+Every policy decision - APPROVED or DENIED - is written to **ImmuDB** via `verifiableSet`, which records the entry in a Merkle-committed transaction and returns the transaction header.
 
 For each decision, the ledger stores:
 - Agent SPIFFE identity
@@ -156,11 +156,14 @@ For each decision, the ledger stores:
 - Full tool call payload (arguments as submitted)
 - OPA verdict string
 - Policy bundle ETag (version of the policies that evaluated this call)
-- SHA-256 hash: `sha256(key:serialized_entry:tx_id)`
 
-Two distinct integrity guarantees apply. The per-entry digest lets an auditor confirm that a returned entry's contents match what was recorded; it is reproducible offline with no tooling beyond a SHA-256 implementation. Whole-ledger tamper-evidence - proof that no entry was deleted and the chain was not rewritten - comes from ImmuDB's Merkle-tree inclusion and consistency proofs, not from the per-entry digest. The current REST integration surfaces the per-entry digest in the dashboard; verification of ImmuDB's cryptographic proofs is a separate step against the ImmuDB transaction store.
+After each write the interceptor computes the transaction's **Accumulated Ledger Hash** (ALH = `SHA256(prevAlh ‖ BigEndian8(txID) ‖ entriesHash)`) from the returned header and persists it in a local trusted state file keyed by transaction ID. This formula mirrors `TxHeader.Alh()` in ImmuDB's Go source and is reproducible from the raw header fields.
 
-The CISO dashboard's Audit Ledger view exposes the per-entry digest for every record, copyable directly from the UI.
+Audit reads use `verifiableGet` instead of a plain scan. For each entry the control plane retrieves the inclusion proof and recomputes the ALH from the source transaction header, returning both alongside the entry. An auditor can compare the returned ALH against the value stored in the interceptor's trusted state to confirm the entry has not been modified since it was written: any change to the entry changes `entriesHash`, which changes the ALH and breaks the comparison.
+
+Full Merkle inclusion proof walking (proving the entry is at a specific leaf position in the tree without trusting the server) requires implementing ImmuDB's binary Merkle verification or using `immuclient`; this is tracked as future work. The inclusion proof terms are returned in the `/audit` response for offline verification.
+
+The CISO dashboard's Audit Ledger view exposes the `entry_alh` and `inclusion_proof` for every record.
 
 ### 3.5 Real-Time CISO Observability
 
@@ -358,7 +361,7 @@ This bounds prompt injection rather than eliminating it. The guarantee is precis
 
 **ADR-001: ImmuDB REST API over gRPC SDK**
 
-The native `immudb-py` gRPC SDK requires a pinned version of Google Protobuf that conflicts with `spiffe` library dependencies under Python 3.11. Rather than accepting a degraded security posture (running without mTLS) to satisfy a transitive dependency, we migrated the ledger client to ImmuDB's REST API. Trade-off accepted: the REST path returns entry data plus a reproducible per-entry content digest (`sha256(key:serialized_entry:tx_id)`), but does not by itself perform the verified-read proof check the gRPC SDK offers. Whole-ledger proof verification against ImmuDB's Merkle-tree is tracked as a known gap (see TODO).
+The native `immudb-py` gRPC SDK requires a pinned version of Google Protobuf that conflicts with `spiffe` library dependencies under Python 3.11. Rather than accepting a degraded security posture (running without mTLS) to satisfy a transitive dependency, the ledger client uses ImmuDB's REST API with its verifiable endpoints (`verifiableSet` / `verifiableGet`). Writes are committed via `verifiableSet`; the ALH is computed from the returned transaction header and persisted locally as a trusted reference. Reads use `verifiableGet` to retrieve the inclusion proof and source transaction header alongside each entry. Known gap: full client-side Merkle inclusion proof walking (without the gRPC SDK) requires implementing ImmuDB's binary tree hash algorithm; this is tracked as open work. In the interim, auditors can verify inclusion proofs offline using `immuclient` or the immudb-py SDK against the ImmuDB transaction store.
 
 **ADR-002: FastAPI as ImmuDB Proxy**
 

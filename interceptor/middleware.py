@@ -145,8 +145,8 @@ except ValueError:
     _POLICY_DECISIONS = REGISTRY._names_to_collectors["ail_policy_decisions_total"]
 
 try:
-    start_http_server(8000, addr="127.0.0.1")
-    logging.info("Prometheus metrics server started on 127.0.0.1:8000")
+    start_http_server(8000)
+    logging.info("Prometheus metrics server started on 0.0.0.0:8000")
 except OSError:
     pass  # port already bound (e.g. module reloaded)
 
@@ -481,27 +481,25 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     _POLICY_DECISIONS.labels(status=response["status"], tool_name=tool_name, policy=policy_label).inc()
 
     # Fail-closed: log to ImmuDB ledger or block execution if unavailable
-    record_hash = "unavailable"  # Initialize to prevent uninitialized variable usage
+    ledger_tx_id = None
     try:
         from immudb_ledger import get_ledger
         ledger = get_ledger()
 
         policy_version = _compute_policy_hash()
-        ledger.log_tool_call(
+        ledger_tx_id = ledger.log_tool_call(
             agent_id=agent_id,
             tool_name=tool_name,
             payload=tool_args,
             decision=f"{decision_for_ledger} (policy: {policy_version})",
         )
-        record_hash = ledger.get_previous_hash()
-        logging.info(f"Ledger Hash: {record_hash[:16]}")
+        logging.info(f"Ledger tx_id: {ledger_tx_id}")
     except Exception as e:
         logging.error(f"ImmuDB ledger unavailable: {e}")
         return {
             "status": "DENIED",
             "message": "Audit ledger unavailable. Execution blocked.",
-            "record_hash": record_hash
         }
 
-    response["record_hash"] = record_hash
+    response["ledger_tx_id"] = ledger_tx_id
     return response
