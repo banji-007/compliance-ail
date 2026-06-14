@@ -158,9 +158,9 @@ For each decision, the ledger stores:
 - Policy bundle ETag (version of the policies that evaluated this call)
 - SHA-256 hash: `sha256(key:serialized_entry:tx_id)`
 
-The hash formula is documented and reproducible offline. A security auditor can pull the raw ImmuDB transaction, recompute the hash, and verify that the entry has not been tampered with since it was written. This is the cryptographic guarantee required for SOC2 Type II continuous compliance evidence.
+Two distinct integrity guarantees apply. The per-entry digest lets an auditor confirm that a returned entry's contents match what was recorded; it is reproducible offline with no tooling beyond a SHA-256 implementation. Whole-ledger tamper-evidence - proof that no entry was deleted and the chain was not rewritten - comes from ImmuDB's Merkle-tree inclusion and consistency proofs, not from the per-entry digest. The current REST integration surfaces the per-entry digest in the dashboard; verification of ImmuDB's cryptographic proofs is a separate step against the ImmuDB transaction store.
 
-The CISO dashboard's Audit Ledger view exposes this hash for every entry, copyable directly from the UI.
+The CISO dashboard's Audit Ledger view exposes the per-entry digest for every record, copyable directly from the UI.
 
 ### 3.5 Real-Time CISO Observability
 
@@ -358,7 +358,7 @@ This bounds prompt injection rather than eliminating it. The guarantee is precis
 
 **ADR-001: ImmuDB REST API over gRPC SDK**
 
-The native `immudb-py` gRPC SDK requires a pinned version of Google Protobuf that conflicts with `spiffe` library dependencies under Python 3.11. Rather than accepting a degraded security posture (running without mTLS) to satisfy a transitive dependency, we migrated the ledger client to ImmuDB's REST API. Tamper-evidence guarantees are preserved via the SHA-256 hash formula that auditors can reproduce offline against the ImmuDB transaction store.
+The native `immudb-py` gRPC SDK requires a pinned version of Google Protobuf that conflicts with `spiffe` library dependencies under Python 3.11. Rather than accepting a degraded security posture (running without mTLS) to satisfy a transitive dependency, we migrated the ledger client to ImmuDB's REST API. Trade-off accepted: the REST path returns entry data plus a reproducible per-entry content digest (`sha256(key:serialized_entry:tx_id)`), but does not by itself perform the verified-read proof check the gRPC SDK offers. Whole-ledger proof verification against ImmuDB's Merkle-tree is tracked as a known gap (see TODO).
 
 **ADR-002: FastAPI as ImmuDB Proxy**
 
