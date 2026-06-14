@@ -8,7 +8,7 @@
 
 ## 1. The Problem: LLM System Prompts Are Not a Security Boundary
 
-There is critical architectural gap in the enterprise security industry today. Organizations are deploying autonomous AI agents without proper security controls.
+There is a critical architectural gap in enterprise security today. Organizations are deploying autonomous AI agents without enforceable controls.
 
 As organizations deploy autonomous AI agents - systems built on LangGraph, AutoGen, CrewAI, or bespoke orchestration frameworks - they are commonly relying on **LLM system prompts** to enforce compliance rules. A typical implementation looks like this:
 
@@ -127,7 +127,7 @@ This catches hallucinated or malformed payloads - missing required fields, wrong
 | `deploy_to_production` | Repository name, environment target, required approval metadata |
 | Unregistered tool | **Blocked at registry lookup** - fail-closed before OPA is queried |
 
-### 3.3 True SaaS Multi-Tenancy
+### 3.3 Multi-Tenant Policy Isolation
 
 AIL is architected for SaaS deployment. Each tenant receives a **dynamically generated OPA bundle** served by the control plane.
 
@@ -143,6 +143,8 @@ tenant_finance  →  allowed_cost_centers: [finance, executive]
 ```
 
 The same gateway infrastructure, the same OPA process, the same Rego evaluation engine - but each tenant's agent operates under a completely isolated policy brain.
+
+The control plane persists tenant config in SQLite, which is sufficient for the demo and single-instance deployments but is a single-writer store. Horizontal scale-out of the control plane requires moving to a networked database (Postgres). The tenancy model and bundle generation are storage-agnostic; only the persistence layer is the constraint.
 
 ### 3.4 Cryptographic Auditability
 
@@ -323,9 +325,10 @@ The Docker Compose stack remains the recommended path for local development and 
 
 ## 5. Security Threat Model
 
-### Prompt Injection - Fully Mitigated
+### Prompt Injection - Structurally Constrained
 
-The gateway's enforcement is **out-of-band**: it operates at the tool call interception layer in the Python interceptor and at the Envoy network layer. The LLM's output is only ever treated as untrusted input to be evaluated. The LLM cannot instruct the gateway to disable itself any more than a SQL injection payload can instruct a firewall to turn off.
+The gateway's enforcement is out-of-band; it operates at the tool call interception layer in the Python interceptor and at the Envoy network layer. The LLM's output is only ever treated as untrusted input to be evaluated. The LLM cannot instruct the gateway to disable itself, any more than a SQL injection payload can instruct a firewall to turn off.
+This bounds prompt injection rather than eliminating it. The guarantee is precise: no tool call reaches execution unless its parameters satisfy the active Rego policies and the registered schema. It follows that the security boundary is exactly as strong as your policy coverage. An injection that drives a registered tool toward a policy-violating parameter set is blocked deterministically. An injection that abuses a legitimately allowed tool in a way no policy expresses, or exfiltrates through an approved channel, is not something a parameter-level gateway can catch. AIL closes the 'the model was told not to' gap. It does not close the 'we never wrote a rule for that' gap..
 
 **Demonstrated attack and response:**
 
@@ -336,6 +339,8 @@ The gateway's enforcement is **out-of-band**: it operates at the tool call inter
 | `encryption_at_rest: false` explicit request | LLM attempts tool call | DENIED - SOC2 mandate |
 | Restricted GPU instance without `ml-training` tag | LLM attempts tool call | DENIED - FinOps instance restriction |
 | Unregistered tool name | LLM attempts tool call | DENIED at schema registry - OPA never queried |
+
+**Coverage boundary:** AIL enforces what is expressible in Rego over tool-call parameters and what is declared in the schema registry. It is not a semantic firewall. Tools whose misuse is valid under policy, side channels, and data-dependent harms remain the operator's responsibility to model. Treat the policy set and schema registry as the actual attack surface and review them accordingly.
 
 ### Infrastructure Failure - Fail-Closed
 
