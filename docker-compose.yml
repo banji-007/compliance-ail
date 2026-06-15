@@ -6,11 +6,12 @@ services:
       - "8002:8002"
     environment:
       - DATABASE_URL=sqlite:////data/control_plane.db
-      # ImmuDB credentials — consumed by GET /audit to proxy ledger entries.
-      # immudb:8080 is internal-only (port not exposed to host by design).
+      # ImmuDB REST (used for scan in /audit; scan needs no SDK).
       - IMMUDB_URL=http://immudb:8080
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
+      # Verifier service — /audit calls this for per-entry proof verification.
+      - VERIFIER_URL=http://verifier:8003
       # API key for mutating control-plane endpoints (PUT/POST /tenants).
       # Must be set in .env — absent key disables auth with a 503 response.
       - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
@@ -65,12 +66,53 @@ services:
     environment:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
+    volumes:
+      # Signing key enables cryptographic state signing. Generate once with
+      # "make keygen" before starting. Without this file, ImmuDB starts without
+      # signing; the verifier will log a warning but still run.
+      - ./keys:/keys:ro
+    command:
+      - "--signingKey=/keys/signing.key"
     healthcheck:
       test: ["CMD", "immuadmin", "status"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
+    restart: unless-stopped
+
+  # AIL Verifier — isolated immudb-py (gRPC) wrapper.
+  # Keeps the SDK's protobuf dependency out of the interceptor process so
+  # SPIFFE mTLS is not compromised (see ADR-0001). Both the interceptor and
+  # the control plane call this service for all verified writes and reads.
+  verifier:
+    build:
+      context: ./verifier
+    ports:
+      - "8003:8003"
+    environment:
+      - IMMUDB_ADDR=immudb:3322
+      - IMMUDB_USER=${IMMUDB_USER}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
+      # Path to ImmuDB's public signing key (derived from keys/signing.key).
+      # The verifier checks every server state response against this key.
+      - IMMUDB_SIGNING_PUBKEY=/keys/signing.pub
+      - VERIFIER_STATE_FILE=/data/verifier-state/immudb.state
+    volumes:
+      - ./keys:/keys:ro
+      # Verifier state is its own volume, not shared with the ledger-writing
+      # identity (langgraph-demo). This enforces the write/verify separation
+      # required by the trust anchor model.
+      - verifier-state:/data/verifier-state
+    depends_on:
+      immudb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   spire-server:
@@ -192,7 +234,8 @@ services:
     tty: true
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - IMMUDB_URL=http://immudb:8080
+      # Interceptor writes go to verifier (SDK-verified writes), not direct REST.
+      - VERIFIER_URL=http://verifier:8003
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
       - SPIFFE_ENDPOINT_SOCKET=unix:///tmp/spire-sockets/workload_api.sock
@@ -217,7 +260,7 @@ services:
         condition: service_started
       opa:
         condition: service_healthy
-      immudb:
+      verifier:
         condition: service_healthy
       envoy:
         condition: service_started
@@ -383,3 +426,6 @@ volumes:
   grafana-data:
   # Persists SQLite tenant config across docker compose down/up cycles.
   control-plane-data:
+  # Verifier's rolling SDK state (PersistentRootService pickle).
+  # Not mounted in the interceptor container — enforces write/verify separation.
+  verifier-state:

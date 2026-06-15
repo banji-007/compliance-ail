@@ -14,11 +14,9 @@ Endpoints:
 """
 
 import base64
-import hashlib
 import json
 import logging
 import os
-import struct
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -54,10 +52,11 @@ def _require_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
         raise HTTPException(status_code=403, detail="Invalid API key")
 
 
-# Internal Docker service name; overridable via env for local dev.
-IMMUDB_URL = os.getenv("IMMUDB_URL", "http://immudb:8080")
-IMMUDB_USER = os.getenv("IMMUDB_USER")
+# Internal Docker service names; overridable via env for local dev.
+IMMUDB_URL   = os.getenv("IMMUDB_URL", "http://immudb:8080")
+IMMUDB_USER  = os.getenv("IMMUDB_USER")
 IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD")
+VERIFIER_URL = os.getenv("VERIFIER_URL", "http://verifier:8003")
 
 
 @asynccontextmanager
@@ -251,39 +250,31 @@ def get_bundle(tenant_id: str, request: Request, db: Session = Depends(get_db)):
     )
 
 
-def _compute_alh(prev_alh_b64: str, tx_id: int, entries_hash_b64: str) -> str:
-    """ALH = SHA256(prevAlh || BigEndian8(txID) || entriesHash). Matches TxHeader.Alh() in ImmuDB."""
-    prev_alh = base64.b64decode(prev_alh_b64)
-    tx_id_bytes = struct.pack(">Q", tx_id)
-    entries_hash = base64.b64decode(entries_hash_b64)
-    digest = hashlib.sha256(prev_alh + tx_id_bytes + entries_hash).digest()
-    return base64.b64encode(digest).decode()
-
-
 @app.get("/audit")
 def get_audit(limit: int = 100, _: None = Depends(_require_api_key)):
     """
-    Proxy to ImmuDB REST API using verifiable reads.
+    Return verified audit entries from ImmuDB.
 
-    Scans for all tool_call: keys, then calls verifiableGet for each entry to
-    retrieve the inclusion proof and source transaction header. The ALH is
-    computed from the source tx header fields so an auditor can compare it
-    against the ALH persisted by the interceptor at write time (stored in
-    ledger/.trusted_state.json). Full Merkle proof walking is handled
-    separately by the interceptor's verify_entry() or offline via immuclient.
+    Scans for all tool_call: keys via REST (no SDK needed for a key listing),
+    then calls the verifier service for each key. The verifier uses
+    immudb-py verifiedGet, which walks the inclusion proof (leaf->eH) and the
+    dual consistency proof from the persisted signed state. The result is
+    authoritative: if the SDK says verified: true, the entry is cryptographically
+    bound to the stored state chain. verified: false means the entry should be
+    treated as potentially tampered and is flagged in the response.
 
     Returns:
         {"entries": [...], "total": <int>}
 
     Each entry:
-        tx_id           — ImmuDB transaction ID
-        agent_id        — SPIFFE workload identity
-        timestamp       — ISO-8601 UTC string
-        tool_name       — tool that was intercepted
-        payload         — original tool arguments
-        decision        — OPA verdict
-        entry_alh       — ALH recomputed from verifiableGet source tx header
-        inclusion_proof — {leaf, width, terms} from ImmuDB for offline verification
+        tx_id     - ImmuDB transaction ID
+        agent_id  - SPIFFE workload identity
+        timestamp - ISO-8601 UTC string
+        tool_name - tool that was intercepted
+        payload   - original tool arguments
+        decision  - OPA verdict
+        verified  - bool; false means the SDK proof check failed - treat as integrity warning
+        state_id  - tx_id of the latest verified state the verifier holds after this check
     """
     if not IMMUDB_USER or not IMMUDB_PASSWORD:
         raise HTTPException(
@@ -291,9 +282,9 @@ def get_audit(limit: int = 100, _: None = Depends(_require_api_key)):
             detail="ImmuDB credentials not configured (IMMUDB_USER / IMMUDB_PASSWORD missing)",
         )
 
+    # --- Scan ImmuDB for all tool_call: keys (REST; scan needs no proof) ---
     try:
         with httpx.Client(timeout=30.0) as client:
-            # --- Authenticate ---
             login_resp = client.post(
                 f"{IMMUDB_URL}/api/v2/login",
                 json={
@@ -307,9 +298,6 @@ def get_audit(limit: int = 100, _: None = Depends(_require_api_key)):
             if not token:
                 raise ValueError("No auth token in ImmuDB login response")
 
-            auth_headers = {"Authorization": f"Bearer {token}"}
-
-            # --- Scan for all tool_call: keys (newest first) ---
             scan_resp = client.post(
                 f"{IMMUDB_URL}/api/v2/db/scan",
                 json={
@@ -317,72 +305,72 @@ def get_audit(limit: int = 100, _: None = Depends(_require_api_key)):
                     "desc": True,
                     "limit": limit,
                 },
-                headers=auth_headers,
+                headers={"Authorization": f"Bearer {token}"},
             )
             scan_resp.raise_for_status()
             raw_entries = scan_resp.json().get("entries", [])
 
-            # --- verifiableGet per key to retrieve inclusion proof ---
-            verified_entries = []
-            for raw in raw_entries:
-                encoded_key = raw.get("key", "")
-                vget_resp = client.post(
-                    f"{IMMUDB_URL}/api/v2/db/verifiableget",
-                    json={"keyRequest": {"key": encoded_key}, "proveSinceTx": "0"},
-                    headers=auth_headers,
-                )
-                if vget_resp.status_code != 200:
-                    logger.warning(
-                        "verifiableGet failed for key (tx=%s): HTTP %d",
-                        raw.get("tx"),
-                        vget_resp.status_code,
-                    )
-                    verified_entries.append((raw, None))
-                    continue
-                verified_entries.append((raw, vget_resp.json()))
-
     except httpx.HTTPStatusError as exc:
-        logger.error("ImmuDB HTTP error during audit fetch: %s", exc)
+        logger.error("ImmuDB HTTP error during audit scan: %s", exc)
         raise HTTPException(status_code=502, detail=f"ImmuDB returned {exc.response.status_code}")
     except Exception as exc:
-        logger.error("ImmuDB unavailable for audit fetch: %s", exc)
+        logger.error("ImmuDB unavailable for audit scan: %s", exc)
         raise HTTPException(status_code=503, detail=f"ImmuDB unavailable: {exc}")
 
+    # --- Verify each entry via the verifier service ---
+    verifier_up = True
     entries = []
-    for raw, vget in verified_entries:
+    for raw in raw_entries:
         try:
-            key: str = base64.b64decode(raw["key"]).decode()
-            serialized_entry: str = base64.b64decode(raw["value"]).decode()
-            log_entry: dict = json.loads(serialized_entry)
-            tx_id: int = int(raw.get("tx", 0))
+            encoded_key: str       = raw.get("key", "")
+            serialized_entry: str  = base64.b64decode(raw["value"]).decode()
+            log_entry: dict        = json.loads(serialized_entry)
+            tx_id: int             = int(raw.get("tx", 0))
 
-            entry_alh = None
-            inclusion_proof = None
-
-            if vget is not None:
+            verified  = False
+            state_id  = None
+            if verifier_up:
                 try:
-                    # dualProof.sourceTxHeader is the tx that wrote this entry
-                    src_hdr = vget["verifiableTx"]["dualProof"]["sourceTxHeader"]
-                    entry_alh = _compute_alh(
-                        src_hdr["prevAlh"], int(src_hdr["id"]), src_hdr["eh"]
-                    )
-                    inclusion_proof = vget.get("inclusionProof")
-                except (KeyError, TypeError, ValueError) as exc:
-                    logger.warning("Could not extract proof fields for tx %d: %s", tx_id, exc)
+                    with httpx.Client(timeout=10.0) as vc:
+                        vr = vc.post(
+                            f"{VERIFIER_URL}/verify",
+                            json={"key": encoded_key},
+                        )
+                    if vr.status_code == 200:
+                        vdata    = vr.json()
+                        verified = vdata.get("verified", False)
+                        state_id = vdata.get("state_id")
+                        if not verified:
+                            logger.warning(
+                                "Audit: entry tx=%d failed verification: %s",
+                                tx_id,
+                                vdata.get("detail"),
+                            )
+                    else:
+                        logger.warning("Verifier returned HTTP %d for tx=%d", vr.status_code, tx_id)
+                except Exception as vexc:
+                    logger.error("Verifier unreachable during audit: %s", vexc)
+                    verifier_up = False  # stop hammering on every entry
 
             entries.append({
-                "tx_id": tx_id,
-                "agent_id": log_entry.get("agent_id"),
+                "tx_id":     tx_id,
+                "agent_id":  log_entry.get("agent_id"),
                 "timestamp": log_entry.get("timestamp"),
                 "tool_name": log_entry.get("tool_name"),
-                "payload": log_entry.get("payload"),
-                "decision": log_entry.get("decision"),
-                "entry_alh": entry_alh,
-                "inclusion_proof": inclusion_proof,
+                "payload":   log_entry.get("payload"),
+                "decision":  log_entry.get("decision"),
+                "verified":  verified,
+                "state_id":  state_id,
             })
         except Exception as exc:
             logger.warning("Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc)
             continue
 
-    logger.info("Audit: returned %d ledger entries with inclusion proofs", len(entries))
+    logger.info(
+        "Audit: %d entries; verifier_up=%s verified=%d unverified=%d",
+        len(entries),
+        verifier_up,
+        sum(1 for e in entries if e["verified"]),
+        sum(1 for e in entries if not e["verified"]),
+    )
     return {"entries": entries, "total": len(entries)}
