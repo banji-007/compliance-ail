@@ -415,4 +415,10 @@ The CI pipeline (`.github/workflows/ci.yml`) runs this suite on every push to `m
 
 ---
 
+## 9. Known Limitations and Backlog
+
+- **Signing-key rotation requires resetting verifier persisted state.** When `keys/signing.key` is regenerated, the verifier's `PersistentRootService` state file (in the `verifier-state` Docker volume) still contains a `State` object whose embedded public key and signature were produced by the old key. Subsequent `verifiedSet` / `verifiedGet` calls fail with an opaque `'Signature verification failed'` detail. The correct fix is for the verifier to detect the key/signature mismatch at startup (comparing the mounted public key against the public key embedded in the loaded state) and fail with an actionable error — e.g. "stored state was signed by a different key; delete the verifier-state volume to reset". The `make test-integration` target works around this today by running `docker compose down -v` before every run. This mitigation is not sufficient for production, where key rotation must be a deliberate, audited operation with a clear recovery path.
+
+---
+
 *AIL - Agentic Integrity Ledger. Built for the governance gap.*

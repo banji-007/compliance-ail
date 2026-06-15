@@ -94,6 +94,12 @@ state volume so the new root is accepted on the next startup.
 - Per-entry `verifiedGet` on `/audit` is O(n) SDK calls. At the default limit
   of 100 entries this is acceptable; consider lazy verification (verify on
   expand) if audit pages grow large.
+- **Backlog:** Signing-key rotation requires deleting the verifier state volume.
+  The verifier currently does not detect a mismatch between the mounted public
+  key and the public key embedded in the loaded `PersistentRootService` state;
+  the failure surfaces as an opaque `'Signature verification failed'` on the
+  next write or read. The verifier should compare keys at startup and raise an
+  actionable error rather than failing silently at proof time.
 
 ## References
 

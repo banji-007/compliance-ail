@@ -12,24 +12,31 @@
 .PHONY: keygen test-integration test-integration-down
 
 ## Generate the ECDSA P-256 signing key pair used by ImmuDB and the verifier.
-## Run once before "docker compose up". The private key is mounted into the
-## ImmuDB container; the public key is mounted into the verifier container.
-## Both files are gitignored. Re-running rotates keys; restart both services
-## afterward and delete the verifier state volume so the new root is accepted.
+## Skips generation if keys/signing.key already exists (idempotent).
+## To rotate keys: delete keys/ and re-run, then also delete the verifier
+## state volume (docker compose down -v) so the new root is accepted.
 keygen:
 	@mkdir -p keys
-	openssl ecparam -genkey -name prime256v1 -noout -out keys/signing.key
-	openssl ec -in keys/signing.key -pubout -out keys/signing.pub
-	@echo "Keys written to keys/signing.key and keys/signing.pub"
-	@echo "Run 'docker compose up -d --build' (or restart immudb + verifier) to apply."
+	@if [ -f keys/signing.key ]; then \
+	  echo "keygen: keys/signing.key already exists — reusing existing keys."; \
+	else \
+	  openssl ecparam -genkey -name prime256v1 -noout -out keys/signing.key && \
+	  openssl ec -in keys/signing.key -pubout -out keys/signing.pub && \
+	  echo "keygen: keys written to keys/signing.key and keys/signing.pub"; \
+	fi
 
 ## Boot CI infrastructure, run the full pytest suite, then tear down.
+## Starts with "down -v" to ensure a hermetic run: any previous stack and
+## its volumes (verifier state, control-plane DB) are removed before the
+## new stack starts. This prevents stale verifier state from a prior keygen
+## rotation from causing opaque proof failures.
 ##
 ## OPA bundle timing: opa-config.yaml sets min_delay_seconds=10 for bundle
 ## polling. "docker compose up --wait" blocks until health checks pass (OPA
 ## binary alive), but the first bundle poll may not have completed yet.
 ## The 15-second sleep ensures OPA has loaded the policy before pytest runs.
 test-integration:
+	docker compose -f docker-compose.test.yml down -v
 	$(MAKE) keygen
 	docker compose -f docker-compose.test.yml up -d --wait
 	@echo "Waiting 15s for OPA to complete its first bundle poll..."
