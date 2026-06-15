@@ -1,11 +1,18 @@
 import os
 import json
 import sys
+import pytest
 from openai import OpenAI
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+pytestmark = pytest.mark.skipif(
+    not os.getenv("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set; live LLM tests skipped",
+)
+
 
 class TestAgent:
     def __init__(self):

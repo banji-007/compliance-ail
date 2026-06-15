@@ -1,6 +1,7 @@
 import os
 import json
 import sys
+import pytest
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -10,6 +11,12 @@ from middleware import intercept_tool_call
 
 # Load environment variables
 load_dotenv()
+
+pytestmark = pytest.mark.skipif(
+    not os.getenv("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set; live LLM tests skipped",
+)
+
 
 class TestAgentWithInterceptor:
     def __init__(self):
