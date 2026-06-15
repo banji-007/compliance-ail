@@ -364,13 +364,15 @@ This bounds prompt injection rather than eliminating it. The guarantee is precis
 
 ## 6. Architectural Decision Records
 
-**ADR-001: ImmuDB REST API over gRPC SDK**
+**ADR-001: Verifier service (immudb-py gRPC) isolated from interceptor (SPIFFE)**
 
-The native `immudb-py` gRPC SDK requires a pinned version of Google Protobuf that conflicts with `spiffe` library dependencies under Python 3.11. Rather than accepting a degraded security posture (running without mTLS) to satisfy a transitive dependency, the ledger client uses ImmuDB's REST API with its verifiable endpoints (`verifiableSet` / `verifiableGet`). Writes are committed via `verifiableSet`; the ALH is computed from the returned transaction header and persisted locally as a trusted reference. Reads use `verifiableGet` to retrieve the inclusion proof and source transaction header alongside each entry. Known gap: full client-side Merkle inclusion proof walking (without the gRPC SDK) requires implementing ImmuDB's binary tree hash algorithm; this is tracked as open work. In the interim, auditors can verify inclusion proofs offline using `immuclient` or the immudb-py SDK against the ImmuDB transaction store.
+`spiffe==0.2.5` requires `protobuf>=6.31.1`; `immudb-py` (pre-1.x) required `protobuf<4.0.0`. Running both in the same process was impossible. An earlier iteration switched to ImmuDB's REST API, but the REST endpoints do not return Merkle proofs — client-side inclusion and consistency proof verification was therefore impossible and was replaced by a hand-rolled ALH formula that turned out to be incorrect.
+
+The current resolution uses process isolation: a dedicated `verifier` container runs `immudb-py==1.5.0` (gRPC, `protobuf>=4.25.3`) with no SPIFFE dependency. The interceptor calls the verifier over HTTP; the verifier performs real SDK-level verification (inclusion proof, dual consistency proof, ECDSA state signature) on every write and read. The trust anchor is stored in a Docker volume mounted only in the verifier container. See `docs/adr/0001-immudb-rest-migration.md` for the full record.
 
 **ADR-002: FastAPI as ImmuDB Proxy**
 
-ImmuDB is intentionally not exposed on the host network interface. The CISO dashboard (a browser application) cannot reach an internal Docker service directly. The FastAPI control plane exposes a `GET /audit` endpoint that authenticates to ImmuDB internally, decodes the base64-encoded ledger entries, recomputes the SHA-256 hash for each, and returns structured JSON. CORS is restricted to `localhost:3001`. This keeps ImmuDB off the public interface while giving the dashboard verified audit data.
+ImmuDB is intentionally not exposed on the host network interface. The CISO dashboard (a browser application) cannot reach an internal Docker service directly. The FastAPI control plane exposes a `GET /audit` endpoint that scans ImmuDB via REST for key listing, then calls the verifier service for a `verifiedGet` proof check on each entry. The response includes `verified: true|false` per entry. CORS is restricted to `localhost:3001`.
 
 **ADR-003: OPA Bundle API over Direct Rego Push**
 
