@@ -148,27 +148,15 @@ The control plane persists tenant config in SQLite, which is sufficient for the 
 
 ### 3.4 Cryptographic Auditability
 
-Every policy decision - APPROVED or DENIED - is written to **ImmuDB** via an isolated verifier service that wraps `immudb-py verifiedSet`. For each decision, the ledger stores:
+Every policy decision is written to ImmuDB through an isolated verifier service wrapping the official `immudb-py` gRPC SDK. The verifier runs in its own process so its Protobuf dependency never reaches the interceptor, preserving the SPIFFE mTLS posture (see ADR-001).
 
-- Agent SPIFFE identity
-- ISO-8601 UTC timestamp
-- Full tool call payload (arguments as submitted)
-- OPA verdict string
-- Policy bundle ETag (version of the policies that evaluated this call)
+Writes use `verifiedSet` and reads use `verifiedGet`. On each write the SDK checks the inclusion proof binding the `(key, value)` leaf to the transaction's entries hash, and the consistency proof from the verifier's persisted state to the new transaction, before the entry is treated as durable. A write the SDK cannot verify makes the interceptor fail closed and return DENY; no tool call executes against an unverifiable audit record. On read, `/audit` stamps each entry with a `verified` flag and the `state_id` it was checked against, and any entry that fails verification is surfaced as an integrity warning rather than silently included.
 
-**What is actually verified.** The verifier service uses the official `immudb-py` SDK (gRPC), which performs three checks on every write and read:
+When ImmuDB runs with a signing key, each state it returns is ECDSA-signed, and the verifier rejects any state whose signature does not verify against the configured public key before accepting a proof result. The persisted signed state is the trust anchor; it sits on a volume separate from the ledger-writing identity, so the process that records entries cannot rewrite the anchor it is checked against.
 
-1. **Inclusion proof** - walks the Merkle tree from the `(key, value)` leaf to `eH` (the transaction's committed entry hash root), proving the entry is in the tree the server attested.
-2. **Dual consistency proof** - verifies a linear-hash chain from the verifier's persisted signed state (tx N) to the current state (tx M), confirming no transactions were inserted, removed, or reordered in that range.
-3. **State signature** - when `--signingKey` is configured on the ImmuDB server, verifies the server's ECDSA signature over `(db, txId, txHash)` before the new state is accepted as the rolling anchor.
+**What this proves, and what it does not.** The chain establishes that a returned entry was committed and has not been altered, deleted, or served from a forked or rolled-back store, and an auditor can reproduce the result offline with `immuclient` against the same signed state. It does not prove the correctness of the policy that approved the entry; that is the OPA layer's concern. Tamper-evidence and policy-correctness are separate guarantees.
 
-A write that the SDK cannot confirm as verified causes the interceptor to return **DENY** rather than recording an unverified entry. The `/audit` endpoint calls `verifiedGet` for each scanned entry and returns `verified: true|false` per record; an unverified entry is flagged as a hard integrity warning in the dashboard, not silently included.
-
-**Trust anchor separation.** The verifier maintains its rolling SDK state in a Docker volume (`verifier-state`) that is not mounted in the interceptor container. The identity that writes ledger entries cannot alter the anchor that verifies them.
-
-**Offline verification.** An auditor can reproduce any verification result independently using `immuclient verifiedGet` against the same ImmuDB instance and the same signing public key. The acceptance test suite (`tests/test_verification.py`) covers parity, tamper detection (corrupted state, wrong signing key), cross-process audit, and round-trip encoding - all gated in CI against a real ImmuDB container.
-
-The CISO dashboard's Audit Ledger view exposes `verified` and `state_id` for every record.
+Coverage is enforced by integration tests run against a live ImmuDB on every CI build: proof parity between verifier and server, corruption of the persisted anchor caught as a consistency-proof failure (`ErrCorruptedData`), a wrong signing key caught as a signature failure on an independent code path (`BadSignatureError`), cross-process verification through `/audit`, and a write-read round trip. Any failure fails the build.
 
 ### 3.5 Real-Time CISO Observability
 
