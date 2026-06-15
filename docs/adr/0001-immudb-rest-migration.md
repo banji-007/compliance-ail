@@ -1,68 +1,105 @@
-# ADR 0001: ImmuDB REST API Migration
+# ADR 0001: ImmuDB Client Architecture
 
 ## Status
-Accepted
+
+Accepted (supersedes the original REST-migration decision)
 
 ## Context
-The Agentic Integrity Ledger (AIL) was experiencing protobuf dependency collisions between the SPIFFE library (requiring protobuf >= 6.31.1) and the immudb-py gRPC client (requiring protobuf < 4.0.0). This collision forced us to disable SPIRE mTLS (`SPIRE_DISABLED=true`) as a temporary workaround, compromising our workload identity security posture.
+
+The AIL interceptor needs cryptographic tamper-evidence for its audit ledger.
+Two constraints shape the solution:
+
+1. The SPIFFE library (`spiffe==0.2.5`) requires `protobuf>=6.31.1`. The
+   official `immudb-py` gRPC client (pre-1.x) required `protobuf<4.0.0`.
+   Running both in the same process was impossible.
+
+2. Switching to ImmuDB's REST API (ADR-0001 v1) resolved the dependency
+   collision but conceded client-side tamper-evidence: the REST endpoints
+   do not return the Merkle inclusion proofs and consistency proofs that
+   `immudb-py verifiedGet / verifiedSet` verify internally. The REST path
+   required hand-rolling `TxHeader.Alh()` in Python, which was found to
+   be incorrect (wrong field order, `eH` substituted for `innerHash`,
+   `innerHash` itself version-dependent).
 
 ## Decision
-We are migrating from the immudb-py gRPC client to ImmuDB's REST API. This trade-off prioritizes cryptographic workload identity (mTLS) over client-side tamper-evidence verification.
 
-### Technical Changes:
-1. **Drop immudb-py gRPC client** - Remove protobuf version conflict
-2. **Adopt ImmuDB REST API** - Use standard HTTP requests with Bearer token auth
-3. **Re-enable SPIRE mTLS** - Restore workload identity via `SPIRE_DISABLED=false`
-4. **Server-side guarantees** - Rely on ImmuDB's server-side Merkle tree verification
+Resolve the conflict with process isolation, not by choosing between the two
+libraries. The system is split into two processes:
 
-## Rationale
+**Interceptor process** (langgraph-demo container)
 
-### Security Trade-off Analysis:
-- **Gained**: Cryptographic workload identity via SPIRE mTLS
-- **Lost**: Client-side cryptographic tamper-evidence verification
-- **Net Impact**: Positive - workload identity prevents MITM attacks and provides stronger authentication guarantees
+- Uses `httpx` over plain HTTP to call the verifier service.
+- Holds zero `immudb-py` code and zero protobuf dependency.
+- SPIFFE mTLS posture is fully preserved.
 
-### Threat Model Considerations:
-- **With mTLS**: Workloads are cryptographically authenticated, preventing spoofed agents
-- **Without client verification**: We trust ImmuDB's server-side integrity guarantees
-- **Mitigation**: Network-level mTLS tunnel provides tamper-evidence at transport layer
+**Verifier service** (separate `verifier` container)
 
-## Implementation
+- A small FastAPI wrapper around `immudb-py==1.5.0` (gRPC, port 3322).
+- `immudb-py 1.5.0` requires `protobuf>=4.25.3`; there is no spiffe import
+  in this container, so there is no conflict.
+- Exposes `POST /write` (wraps `verifiedSet`) and `POST /verify` (wraps
+  `verifiedGet`).
+- Maintains a `PersistentRootService` state file in its own Docker volume,
+  not shared with the interceptor container.
 
-### Infrastructure Changes:
-- Expose ImmuDB REST API port 8080
-- Update connection URLs to use HTTP instead of gRPC
-- Re-enable SPIRE mTLS enforcement
+Both the interceptor (write path) and the control plane (audit read path)
+call the verifier over the Docker internal network. Neither holds a copy of
+ImmuDB credentials or SDK state.
 
-### Code Changes:
-- Replace immudb-py SDK with httpx HTTP client
-- Implement Bearer token authentication flow
-- Base64 encode ledger entries for REST API payload
+## What the SDK actually verifies
+
+`verifiedSet` and `verifiedGet` perform three checks:
+
+1. **Inclusion proof** - walks the Merkle tree from the (key, value) leaf to
+   `eH` (the transaction's entry hash root), confirming the entry is in the
+   tree committed by the server.
+
+2. **Dual consistency proof** - verifies a linear-hash chain from the
+   verifier's locally persisted state (tx N) to the current state (tx M),
+   confirming no transactions were inserted, removed, or reordered between N
+   and M.
+
+3. **State signature** (when `--signingKey` is configured on the server) -
+   verifies the server's ECDSA signature over `(db, txId, txHash)` against
+   the public key mounted in the verifier container. A forged or rolled-back
+   state cannot pass this check without the private key.
+
+## Trust anchor
+
+The verifier's `PersistentRootService` stores the latest verified `(txId,
+txHash)` in `/data/verifier-state/immudb.state` (a named Docker volume
+mounted only in the verifier container). The interceptor container cannot
+write to this volume. Rotating the signing key requires deleting the verifier
+state volume so the new root is accepted on the next startup.
 
 ## Consequences
 
-### Positive:
-- Resolves protobuf dependency collision
-- Restores SPIRE mTLS enforcement
-- Simplifies dependency management
-- Reduces attack surface via workload identity
+**Gained:**
 
-### Negative:
-- No client-side Merkle proof verification
-- Additional HTTP request latency
-- Manual token management required
+- Full client-side Merkle inclusion and consistency proof verification via the
+  official SDK - no hand-rolled crypto.
+- SPIFFE mTLS and workload identity are fully preserved in the interceptor.
+- The audit read path (`/audit`) verifies every entry through the same SDK
+  chain, so the CISO dashboard reflects real proof results, not decorative
+  hashes.
 
-### Mitigations:
-- SPIRE mTLS provides transport-level integrity
-- Regular ledger audits can verify consistency
-- HTTP requests are still within trusted Docker network
+**Constraints:**
 
-## Future Considerations
-- Monitor for official immudb-py updates with modern protobuf support
-- Consider implementing client-side verification if threat model changes
-- Evaluate ledger performance impact of REST vs gRPC
+- The verifier service must be healthy before the interceptor can start. The
+  compose dependency is `verifier: condition: service_healthy`. Fail-closed
+  posture is maintained: if the verifier is unreachable, every intercepted
+  tool call is DENIED.
+- `PersistentRootService` uses pickle and is not safe for concurrent access
+  across multiple uvicorn workers. The verifier runs with `--workers 1`.
+- Per-entry `verifiedGet` on `/audit` is O(n) SDK calls. At the default limit
+  of 100 entries this is acceptable; consider lazy verification (verify on
+  expand) if audit pages grow large.
 
 ## References
-- ImmuDB REST API Documentation
-- SPIFFE mTLS Security Model
-- AIL Architecture Requirements
+
+- `verifier/main.py` - service implementation
+- `immudb/embedded/store/tx.py` in immudb-py 1.5.0 - `Alh()` and
+  `innerHash()` source (the correct formula; the earlier hand-rolled version
+  was wrong)
+- `tests/test_verification.py` - five acceptance tests including tamper
+  detection against a corrupted state file and a wrong signing key

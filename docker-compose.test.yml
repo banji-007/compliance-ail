@@ -20,6 +20,11 @@ services:
       - "8002:8002"
     environment:
       - DATABASE_URL=sqlite:////data/control_plane.db
+      - IMMUDB_URL=http://immudb:8080
+      - IMMUDB_USER=${IMMUDB_USER:-immudb}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
+      - VERIFIER_URL=http://verifier:8003
+      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-test-api-key}
     volumes:
       - ./policy:/policy:ro
       - test-control-plane-data:/data
@@ -59,13 +64,17 @@ services:
   immudb:
     image: codenotary/immudb:1.9.5
     ports:
-      # Expose REST API to host so pytest (running on host) can reach localhost:8080.
-      # In the production compose this port is intentionally internal-only.
+      # Expose both ports to host: REST (8080) for scan calls from tests running
+      # on the host, and gRPC (3322) for the in-process immudb-py tamper tests.
       - "8080:8080"
       - "3322:3322"
     environment:
       - IMMUDB_USER=${IMMUDB_USER:-immudb}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
+    volumes:
+      - ./keys:/keys:ro
+    command:
+      - "--signingKey=/keys/signing.key"
     healthcheck:
       test: ["CMD", "immuadmin", "status"]
       interval: 5s
@@ -73,5 +82,30 @@ services:
       retries: 10
       start_period: 15s
 
+  verifier:
+    build:
+      context: ./verifier
+    ports:
+      - "8003:8003"
+    environment:
+      - IMMUDB_ADDR=immudb:3322
+      - IMMUDB_USER=${IMMUDB_USER:-immudb}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
+      - IMMUDB_SIGNING_PUBKEY=/keys/signing.pub
+      - VERIFIER_STATE_FILE=/data/verifier-state/immudb.state
+    volumes:
+      - ./keys:/keys:ro
+      - test-verifier-state:/data/verifier-state
+    depends_on:
+      immudb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
 volumes:
   test-control-plane-data:
+  test-verifier-state:

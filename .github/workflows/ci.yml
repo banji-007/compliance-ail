@@ -21,5 +21,15 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
 
+      - name: Install immudb-py for in-process tamper tests
+        run: pip install immudb-py==1.5.0
+
+      - name: Generate ImmuDB signing key pair
+        run: make keygen
+
       - name: Run integration tests
+        env:
+          IMMUDB_USER: immudb
+          IMMUDB_PASSWORD: immudb
+          CONTROL_PLANE_API_KEY: test-api-key
         run: make test-integration

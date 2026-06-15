@@ -148,22 +148,27 @@ The control plane persists tenant config in SQLite, which is sufficient for the 
 
 ### 3.4 Cryptographic Auditability
 
-Every policy decision - APPROVED or DENIED - is written to **ImmuDB** via `verifiableSet`, which records the entry in a Merkle-committed transaction and returns the transaction header.
+Every policy decision - APPROVED or DENIED - is written to **ImmuDB** via an isolated verifier service that wraps `immudb-py verifiedSet`. For each decision, the ledger stores:
 
-For each decision, the ledger stores:
 - Agent SPIFFE identity
 - ISO-8601 UTC timestamp
 - Full tool call payload (arguments as submitted)
 - OPA verdict string
 - Policy bundle ETag (version of the policies that evaluated this call)
 
-After each write the interceptor computes the transaction's **Accumulated Ledger Hash** (ALH = `SHA256(prevAlh ‖ BigEndian8(txID) ‖ entriesHash)`) from the returned header and persists it in a local trusted state file keyed by transaction ID. This formula mirrors `TxHeader.Alh()` in ImmuDB's Go source and is reproducible from the raw header fields.
+**What is actually verified.** The verifier service uses the official `immudb-py` SDK (gRPC), which performs three checks on every write and read:
 
-Audit reads use `verifiableGet` instead of a plain scan. For each entry the control plane retrieves the inclusion proof and recomputes the ALH from the source transaction header, returning both alongside the entry. An auditor can compare the returned ALH against the value stored in the interceptor's trusted state to confirm the entry has not been modified since it was written: any change to the entry changes `entriesHash`, which changes the ALH and breaks the comparison.
+1. **Inclusion proof** - walks the Merkle tree from the `(key, value)` leaf to `eH` (the transaction's committed entry hash root), proving the entry is in the tree the server attested.
+2. **Dual consistency proof** - verifies a linear-hash chain from the verifier's persisted signed state (tx N) to the current state (tx M), confirming no transactions were inserted, removed, or reordered in that range.
+3. **State signature** - when `--signingKey` is configured on the ImmuDB server, verifies the server's ECDSA signature over `(db, txId, txHash)` before the new state is accepted as the rolling anchor.
 
-Full Merkle inclusion proof walking (proving the entry is at a specific leaf position in the tree without trusting the server) requires implementing ImmuDB's binary Merkle verification or using `immuclient`; this is tracked as future work. The inclusion proof terms are returned in the `/audit` response for offline verification.
+A write that the SDK cannot confirm as verified causes the interceptor to return **DENY** rather than recording an unverified entry. The `/audit` endpoint calls `verifiedGet` for each scanned entry and returns `verified: true|false` per record; an unverified entry is flagged as a hard integrity warning in the dashboard, not silently included.
 
-The CISO dashboard's Audit Ledger view exposes the `entry_alh` and `inclusion_proof` for every record.
+**Trust anchor separation.** The verifier maintains its rolling SDK state in a Docker volume (`verifier-state`) that is not mounted in the interceptor container. The identity that writes ledger entries cannot alter the anchor that verifies them.
+
+**Offline verification.** An auditor can reproduce any verification result independently using `immuclient verifiedGet` against the same ImmuDB instance and the same signing public key. The acceptance test suite (`tests/test_verification.py`) covers parity, tamper detection (corrupted state, wrong signing key), cross-process audit, and round-trip encoding - all gated in CI against a real ImmuDB container.
+
+The CISO dashboard's Audit Ledger view exposes `verified` and `state_id` for every record.
 
 ### 3.5 Real-Time CISO Observability
 
