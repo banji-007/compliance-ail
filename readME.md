@@ -64,13 +64,16 @@ flowchart TD
         C2 -->|Loaded into OPA\non poll cycle| C
     end
 
-    C -->|APPROVED / DENIED| D
+    C -->|APPROVED / DENIED\nlogged via verifier| V
 
-    subgraph LEDGER ["Stage 3 - Immutable Audit"]
+    subgraph LEDGER ["Stage 3 - Verified Immutable Audit"]
+        V[AIL Verifier\nisolated immudb-py SDK]
         D[ImmuDB\nMerkle-Tree Ledger]
+        V -->|verifiedSet\ninclusion + consistency proof| D
+        D -.->|ECDSA-signed state\nverified vs public key| V
     end
 
-    D -->|Every Decision\nSHA-256 Hash| E
+    V -->|verified entries + state_id\nvia verifiedGet| E
 
     subgraph OBSERVE ["Stage 4 - Observability & Control"]
         E[CISO Control Plane\nNext.js Dashboard]
@@ -91,6 +94,7 @@ flowchart TD
 **Fail-closed guarantees:**
 - OPA unreachable → **DENY**
 - ImmuDB unreachable → **DENY**
+- Verifier unreachable or entry unverified → **DENY**
 - SPIRE socket absent → **DENY**
 - Schema validation failure → **DENY** (before OPA is even queried)
 
@@ -169,7 +173,7 @@ The Python interceptor middleware exports native **Prometheus metrics** (`ail_po
 The CISO Control Plane dashboard (Next.js 15, Tailwind, Shadcn UI) provides:
 
 - **Policy Settings** - toggle compliance packs per tenant, manage cost center allowlists, approved regions, and processing purpose constraints. Every save generates a new OPA bundle immediately.
-- **Audit Ledger** - paginated, searchable table of all agent decisions sourced live from ImmuDB, with copyable SHA-256 hashes for offline verification.
+- **Audit Ledger** - paginated, searchable table of all agent decisions sourced live from ImmuDB, with per-entry verification status and state IDs; entries are reproducible offline via immuclient against the signed state.
 
 ---
 
