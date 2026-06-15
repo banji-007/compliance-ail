@@ -151,6 +151,7 @@ def test_tamper_state():
     an entry written after the anchor.
     """
     from immudb import ImmudbClient
+    from immudb.exceptions import ErrCorruptedData
     from immudb.rootService import PersistentRootService, State
 
     with tempfile.NamedTemporaryFile(suffix=".state", delete=False) as f:
@@ -193,9 +194,12 @@ def test_tamper_state():
         corrupt_client.login(
             IMMUDB_USER.encode(), IMMUDB_PASSWORD.encode(), database=b"defaultdb"
         )
-        with pytest.raises(Exception):
-            # The dual consistency proof from (real txId, WRONG hash) to the
-            # target tx hash cannot verify — the linear-hash chain diverges.
+        # ErrCorruptedData is the specific exception immudb-py 1.5.0 raises when
+        # the dual consistency proof fails (linear-hash chain diverges because the
+        # stored txHash doesn't match the chain start the server used in its proof).
+        # Any other exception (login failure, pickle error, connection) propagates
+        # and fails the test, ruling out unrelated causes.
+        with pytest.raises(ErrCorruptedData):
             corrupt_client.verifiedGet(target_key.encode())
     finally:
         os.unlink(state_path)
@@ -218,6 +222,7 @@ def test_tamper_pubkey():
     signature. The test is valid in both server configurations.
     """
     import ecdsa
+    from ecdsa.keys import BadSignatureError
 
     from immudb import ImmudbClient
     from immudb.rootService import RootService
@@ -228,6 +233,13 @@ def test_tamper_pubkey():
     wrong_vk = ecdsa.SigningKey.generate(curve=ecdsa.NIST256p).get_verifying_key()
 
     bad_client = ImmudbClient(IMMUDB_ADDR, rs=RootService())
+    # Assert the attribute exists before overwriting it: if a future SDK version
+    # renames _vk, this line will fail loudly instead of the test silently
+    # doing nothing (verifiedGet would then use no key and might not raise).
+    assert hasattr(bad_client, "_vk"), (
+        "ImmudbClient no longer has a '_vk' attribute — SDK may have renamed it; "
+        "update this test to use the new attribute name"
+    )
     bad_client._vk = wrong_vk
     bad_client.login(
         IMMUDB_USER.encode(),
@@ -235,7 +247,11 @@ def test_tamper_pubkey():
         database=b"defaultdb",
     )
 
-    with pytest.raises(Exception):
+    # BadSignatureError is the specific exception ecdsa raises when the server's
+    # ECDSA state signature cannot be verified against the injected wrong key.
+    # Any other exception (login failure, connection) propagates and fails the
+    # test, ruling out unrelated causes.
+    with pytest.raises(BadSignatureError):
         bad_client.verifiedGet(key.encode())
 
 
