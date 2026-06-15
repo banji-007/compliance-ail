@@ -24,6 +24,7 @@ keygen:
 	  openssl ec -in keys/signing.key -pubout -out keys/signing.pub && \
 	  echo "keygen: keys written to keys/signing.key and keys/signing.pub"; \
 	fi
+	@chmod 644 keys/signing.key keys/signing.pub
 
 ## Boot CI infrastructure, run the full pytest suite, then tear down.
 ## Starts with "down -v" to ensure a hermetic run: any previous stack and
