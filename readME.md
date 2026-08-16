@@ -175,6 +175,8 @@ The CISO Control Plane dashboard (Next.js 15, Tailwind, Shadcn UI) provides:
 - **Policy Settings** - toggle compliance packs per tenant, manage cost center allowlists, approved regions, and processing purpose constraints. Every save generates a new OPA bundle immediately.
 - **Audit Ledger** - paginated, searchable table of all agent decisions sourced live from ImmuDB, with per-entry verification status and state IDs; entries are reproducible offline via immuclient against the signed state.
 
+**The dashboard's Audit Ledger view does not work as shipped.** `/audit` requires an `X-API-Key` header matching `CONTROL_PLANE_API_KEY` (see §4.1), but the dashboard's browser-side client never sends one and is never given the key to send — every request to it fails with `422 Field required` before authentication is even checked. This is not a caveat to work around; there is currently no way to view the audit ledger through the dashboard UI. See `TODO.md`, "Dashboard Cannot Authenticate to Control Plane," for the fix.
+
 ---
 
 ## 4. Quickstart
@@ -196,6 +198,11 @@ OPENAI_API_KEY=sk-...
 # Required - ImmuDB credentials (change in production)
 IMMUDB_USER=immudb
 IMMUDB_PASSWORD=immudb
+
+# Required - the control plane rejects every request with a 503 if this is
+# empty. Used for PUT/POST /tenants and to authenticate GET /audit (see §3.5
+# for why the dashboard's own Audit Ledger view cannot supply it yet).
+CONTROL_PLANE_API_KEY=change-me
 ```
 
 ### 4.2 Boot the Full Stack
@@ -219,7 +226,12 @@ Allow approximately 60 seconds for all health checks to pass. Monitor with:
 docker compose ps
 ```
 
-All 16 services should show `healthy` or `running` status.
+This lists 13 of the 16 defined services as `healthy` or `running`. Three
+(`token-generator`, `policy-validator`, `workload-registrar`) are one-shot
+init jobs that run once, exit `0`, and are gone by the time you check —
+`docker compose ps` does not list exited containers at all. To confirm
+those three actually succeeded, run `docker compose ps -a` and look for
+`Exited (0)` next to each.
 
 ### 4.3 Access the CISO Control Plane
 

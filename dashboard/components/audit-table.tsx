@@ -1,11 +1,11 @@
 "use client";
 
 import { useState, useMemo } from "react";
-import { Copy, Check, Search } from "lucide-react";
+import { Search, ShieldCheck, ShieldAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { formatTimestamp, truncateHash } from "@/lib/utils";
+import { formatTimestamp } from "@/lib/utils";
 import type { AuditEntry } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -48,32 +48,29 @@ function DecisionCell({ decision }: { decision: string | null }) {
   );
 }
 
-function CopyHash({ hash }: { hash: string | null }) {
-  const [copied, setCopied] = useState(false);
-  if (!hash) return <span className="text-muted-foreground">—</span>;
-
-  function copy() {
-    if (!hash) return;
-    navigator.clipboard.writeText(hash).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+/**
+ * verified is the one signal in this table that a tamper check actually
+ * failed (or could not be run - the API does not currently distinguish the
+ * two, see AuditEntry.verified). It must never render as blank or absent.
+ */
+function VerificationCell({ entry }: { entry: AuditEntry }) {
+  if (entry.verified) {
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <ShieldCheck className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
+        <span className="text-muted-foreground">
+          Verified{entry.state_id != null ? ` · state ${entry.state_id}` : ""}
+        </span>
+      </div>
+    );
   }
 
   return (
-    <div className="flex items-center gap-1.5 font-mono text-xs">
-      <span className="text-muted-foreground">{truncateHash(hash)}</span>
-      <button
-        onClick={copy}
-        className="rounded p-0.5 hover:bg-accent"
-        aria-label="Copy full hash"
-      >
-        {copied ? (
-          <Check className="h-3.5 w-3.5 text-emerald-500" />
-        ) : (
-          <Copy className="h-3.5 w-3.5 text-muted-foreground" />
-        )}
-      </button>
+    <div className="flex items-center gap-1.5 text-xs">
+      <ShieldAlert className="h-3.5 w-3.5 text-red-500 shrink-0" />
+      <Badge variant="denied" className="w-fit">
+        UNVERIFIED
+      </Badge>
     </div>
   );
 }
@@ -91,7 +88,7 @@ const COLUMNS = [
   { key: "agent_id", label: "Agent ID", width: "w-48" },
   { key: "tool_name", label: "Tool Name", width: "w-44" },
   { key: "decision", label: "Decision", width: "w-48" },
-  { key: "ledger_hash", label: "Ledger Hash (SHA-256)", width: "w-52" },
+  { key: "verified", label: "Verification", width: "w-52" },
 ] as const;
 
 export function AuditTable({ entries }: Props) {
@@ -106,7 +103,7 @@ export function AuditTable({ entries }: Props) {
         e.tool_name,
         e.decision,
         e.timestamp,
-        e.ledger_hash,
+        e.verified ? "verified" : "unverified",
         JSON.stringify(e.payload ?? {}),
       ]
         .join(" ")
@@ -121,7 +118,7 @@ export function AuditTable({ entries }: Props) {
       <div className="relative max-w-sm">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
-          placeholder="Search agent, tool, decision, hash…"
+          placeholder="Search agent, tool, decision, verification…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="pl-9"
@@ -177,7 +174,7 @@ export function AuditTable({ entries }: Props) {
                     <DecisionCell decision={entry.decision} />
                   </td>
                   <td className="px-4 py-3">
-                    <CopyHash hash={entry.ledger_hash} />
+                    <VerificationCell entry={entry} />
                   </td>
                 </tr>
               ))
@@ -188,7 +185,8 @@ export function AuditTable({ entries }: Props) {
 
       <p className="text-xs text-muted-foreground">
         Showing {filtered.length} of {entries.length} ledger entries — newest
-        first. Hashes are SHA-256(key:entry:tx_id) and verifiable offline.
+        first. Verification is a cryptographic inclusion/consistency proof
+        check against ImmuDB's signed state, performed server-side per entry.
       </p>
     </div>
   );

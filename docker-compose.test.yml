@@ -42,6 +42,7 @@ services:
       - "8181:8181"
     environment:
       - AIL_TENANT_ID=tenant_default
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
     command:
       - "run"
       - "--server"

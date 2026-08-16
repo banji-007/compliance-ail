@@ -34,6 +34,10 @@ services:
       - "8181:8181"
     environment:
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
+      # Single-sourced bundle key - opa-config.yaml's `bundles:` key and
+      # interceptor/middleware.py's revision lookup both read this same
+      # var. See opa-config.yaml and docs/reports/phase-0-1.md, P01-3.
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
     command:
       - "run"
       - "--server"
@@ -243,6 +247,7 @@ services:
       - SPIRE_DISABLED=false
       - CONTROL_PLANE_URL=http://ail-control-plane:8002
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
     volumes:
       # SPIRE workload socket — runtime mount, not baked into image.
       - spire-sockets:/tmp/spire-sockets

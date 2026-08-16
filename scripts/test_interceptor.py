@@ -1,3 +1,9 @@
+# Moved from tests/ in Phase 0.1 (see docs/reports/phase-0-1.md, P01-2):
+# this file's two items have no assertion (the body is wrapped in a
+# try/except that swallows every exception), so they cannot fail under any
+# input and this is a smoke script, not a test. Not collected by pytest
+# from here. Run directly: python scripts/test_interceptor.py
+
 import os
 import json
 import sys

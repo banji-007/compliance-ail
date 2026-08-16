@@ -188,13 +188,3 @@ class TestInterceptorWithOpa:
             f"Expected DENIED, got: {response}"
         )
 
-
-# ---------------------------------------------------------------------------
-# Part 3: ledger notice (documentation — no assertions required)
-# ---------------------------------------------------------------------------
-
-def test_ledger_after_opa():
-    """Reminder: ImmuDB is the source of truth for audit records."""
-    print("\nAll intercepts are logged to ImmuDB cryptographic ledger.")
-    print("ImmuDB is the source of truth for audit records.")
-    print("Use ImmuDB client tools to query the audit trail.")

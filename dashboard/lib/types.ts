@@ -32,8 +32,16 @@ export interface AuditEntry {
   payload: Record<string, unknown> | null;
   /** OPA verdict, e.g. "APPROVED" or "DENIED: gdpr.pii_masking_required" */
   decision: string | null;
-  /** SHA-256(key:serialized_entry:tx_id) — recomputed server-side for verification */
-  ledger_hash: string | null;
+  /**
+   * Result of the verifier's cryptographic proof check for this entry.
+   * false covers two distinct cases the API does not currently
+   * distinguish — a failed proof, or a verifier error that skipped the
+   * check entirely — see control_plane/main.py's /audit handler and
+   * docs/reports/phase-0-1.md, P01-5.
+   */
+  verified: boolean;
+  /** tx_id of the latest verified state the verifier held after this check, or null if unavailable */
+  state_id: number | null;
 }
 
 export interface AuditResponse {

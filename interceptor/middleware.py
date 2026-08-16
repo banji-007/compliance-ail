@@ -38,14 +38,20 @@ _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
 # is strictly safer than checking absence of denials.
 _OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/allow")
 
+# Bundle key under OPA's `bundles:` config (opa-config.yaml), not tenant-
+# specific. Single-sourced via AIL_BUNDLE_NAME so opa-config.yaml (which
+# reads the same env var via ${AIL_BUNDLE_NAME} substitution) and this
+# module can never independently drift apart - see
+# docs/reports/phase-0-redteam.md, C4, and docs/reports/phase-0-1.md, P01-3.
+_BUNDLE_NAME = os.getenv("AIL_BUNDLE_NAME", "ail-policies")
+
 # Revision of the bundle actually loaded by the OPA instance we just queried.
 # OPA publishes this itself once the Bundle API has activated a bundle, at
 # data.system.bundles.<name>.manifest.revision - no separate round trip to
 # the control plane, so there is no way for this to name a different tenant's
-# bundle than the one that produced the decision. "ail-policies" is the fixed
-# bundle key in opa-config.yaml, not tenant-specific.
+# bundle than the one that produced the decision.
 _OPA_REVISION_URL = _OPA_URL.replace(
-    "/v1/data/ail/main/allow", "/v1/data/system/bundles/ail-policies/manifest/revision"
+    "/v1/data/ail/main/allow", f"/v1/data/system/bundles/{_BUNDLE_NAME}/manifest/revision"
 )
 
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
@@ -292,6 +298,62 @@ def get_spiffe_ssl_context() -> ssl.SSLContext | None:
     return _get_spiffe_ssl_context()
 
 
+def verify_bundle_at_startup(timeout_seconds: float = 30, poll_interval: float = 2) -> None:
+    """
+    Verify the configured OPA bundle name resolves to a loaded bundle before
+    the agent accepts work, and exit the process if it does not.
+
+    A bundle-name mismatch between opa-config.yaml's `bundles:` key and this
+    module's AIL_BUNDLE_NAME (both meant to be the same value via env
+    substitution - see _BUNDLE_NAME above) otherwise surfaces only as every
+    subsequent tool call being DENIED, indistinguishable at the time from a
+    real policy denial (docs/reports/phase-0-redteam.md, C4). Checking once
+    at boot, with the same actionable message either config location would
+    need to diagnose it, turns that into a startup failure instead.
+
+    Polls for up to timeout_seconds because OPA's bundle plugin loads
+    asynchronously after the container reports healthy (opa-config.yaml's
+    polling.min_delay_seconds/max_delay_seconds) - a single immediate check
+    would false-positive during ordinary startup timing, not just on a real
+    mismatch.
+    """
+    if _SPIRE_DISABLED:
+        ssl_context = True
+    else:
+        ssl_context = _get_spiffe_ssl_context()
+        if not ssl_context or not _validate_peer_spiffe_san(ssl_context):
+            logging.error(
+                "STARTUP FAILURE: could not establish a verified mTLS channel to "
+                "OPA/Envoy - cannot confirm the policy bundle is loaded. Check the "
+                "SPIRE agent and Envoy sidecar are healthy before retrying."
+            )
+            sys.exit(1)
+
+    deadline = time.monotonic() + timeout_seconds
+    revision = None
+    while time.monotonic() < deadline:
+        revision = _fetch_opa_bundle_revision(ssl_context)
+        if revision:
+            break
+        time.sleep(poll_interval)
+
+    if not revision:
+        logging.error(
+            "STARTUP FAILURE: bundle '%s' has no revision on OPA after %ss "
+            "(queried %s). This means opa-config.yaml's `bundles:` key and "
+            "AIL_BUNDLE_NAME (currently '%s', read by interceptor/middleware.py) "
+            "do not name the same bundle, or OPA has not loaded any bundle under "
+            "this name. Check: (1) opa-config.yaml's `bundles:` map key resolves "
+            "to '%s' after ${AIL_BUNDLE_NAME} substitution - confirm AIL_BUNDLE_NAME "
+            "is set identically for the opa and this agent's containers; "
+            "(2) OPA's own logs for bundle download/activation errors.",
+            _BUNDLE_NAME, timeout_seconds, _OPA_REVISION_URL, _BUNDLE_NAME, _BUNDLE_NAME,
+        )
+        sys.exit(1)
+
+    logging.info("Startup check: OPA bundle '%s' loaded, revision=%s", _BUNDLE_NAME, revision)
+
+
 def query_opa_policy(tool_name, tool_args):
     """
     Query OPA policy for tool call authorization using mTLS authentication.
@@ -515,7 +577,12 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     # separately - deny and write nothing rather than log an unattributable
     # entry.
     if opa_decision.get("digest_unavailable"):
-        return {"status": "DENIED", "message": response["message"]}
+        # Distinguishes this from an ordinary policy denial: nothing about
+        # tool_args violated policy, the bundle revision that produced the
+        # decision simply could not be established. status stays DENIED so
+        # existing consumers gated on it are unaffected; callers that want
+        # to tell operators the difference check "fault" instead.
+        return {"status": "DENIED", "message": response["message"], "fault": "infrastructure"}
 
     # policy_revision is only present when OPA itself produced the decision
     # (see query_opa_policy). Pre-flight rejections (schema validation, no

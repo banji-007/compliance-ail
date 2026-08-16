@@ -58,6 +58,7 @@ test-integration:
 	CONTROL_PLANE_API_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_API_KEY" ) ); \
 	SPIRE_DISABLED=true \
 	  OPA_URL=http://localhost:8181/v1/data/ail/main/allow \
+	  AIL_BUNDLE_NAME=$${AIL_BUNDLE_NAME:-ail-policies} \
 	  CONTROL_PLANE_URL=http://localhost:8002 \
 	  IMMUDB_URL=http://localhost:8080 \
 	  IMMUDB_USER=$${IMMUDB_USER_ENV:-$${IMMUDB_USER:-immudb}} \

@@ -3,13 +3,21 @@
 Test script for Epic 3: Enterprise Policy Packs
 """
 
+# Moved from tests/ to scripts/ in Phase 0.1 (see docs/reports/phase-0-1.md,
+# P01-2): its one item has no assertion, so it is a smoke script, not a
+# test. Its own inline comments claiming specific scenarios trigger GDPR
+# violations are known stale against the current tenant_default seed data
+# (see docs/reports/phase-0.md section 6) - asserting those claimed outcomes
+# would assert something false, so this file was moved rather than given
+# invented assertions. Not collected by pytest from here.
+
 import os
 import sys
 import json
 
 # Add the interceptor directory to the path (moved from repo root into tests/
-# in Phase 0 housekeeping; path adjusted for the new location only, content
-# unchanged).
+# in Phase 0 housekeeping, then into scripts/ in Phase 0.1; path adjusted for
+# each new location only, content unchanged).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
 
 def test_epic_3_enterprise_packs():

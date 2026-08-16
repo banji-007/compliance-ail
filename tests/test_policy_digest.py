@@ -67,9 +67,12 @@ requires_stack = pytest.mark.skipif(
 )
 
 
+_BUNDLE_NAME = os.getenv("AIL_BUNDLE_NAME", "ail-policies")
+
+
 def _opa_live_revision() -> str:
     """The ground truth: what OPA itself currently has loaded."""
-    resp = httpx.get(f"{OPA_BASE}/v1/data/system/bundles/ail-policies/manifest/revision", timeout=5)
+    resp = httpx.get(f"{OPA_BASE}/v1/data/system/bundles/{_BUNDLE_NAME}/manifest/revision", timeout=5)
     resp.raise_for_status()
     revision = resp.json().get("result")
     assert revision, f"OPA has no bundle revision loaded: {resp.json()}"
