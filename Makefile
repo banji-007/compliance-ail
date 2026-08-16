@@ -36,20 +36,34 @@ keygen:
 ## polling. "docker compose up --wait" blocks until health checks pass (OPA
 ## binary alive), but the first bundle poll may not have completed yet.
 ## The 15-second sleep ensures OPA has loaded the policy before pytest runs.
+##
+## docker compose auto-loads a root .env regardless of -f, so the control
+## plane and immudb containers enforce whatever IMMUDB_USER, IMMUDB_PASSWORD,
+## and CONTROL_PLANE_API_KEY are in .env if one exists. pytest must
+## authenticate with those same values, so each is read from .env in its own
+## isolated subshell if present, falling back to the prior default otherwise.
+## Isolated per-variable subshells, not a blanket ". .env", so an unrelated
+## var in .env (OPENAI_API_KEY, say) can never shadow an already-correct
+## value already exported in the caller's shell. Without this, a
+## contributor's real .env silently breaks test_cross_process with a 403
+## that has nothing to do with the code under test.
 test-integration:
 	docker compose -f docker-compose.test.yml down -v
 	$(MAKE) keygen
 	docker compose -f docker-compose.test.yml up -d --wait
 	@echo "Waiting 15s for OPA to complete its first bundle poll..."
 	sleep 15
+	IMMUDB_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_USER" ) ); \
+	IMMUDB_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_PASSWORD" ) ); \
+	CONTROL_PLANE_API_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_API_KEY" ) ); \
 	SPIRE_DISABLED=true \
 	  OPA_URL=http://localhost:8181/v1/data/ail/main/allow \
 	  CONTROL_PLANE_URL=http://localhost:8002 \
 	  IMMUDB_URL=http://localhost:8080 \
-	  IMMUDB_USER=$${IMMUDB_USER:-immudb} \
-	  IMMUDB_PASSWORD=$${IMMUDB_PASSWORD:-immudb} \
+	  IMMUDB_USER=$${IMMUDB_USER_ENV:-$${IMMUDB_USER:-immudb}} \
+	  IMMUDB_PASSWORD=$${IMMUDB_PASSWORD_ENV:-$${IMMUDB_PASSWORD:-immudb}} \
 	  VERIFIER_URL=http://localhost:8003 \
-	  CONTROL_PLANE_API_KEY=$${CONTROL_PLANE_API_KEY:-test-api-key} \
+	  CONTROL_PLANE_API_KEY=$${CONTROL_PLANE_API_KEY_ENV:-$${CONTROL_PLANE_API_KEY:-test-api-key}} \
 	  python -m pytest tests/ -v
 	docker compose -f docker-compose.test.yml down -v
 

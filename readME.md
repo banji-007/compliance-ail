@@ -146,7 +146,7 @@ tenant_default  →  allowed_cost_centers: [engineering, marketing, finance, ope
 tenant_finance  →  allowed_cost_centers: [finance, executive]
 ```
 
-The same gateway infrastructure, the same OPA process, the same Rego evaluation engine - but each tenant's agent operates under a completely isolated policy brain.
+Each OPA process resolves exactly one bundle resource, from its own `AIL_TENANT_ID` environment variable, once at startup - it polls and evaluates against that single tenant's bundle for the lifetime of the process. Isolation between tenants comes from running a dedicated OPA process per tenant, not from one process serving several: in the Kubernetes/Helm deployment this is a separate OPA sidecar container per agent pod, each pinned to its tenant. The docker-compose demo runs a single OPA container, so at any given moment it is serving exactly one tenant; switching which tenant it serves means recreating that container against a different `AIL_TENANT_ID` (section 4.5 below).
 
 The control plane persists tenant config in SQLite, which is sufficient for the demo and single-instance deployments but is a single-writer store. Horizontal scale-out of the control plane requires moving to a networked database (Postgres). The tenancy model and bundle generation are storage-agnostic; only the persistence layer is the constraint.
 
@@ -160,7 +160,7 @@ When ImmuDB runs with a signing key, each state it returns is ECDSA-signed, and 
 
 **What this proves, and what it does not.** The chain establishes that a returned entry was committed and has not been altered, deleted, or served from a forked or rolled-back store, and an auditor can reproduce the result offline with `immuclient` against the same signed state. It does not prove the correctness of the policy that approved the entry; that is the OPA layer's concern. Tamper-evidence and policy-correctness are separate guarantees.
 
-Coverage is enforced by integration tests run against a live ImmuDB on every CI build: proof parity between verifier and server, corruption of the persisted anchor caught as a consistency-proof failure (`ErrCorruptedData`), a wrong signing key caught as a signature failure on an independent code path (`BadSignatureError`), cross-process verification through `/audit`, and a write-read round trip. Any failure fails the build.
+Coverage is enforced by integration tests run against a live ImmuDB on every CI build: proof parity between verifier and server, corruption of the persisted anchor caught as a consistency-proof failure (`ErrCorruptedData`), cross-process verification through `/audit`, and a write-read round trip. A fifth test demonstrates that a mismatched verifying key is caught as a signature failure (`BadSignatureError`); as written it substitutes the key on a client object the test itself constructs, so it proves key-mismatch detection, not resistance to an attacker substituting the key on a running verifier - see `TODO.md` for the attacker-reachable version of this test. Any failure fails the build. Of the five tests, one (the persisted-anchor corruption test) exercises a tamper vector an attacker with access to the verifier's state volume could actually reach; the rest are correctness and detection checks, valuable on their own but not tamper simulations.
 
 ### 3.5 Real-Time CISO Observability
 
@@ -265,38 +265,52 @@ Expected result: `APPROVED` - all policy constraints satisfied.
 
 This is the definitive proof of SaaS policy isolation. The Finance tenant (`tenant_finance`) operates under strict FinOps controls: only `finance` and `executive` cost centers are approved. The same request that passes under `tenant_default` is blocked under `tenant_finance`.
 
-**Step 1.** Start a Finance tenant agent session (one-off - does not require a full stack rebuild):
+OPA resolves its bundle resource from its own `AIL_TENANT_ID` once at process startup (see section 3.3) - setting that variable on the agent has no effect on which bundle OPA is serving. To switch tenants, recreate the `opa` container itself against the Finance bundle:
+
+**Step 1.** Recreate `opa` pinned to the Finance tenant:
 
 ```bash
-docker compose run --rm -e AIL_TENANT_ID=tenant_finance langgraph-demo
+AIL_TENANT_ID=tenant_finance docker compose up -d --force-recreate --no-deps opa
 ```
 
-This boots OPA with the Finance tenant bundle. The `allowed_cost_centers` in `data.ail.config` will be `["finance", "executive"]`.
+Confirm the bundle actually loaded before continuing (OPA fetches immediately on startup, but this is not instantaneous):
 
-**Step 2.** Submit a request that would pass under the default tenant:
+```bash
+curl -s localhost:8181/v1/data/ail/config
+```
+
+Wait until `tenant_id` in the response reads `tenant_finance` and `allowed_cost_centers` reads `["finance", "executive"]`.
+
+**Step 2.** Attach to the agent (unchanged, no tenant flag needed - it never reads one) and submit a request that would pass under the default tenant:
+
+```bash
+docker attach compliance-ail-langgraph-demo-1
+```
 
 ```
-I am on the marketing team. Provision a t3.micro instance in us-east-1
-with tags: environment=prod, cost_center=marketing, encryption_at_rest=true.
+I am on the marketing team. Provision a t3.micro instance in us-east-1 for $5/hour with tags: environment=prod, cost_center=marketing, encryption_at_rest=true.
 ```
 
 **Expected denial:**
 ```
-DENIED: Production environments must include a valid 'cost_center' tag.
-Approved Values: {"executive", "finance"}.
+DENIED: Production environments must include a valid 'cost_center' tag. Approved values: {"executive", "finance"}.
 ```
 
 **Step 3.** Submit the corrected request to demonstrate the approved path:
 
 ```
-Provision a t3.micro in eu-central-1 for the finance team.
-Tags: environment=prod, cost_center=finance, encryption_at_rest=true,
-project=q1-budget.
+Provision a t3.micro in eu-central-1 for the finance team for $5/hour. Tags: environment=prod, cost_center=finance, encryption_at_rest=true, project=q1-budget.
 ```
 
 Expected result: `APPROVED` - finance cost center is in the allowlist, encryption is satisfied, region is within GDPR-approved boundaries.
 
-The same gateway binary, the same OPA process, two completely isolated policy brains.
+**Step 4.** Restore the default tenant when done:
+
+```bash
+docker compose up -d --force-recreate --no-deps opa
+```
+
+The same gateway binary and the same Rego evaluation engine enforce both tenants' policies, but never at the same time from the same OPA process: recreating `opa` against a different bundle is what actually switches the policy brain it runs. Concurrent, per-tenant isolation - two brains live at once - is what the Helm/K8s chart's manifests are architected to provide, one dedicated OPA sidecar per agent pod (section 3.3) - see section 4.7 for why that chart cannot currently be deployed to confirm it.
 
 ### 4.6 Service Endpoints
 
@@ -308,18 +322,18 @@ The same gateway binary, the same OPA process, two completely isolated policy br
 | Grafana | `http://localhost:3000` | Prometheus metrics dashboard |
 | Prometheus | `http://localhost:9090` | Raw metrics scrape target |
 
-### 4.7 Enterprise Kubernetes Deployment
+### 4.7 Kubernetes Deployment (Chart Unsupported)
 
-For production deployments, AIL ships a **production-ready Helm chart** that translates the full sidecar architecture into Kubernetes-native manifests. The AI agent, Envoy proxy, and OPA policy engine run inside a shared Pod namespace, eliminating node-level network sniffing without any additional network policy configuration.
+AIL includes a Helm chart (`charts/ail-gateway/`) that translates the sidecar architecture - AI agent, Envoy proxy, and OPA policy engine sharing a Pod namespace - into Kubernetes-native manifests, with workload identity negotiated using **Kubernetes Projected Service Account Tokens (PSAT)**, the native K8s SPIRE attestation method.
 
-Workload identity is negotiated using **Kubernetes Projected Service Account Tokens (PSAT)** - the native K8s SPIRE attestation method - integrating cleanly into existing cluster security postures without static secrets.
+**This chart is not deployable and is not the production path.** It predates the ADR-001 verifier-isolation migration: it injects ImmuDB credentials directly into the agent pod and has no verifier workload, while the actual ledger client only ever talks to a verifier service. A cluster deployed from it fails closed on every tool call. See `charts/ail-gateway/README.md` for the full explanation and `docs/audit/2026-08-16-verification.md` (item V1) for how this was confirmed. The commands below render and install the chart as it exists today, for reference - not as a working deployment path:
 
 ```bash
 helm dependency update charts/ail-gateway/
 helm install ail-gateway charts/ail-gateway -n ail-system --create-namespace
 ```
 
-The Docker Compose stack remains the recommended path for local development and demo environments. The Helm chart is the production path.
+The Docker Compose stack is the only currently-working path for running AIL end to end, for both local development and any other environment, until the chart is either brought in line with the verifier architecture or retired.
 
 ---
 
@@ -328,7 +342,7 @@ The Docker Compose stack remains the recommended path for local development and 
 ### Prompt Injection - Structurally Constrained
 
 The gateway's enforcement is out-of-band; it operates at the tool call interception layer in the Python interceptor and at the Envoy network layer. The LLM's output is only ever treated as untrusted input to be evaluated. The LLM cannot instruct the gateway to disable itself, any more than a SQL injection payload can instruct a firewall to turn off.
-This bounds prompt injection rather than eliminating it. The guarantee is precise: no tool call reaches execution unless its parameters satisfy the active Rego policies and the registered schema. It follows that the security boundary is exactly as strong as your policy coverage. An injection that drives a registered tool toward a policy-violating parameter set is blocked deterministically. An injection that abuses a legitimately allowed tool in a way no policy expresses, or exfiltrates through an approved channel, is not something a parameter-level gateway can catch. AIL closes the 'the model was told not to' gap. It does not close the 'we never wrote a rule for that' gap..
+This bounds prompt injection rather than eliminating it. The guarantee is precise: no tool call reaches execution unless its parameters satisfy the active Rego policies and the registered schema. It follows that the security boundary is exactly as strong as your policy coverage. An injection that drives a registered tool toward a policy-violating parameter set is blocked deterministically. An injection that abuses a legitimately allowed tool in a way no policy expresses, or exfiltrates through an approved channel, is not something a parameter-level gateway can catch. AIL closes the 'the model was told not to' gap. It does not close the 'we never wrote a rule for that' gap.
 
 **Demonstrated attack and response:**
 
@@ -364,7 +378,7 @@ The current resolution uses process isolation: a dedicated `verifier` container 
 
 **ADR-002: FastAPI as ImmuDB Proxy**
 
-ImmuDB is intentionally not exposed on the host network interface. The CISO dashboard (a browser application) cannot reach an internal Docker service directly. The FastAPI control plane exposes a `GET /audit` endpoint that scans ImmuDB via REST for key listing, then calls the verifier service for a `verifiedGet` proof check on each entry. The response includes `verified: true|false` per entry. CORS is restricted to `localhost:3001`.
+ImmuDB is intentionally not exposed on the host network interface. The CISO dashboard (a browser application) cannot reach an internal Docker service directly. The FastAPI control plane exposes a `GET /audit` endpoint that scans ImmuDB via REST for key listing, then calls the verifier service for a `verifiedGet` proof check on each entry. The response includes `verified: true|false` per entry. CORS is restricted to `localhost:3001`. See `docs/adr/0002-fastapi-immudb-proxy.md` for the full record.
 
 **ADR-003: OPA Bundle API over Direct Rego Push**
 

@@ -19,7 +19,7 @@ class CloudServerProvisionSchema(BaseModel):
     Strict schema for cloud server provisioning tool arguments.
     Catches LLM hallucinations before they reach OPA.
     """
-    # e.g. "t3.micro", "p4d.24xlarge" — alphanumeric with dots/dashes only
+    # e.g. "t3.micro", "p4d.24xlarge" - alphanumeric with dots/dashes only
     instance_type: str = Field(
         ...,
         pattern=r'^[a-z][a-z0-9\-]*\.[a-z0-9]+$',
@@ -45,7 +45,7 @@ class QueryDatabaseSchema(BaseModel):
     Ensures target_table, query, processing_purpose, and masking_enabled are
     all present and correctly typed before the call reaches OPA.
     """
-    # Table names: letters, digits, underscores only — no SQL metacharacters
+    # Table names: letters, digits, underscores only - no SQL metacharacters
     target_table: str = Field(
         ...,
         pattern=r'^[a-zA-Z_][a-zA-Z0-9_]*$',
@@ -70,7 +70,7 @@ class DeployToProductionSchema(BaseModel):
     Ensures change-management fields are present and correctly typed
     before the call reaches OPA (SOC2 CC8.1 / FinOps guardrails).
     """
-    # Repo names: alphanumeric, dash, underscore, dot — no path traversal
+    # Repo names: alphanumeric, dash, underscore, dot - no path traversal
     repository_name: str = Field(
         ...,
         pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_\-\.]*$',
@@ -117,7 +117,7 @@ def _validate(schema_cls: type[BaseModel], tool_args: dict) -> tuple[bool, Optio
 
 
 # ---------------------------------------------------------------------------
-# Public API — one entry point per tool, plus registry for middleware routing
+# Public API - one entry point per tool, plus registry for middleware routing
 # ---------------------------------------------------------------------------
 
 def validate_cloud_server_args(tool_args: dict) -> tuple[bool, Optional[str]]:

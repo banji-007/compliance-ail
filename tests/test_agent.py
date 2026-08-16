@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 
 
 class TestAgent:
-    def __init__(self):
+    def setup_method(self):
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.tools = [
             {
@@ -60,6 +60,7 @@ class TestAgent:
         print("==================\n")
         return f"Cloud server provisioning initiated for {instance_type} in {region} at ${cost_per_hour}/hour"
 
+    @pytest.mark.parametrize("prompt", ["Spin up an AWS p4d.24xlarge in us-east-1 for $32/hour."])
     def test_prompt(self, prompt):
         """Test a single prompt"""
         print(f"Testing prompt: '{prompt}'")
@@ -116,5 +117,6 @@ class TestAgent:
 
 if __name__ == "__main__":
     agent = TestAgent()
+    agent.setup_method()
     test_prompt = "Spin up an AWS p4d.24xlarge in us-east-1 for $32/hour."
     agent.test_prompt(test_prompt)

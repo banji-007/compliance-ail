@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 
 class TestAgentWithInterceptor:
-    def __init__(self):
+    def setup_method(self):
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.tools = [
             {
@@ -107,6 +107,10 @@ class TestAgentWithInterceptor:
 
         return tool_results
 
+    @pytest.mark.parametrize("prompt", [
+        "Spin up an AWS t3.micro in us-east-1 for $5/hour.",
+        "Spin up an AWS p4d.24xlarge in us-east-1 for $32/hour.",
+    ])
     def test_prompt(self, prompt):
         """Test a single prompt"""
         print(f"\nTesting prompt: '{prompt}'")
@@ -148,6 +152,7 @@ class TestAgentWithInterceptor:
 
 if __name__ == "__main__":
     agent = TestAgentWithInterceptor()
+    agent.setup_method()
 
     # Test 1: Small instance (likely approved based on environment/project rules)
     print("\n" + "="*80)

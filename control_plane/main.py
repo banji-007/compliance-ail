@@ -210,22 +210,6 @@ def update_tenant(
     return tenant
 
 
-@app.head("/bundles/{tenant_id}")
-def head_bundle(tenant_id: str, db: Session = Depends(get_db)):
-    """
-    HEAD /bundles/{tenant_id} — returns the current ETag without streaming bundle bytes.
-    Used by the interceptor's _compute_policy_hash() to record the live bundle version
-    in ledger entries without the overhead of a full tar.gz transfer.
-    """
-    tenant = db.query(Tenant).filter_by(id=tenant_id).first()
-    if not tenant:
-        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
-
-    _, etag = generate_bundle(tenant)
-    logger.debug("HEAD /bundles/%s → ETag %s…", tenant_id, etag[:12])
-    return Response(headers={"ETag": etag, "Cache-Control": "max-age=300, must-revalidate"})
-
-
 @app.get("/bundles/{tenant_id}")
 def get_bundle(tenant_id: str, request: Request, db: Session = Depends(get_db)):
     """

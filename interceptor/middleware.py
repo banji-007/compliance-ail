@@ -31,11 +31,6 @@ logging.basicConfig(
 #   Development (local venv):   Set SPIRE_DISABLED=true and point OPA_URL at
 #                               http://localhost:8181/v1/data/ail/main/deny
 #                               Policy is still evaluated; transport identity is not.
-# Control plane connection — override for Docker vs local dev.
-# Docker: http://ail-control-plane:8002  |  Local dev: http://localhost:8002
-_CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
-_AIL_TENANT_ID = os.getenv("AIL_TENANT_ID", "tenant_default")
-
 _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
 # Query the explicit /allow endpoint, not /deny.
 # If the policy fails to compile, OPA returns {"result": null} for this path,
@@ -43,19 +38,34 @@ _SPIRE_DISABLED = os.getenv("SPIRE_DISABLED", "false").lower() == "true"
 # is strictly safer than checking absence of denials.
 _OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/allow")
 
+# Revision of the bundle actually loaded by the OPA instance we just queried.
+# OPA publishes this itself once the Bundle API has activated a bundle, at
+# data.system.bundles.<name>.manifest.revision - no separate round trip to
+# the control plane, so there is no way for this to name a different tenant's
+# bundle than the one that produced the decision. "ail-policies" is the fixed
+# bundle key in opa-config.yaml, not tenant-specific.
+_OPA_REVISION_URL = _OPA_URL.replace(
+    "/v1/data/ail/main/allow", "/v1/data/system/bundles/ail-policies/manifest/revision"
+)
+
 _DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
 
 # Fields whose values must never appear in container logs.
-# Add any future PII or credential keys here — the helper recurses into nested dicts.
-_SENSITIVE_KEYS = frozenset({"query", "approval_ticket", "commit_hash"})
+# Add any future PII or credential keys here - the helper recurses into nested dicts.
+# 'tags' is included whole, not recursed into: its keys are caller-supplied and
+# unconstrained by schema (Dict[str, str]), so there is no fixed set of "safe"
+# sub-keys to allow through - any of them could carry free text or PII. This
+# only affects what reaches stdout; the ledger still stores the raw payload
+# (see docs/reports/phase-0.md, P0-8 - redacting the ledger itself is Phase 1).
+_SENSITIVE_KEYS = frozenset({"query", "approval_ticket", "commit_hash", "tags"})
 
 
 def _redact_args(args: dict) -> dict:
     """
     Return a shallow copy of args with sensitive field values replaced by [REDACTED].
-    Recurses one level into nested dicts (e.g. the 'tags' dict in provision_cloud_server).
-    Non-sensitive metadata (region, instance_type, environment, tags, etc.) is preserved
-    in the clear for ops visibility.
+    Recurses one level into nested dicts not themselves listed in _SENSITIVE_KEYS.
+    Non-sensitive metadata with fixed, known key names (region, instance_type,
+    environment, etc.) is preserved in the clear for ops visibility.
     """
     redacted = {}
     for k, v in args.items():
@@ -151,41 +161,30 @@ except OSError:
     pass  # port already bound (e.g. module reloaded)
 
 
-def _compute_policy_hash() -> str:
+def _fetch_opa_bundle_revision(ssl_context) -> str | None:
     """
-    Fetch the active bundle ETag from the AIL Control Plane.
+    Read back the revision of the bundle the OPA instance we just queried has
+    actually loaded, over the same channel used for the policy query itself.
 
-    The ETag is a SHA-256 digest of all active Rego files + tenant data.json,
-    computed by control_plane/bundle.py — exactly the policy surface OPA is
-    currently evaluating. Recording it in ImmuDB makes policy drift immediately
-    visible: any change to an enabled pack or tenant config produces a new ETag.
+    OPA exposes this at data.system.bundles.<name>.manifest.revision as soon
+    as the Bundle API has activated a bundle - no separate service, so the
+    value returned here cannot name a bundle other than the one that produced
+    the decision this call is paired with.
 
-    Uses HTTP HEAD to /bundles/{tenant_id}: FastAPI/Starlette strips the
-    response body for HEAD requests on GET routes, so the bundle bytes are
-    never transferred over the wire.
-
-    Falls back to 'bundle-hash-unavailable' on any error, logs a WARNING so
-    the degradation is visible in monitoring, and still allows ledger writes.
+    Returns None on any error or on an undefined result (bundle not yet
+    loaded, wrong bundle name). Callers must treat None as the digest being
+    unobtainable, not as an empty digest.
     """
-    bundle_url = f"{_CONTROL_PLANE_URL}/bundles/{_AIL_TENANT_ID}"
     try:
-        with httpx.Client(timeout=2) as client:
-            response = client.head(bundle_url)
-        etag = response.headers.get("etag")
-        if etag:
-            logging.debug(f"Bundle ETag from control plane ({_AIL_TENANT_ID}): {etag[:16]}…")
-            return etag
-        logging.warning(
-            f"Control plane at {bundle_url} responded but returned no ETag header. "
-            "Policy version recorded as 'bundle-hash-unavailable'."
-        )
-        return "bundle-hash-unavailable"
+        with httpx.Client(verify=ssl_context) as client:
+            response = client.get(_OPA_REVISION_URL, timeout=5)
+        if response.status_code != 200:
+            return None
+        revision = response.json().get("result")
+        return revision if isinstance(revision, str) and revision else None
     except Exception as e:
-        logging.warning(
-            f"Control plane unreachable at {bundle_url} — policy version will be "
-            f"recorded as 'bundle-hash-unavailable' in the ledger. Error: {e}"
-        )
-        return "bundle-hash-unavailable"
+        logging.error(f"OPA bundle revision query failed: {e}")
+        return None
 
 
 def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
@@ -376,8 +375,33 @@ def query_opa_policy(tool_name, tool_args):
                     "Fail-closed policy enforced."
                 )
                 return _DENIED_UNAVAILABLE
+
+            # OPA produced a decision in this cycle, so the bundle revision
+            # that decision was evaluated against must be readable from the
+            # same instance right now. If it isn't, the decision cannot be
+            # attributed to a known policy and must not be recorded as if it
+            # could be - deny outright rather than log with no provenance.
+            policy_revision = _fetch_opa_bundle_revision(ssl_context)
+            if policy_revision is None:
+                logging.error(
+                    "OPA answered /allow but its bundle revision could not be read back "
+                    "in the same cycle. Refusing to record an unattributable decision."
+                )
+                return {
+                    "allowed": False,
+                    "reason": "DENIED: Unable to establish the policy revision that produced this "
+                              "decision. Execution blocked.",
+                    "deny": ["Unable to establish the policy revision that produced this decision."],
+                    "digest_unavailable": True,
+                }
+
             if result is True:
-                return {"allowed": True, "reason": "Action approved by policy", "deny": []}
+                return {
+                    "allowed": True,
+                    "reason": "Action approved by policy",
+                    "deny": [],
+                    "policy_revision": policy_revision,
+                }
             else:
                 # allow is False, execute second query to /deny for specific reasons
                 deny_url = _OPA_URL.replace("/allow", "/deny")
@@ -388,9 +412,9 @@ def query_opa_policy(tool_name, tool_args):
                             json={"input": {"tool_name": tool_name, "tool_args": tool_args}},
                             timeout=5,
                         )
-                    
+
                     logging.debug(f"OPA /deny status={deny_response.status_code} body={deny_response.text[:200]}")
-                    
+
                     if deny_response.status_code == 200:
                         deny_result = deny_response.json().get("result", [])
                         # Ensure deny_result is a list of strings
@@ -399,26 +423,30 @@ def query_opa_policy(tool_name, tool_args):
                             return {
                                 "allowed": False,
                                 "reason": f"DENIED: {combined_reason}",
-                                "deny": deny_result
+                                "deny": deny_result,
+                                "policy_revision": policy_revision,
                             }
                         else:
                             return {
                                 "allowed": False,
                                 "reason": "DENIED: Action did not pass policy evaluation.",
-                                "deny": ["Action did not pass policy evaluation."]
+                                "deny": ["Action did not pass policy evaluation."],
+                                "policy_revision": policy_revision,
                             }
                     else:
                         return {
                             "allowed": False,
                             "reason": "DENIED: Action did not pass policy evaluation.",
-                            "deny": ["Action did not pass policy evaluation."]
+                            "deny": ["Action did not pass policy evaluation."],
+                            "policy_revision": policy_revision,
                         }
                 except Exception as e:
                     logging.error(f"OPA /deny query failed: {e}")
                     return {
                         "allowed": False,
                         "reason": "DENIED: Action did not pass policy evaluation.",
-                        "deny": ["Action did not pass policy evaluation."]
+                        "deny": ["Action did not pass policy evaluation."],
+                        "policy_revision": policy_revision,
                     }
         else:
             return _DENIED_UNAVAILABLE
@@ -444,7 +472,8 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         agent_id (str): Identifier for the agent making the call
 
     Returns:
-        dict: Response with 'status', 'message', and 'record_hash' keys
+        dict: Response with 'status', 'message', and, on a completed ledger
+        write, 'ledger_tx_id' keys
     """
     logging.info(f"Agent Request -> AIL Intercept: {tool_name} | args={json.dumps(_redact_args(tool_args))}")
 
@@ -480,18 +509,35 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     logging.info(f"Policy Engine Decision: {response['status']}: {response['message']}")
     _POLICY_DECISIONS.labels(status=response["status"], tool_name=tool_name, policy=policy_label).inc()
 
+    # OPA produced a decision but its own bundle revision could not be read
+    # back in the same cycle (see query_opa_policy). Recording this decision
+    # would attribute it to no known policy, or worse, to a stale one read
+    # separately - deny and write nothing rather than log an unattributable
+    # entry.
+    if opa_decision.get("digest_unavailable"):
+        return {"status": "DENIED", "message": response["message"]}
+
+    # policy_revision is only present when OPA itself produced the decision
+    # (see query_opa_policy). Pre-flight rejections (schema validation, no
+    # registered tool) and OPA-unreachable denials never consulted a policy,
+    # so there is nothing to attribute to a revision - the ledger entry is
+    # written without a policy tag rather than a synthesized one.
+    policy_revision = opa_decision.get("policy_revision")
+    decision_text = (
+        f"{decision_for_ledger} (policy: {policy_revision})" if policy_revision else decision_for_ledger
+    )
+
     # Fail-closed: log to ImmuDB ledger or block execution if unavailable
     ledger_tx_id = None
     try:
         from immudb_ledger import get_ledger
         ledger = get_ledger()
 
-        policy_version = _compute_policy_hash()
         ledger_tx_id = ledger.log_tool_call(
             agent_id=agent_id,
             tool_name=tool_name,
             payload=tool_args,
-            decision=f"{decision_for_ledger} (policy: {policy_version})",
+            decision=decision_text,
         )
         logging.info(f"Ledger tx_id: {ledger_tx_id}")
     except Exception as e:

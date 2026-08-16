@@ -11,9 +11,6 @@ from middleware import intercept_tool_call
 load_dotenv()
 
 class TestLedgerIntegration:
-    def __init__(self):
-        pass
-
     def test_interceptor_logging(self):
         """Test that interceptor logs to ledger correctly"""
         print("\n" + "="*80)

@@ -141,19 +141,21 @@ def provision_cloud_server(
 
     decision = intercept_tool_call("provision_cloud_server", args, agent_id="langgraph_agent")
 
-    # Defense-in-depth: block execution if the ledger write failed or was bypassed.
-    # A valid record_hash proves the decision is durably recorded in ImmuDB before
-    # any real-world action is taken.
-    if not decision.get("record_hash") or decision["record_hash"] == "unavailable":
+    # Defense-in-depth: an APPROVED decision must carry proof the ledger write
+    # completed before any real-world action is taken. intercept_tool_call's
+    # own fail-closed structure already guarantees this (it returns DENIED,
+    # not APPROVED, whenever the write fails), but this checks the invariant
+    # explicitly rather than trusting it silently.
+    if decision.get("status") == "APPROVED" and not decision.get("ledger_tx_id"):
         return (
             "BLOCKED by AIL: Audit ledger write failed or was bypassed. "
             "Execution halted — no action is taken without a verifiable audit record."
         )
 
-    record_hash = decision.get("record_hash", "")[:16]
+    ledger_tx_id = decision.get("ledger_tx_id")
     pipeline_prefix = (
         f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] "
-        f"-> [Ledger Hash] {record_hash}..."
+        f"-> [Ledger tx] {ledger_tx_id}"
     )
 
     if decision["status"] == "APPROVED":
@@ -199,17 +201,21 @@ def query_database(
 
     decision = intercept_tool_call("query_database", args, agent_id="langgraph_agent")
 
-    # Defense-in-depth: block execution if the ledger write failed or was bypassed.
-    if not decision.get("record_hash") or decision["record_hash"] == "unavailable":
+    # Defense-in-depth: an APPROVED decision must carry proof the ledger write
+    # completed before any real-world action is taken. intercept_tool_call's
+    # own fail-closed structure already guarantees this (it returns DENIED,
+    # not APPROVED, whenever the write fails), but this checks the invariant
+    # explicitly rather than trusting it silently.
+    if decision.get("status") == "APPROVED" and not decision.get("ledger_tx_id"):
         return (
             "BLOCKED by AIL: Audit ledger write failed or was bypassed. "
             "Execution halted — no action is taken without a verifiable audit record."
         )
 
-    record_hash = decision.get("record_hash", "")[:16]
+    ledger_tx_id = decision.get("ledger_tx_id")
     pipeline_prefix = (
         f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] "
-        f"-> [Ledger Hash] {record_hash}..."
+        f"-> [Ledger tx] {ledger_tx_id}"
     )
 
     if decision["status"] == "APPROVED":
@@ -254,17 +260,21 @@ def deploy_to_production(
 
     decision = intercept_tool_call("deploy_to_production", args, agent_id="langgraph_agent")
 
-    # Defense-in-depth: block execution if the ledger write failed or was bypassed.
-    if not decision.get("record_hash") or decision["record_hash"] == "unavailable":
+    # Defense-in-depth: an APPROVED decision must carry proof the ledger write
+    # completed before any real-world action is taken. intercept_tool_call's
+    # own fail-closed structure already guarantees this (it returns DENIED,
+    # not APPROVED, whenever the write fails), but this checks the invariant
+    # explicitly rather than trusting it silently.
+    if decision.get("status") == "APPROVED" and not decision.get("ledger_tx_id"):
         return (
             "BLOCKED by AIL: Audit ledger write failed or was bypassed. "
             "Execution halted — no action is taken without a verifiable audit record."
         )
 
-    record_hash = decision.get("record_hash", "")[:16]
+    ledger_tx_id = decision.get("ledger_tx_id")
     pipeline_prefix = (
         f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] "
-        f"-> [Ledger Hash] {record_hash}..."
+        f"-> [Ledger tx] {ledger_tx_id}"
     )
 
     if decision["status"] == "APPROVED":

@@ -7,19 +7,25 @@ import os
 import sys
 import json
 
-# Add the interceptor directory to the path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'interceptor'))
+# Add the interceptor directory to the path (moved from repo root, as
+# test_epic_2.py, into tests/ in Phase 0 housekeeping; path and OPA_URL
+# adjusted for the new location and current endpoint convention only,
+# content otherwise unchanged. Renamed to avoid colliding with the existing
+# tests/test_epic_2.py, which covers QueryDatabaseSchema and
+# DeployToProductionSchema but not CloudServerProvisionSchema - this file's
+# actual, still-unique coverage.)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
 
 def test_epic_2_validation():
     """Test pre-flight validation with various scenarios"""
     print("=== Testing Epic 2: Pre-Flight Input Validation ===\n")
-    
+
     # Set up environment for testing
     os.environ['SPIRE_DISABLED'] = 'true'
-    os.environ['OPA_URL'] = 'http://localhost:8181/v1/data/ail/policy'
-    
-    from interceptor.middleware import intercept_tool_call
-    from interceptor.schemas import CloudServerProvisionSchema
+    os.environ['OPA_URL'] = 'http://localhost:8181/v1/data/ail/main/allow'
+
+    from middleware import intercept_tool_call
+    from schemas import CloudServerProvisionSchema
     
     print("Test 1: Valid cloud server arguments")
     valid_args = {

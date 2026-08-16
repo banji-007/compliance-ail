@@ -7,8 +7,10 @@ import os
 import sys
 import json
 
-# Add the interceptor directory to the path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'interceptor'))
+# Add the interceptor directory to the path (moved from repo root into tests/
+# in Phase 0 housekeeping; path adjusted for the new location only, content
+# unchanged).
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
 
 def test_epic_3_enterprise_packs():
     """Test modular policy packs with aggregator functionality"""
@@ -16,9 +18,9 @@ def test_epic_3_enterprise_packs():
     
     # Set up environment for testing
     os.environ['SPIRE_DISABLED'] = 'true'
-    os.environ['OPA_URL'] = 'http://localhost:8181/v1/data/ail/main/deny'
+    os.environ['OPA_URL'] = 'http://localhost:8181/v1/data/ail/main/allow'
     
-    from interceptor.middleware import intercept_tool_call
+    from middleware import intercept_tool_call
     
     print("Test 1: GDPR Compliance - PCI-DSS data residency violation")
     gdpr_violation = {

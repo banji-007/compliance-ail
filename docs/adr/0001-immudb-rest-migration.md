@@ -107,5 +107,9 @@ state volume so the new root is accepted on the next startup.
 - `immudb/embedded/store/tx.py` in immudb-py 1.5.0 - `Alh()` and
   `innerHash()` source (the correct formula; the earlier hand-rolled version
   was wrong)
-- `tests/test_verification.py` - five acceptance tests including tamper
-  detection against a corrupted state file and a wrong signing key
+- `tests/test_verification.py` - five acceptance tests: proof parity,
+  tamper detection against a corrupted state file (the one test that
+  exercises an attacker-reachable vector - corrupting the verifier's own
+  persisted trust anchor), a mismatched verifying key caught as a signature
+  failure (client-side key substitution, not an attack simulation - see
+  TODO.md), cross-process verification, and a write-read round trip
