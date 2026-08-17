@@ -6,7 +6,7 @@
 
 **Start SHA:** `e7e9607`.
 
-**End SHA:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1`, one commit onto `phase-1-1-remediation`, pushed to origin. PR #2 confirmed still `OPEN`/`MERGEABLE` after the push, head updated to this SHA - not merged.
+**End SHA - the commit to audit:** `832c5e630cce31ea6d40d001cc65e2749ede9737`. Two commits went onto `phase-1-1-remediation`, pushed to origin: `82777b2` (the code change - policy, interceptor, control plane, ledger, tests) and `832c5e6` (docs-only, this report's own end-of-report pointers). `832c5e6` is the actual branch head and the one to check out for audit - it contains everything in `82777b2` plus nothing else code-relevant. An earlier version of this report named `82777b2` as the end SHA, written before the docs-only commit was pushed; that was stale the moment it was superseded and is corrected here. PR #2 confirmed `OPEN`, `mergedAt: null` at `832c5e6` - not merged.
 
 **Environment:**
 
@@ -272,6 +272,6 @@ Full suite, `docker-compose.test.yml`, fresh volumes (`down -v` / `up -d --build
 
 No test skipped, no test newly `xfail`ed, no assertion weakened (§5). 84 = 78 (Phase 1.1's own baseline) - 6 (`tests/test_bundle_ownership.py`, removed as obsolete, P12-1) + 12 new (3 in `test_bundle_revision_attribution.py`, 4 in `test_deny_message_formatting.py`, 3 new in `test_content_states.py`, 2 new in `test_verification.py`).
 
-**End SHA / commit:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1`, one commit onto `phase-1-1-remediation`.
+**Code commit:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1` - CI run `32073638413` (`integration-tests`, `success`, 2m9s) ran at this head.
 
-**CI run id (updated PR #2 head):** `32073638413` (`gh run watch 32073638413 --exit-status`) - `integration-tests` job, `success`, 2m9s. PR #2 confirmed `OPEN`/`MERGEABLE` at this head after the push - not merged.
+**End SHA - the commit to audit:** `832c5e630cce31ea6d40d001cc65e2749ede9737` (docs-only, on top of `82777b2`, no code or test changes - see §1) - CI run `32073875146` (`integration-tests`, `success`, 2m1s) ran at this head, confirming the docs-only commit didn't disturb anything. This is the actual branch head; check it out for audit, not `82777b2`. PR #2 confirmed `OPEN`, `mergedAt: null` at this head - not merged.
