@@ -1,0 +1,8 @@
+{
+  "name": "ail-wasm-parity-spike",
+  "main": "worker.js",
+  "compatibility_date": "2025-08-01",
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }
+  ]
+}

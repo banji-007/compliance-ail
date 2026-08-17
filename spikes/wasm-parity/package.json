@@ -1,0 +1,17 @@
+{
+  "name": "wasm-parity",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@open-policy-agent/opa-wasm": "^1.10.0",
+    "wrangler": "^4.123.0"
+  }
+}

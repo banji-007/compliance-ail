@@ -1,0 +1,1 @@
+{"tool_name":"provision_cloud_server","tool_args":{"instance_type":"t3.micro","region":"ap-southeast-1","tags":{"environment":"prod","data_classification":"internal","encryption_at_rest":"true","cost_center":"rnd","project":"webapp"}}}

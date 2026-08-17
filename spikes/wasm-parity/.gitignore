@@ -1,0 +1,12 @@
+# Regenerable / large — not part of the spike's evidentiary record.
+# See SPIKE.md and docs/reports/spike-wasm-parity.md for how to reproduce.
+node_modules/
+tools/
+build/
+build2/
+build3/
+build_embed/
+build_probe/
+build_eval/
+worker/.wrangler/
+worker/policy.wasm

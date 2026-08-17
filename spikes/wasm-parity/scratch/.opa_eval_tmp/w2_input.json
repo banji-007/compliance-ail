@@ -1,0 +1,1 @@
+{"bundle_name":"ail-policies","tool_name":"provision_cloud_server","tool_args":{"instance_type":"t3.micro","region":"us-east-1","tags":{"environment":"dev","data_classification":"internal","cost_center":"engineering","project":"webapp"}}}

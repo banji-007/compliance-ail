@@ -1,0 +1,415 @@
+{
+  "data_variants": {
+    "default": {},
+    "tenant_custom": {
+      "ail": {
+        "config": {
+          "approved_regions": ["ap-southeast-1"],
+          "approved_purposes": ["research"],
+          "allowed_cost_centers": ["rnd"]
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "PCS-01",
+      "rule": "approval",
+      "description": "provision_cloud_server, fully compliant non-prod, default data",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "internal", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "PCS-02",
+      "rule": "approval-prod",
+      "description": "provision_cloud_server, fully compliant prod, default data",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "prod", "data_classification": "internal", "cost_center": "engineering", "encryption_at_rest": "true", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "GDPR-01-deny",
+      "rule": "gdpr.deny[0] pci-dss unapproved region",
+      "description": "pci-dss workload in unapproved region",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "ap-south-1",
+        "tags": {"environment": "dev", "data_classification": "pci-dss", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "GDPR-01-boundary-allow",
+      "rule": "gdpr.deny[0] boundary: approved region",
+      "description": "pci-dss workload in default-approved region (eu-central-1)",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "eu-central-1",
+        "tags": {"environment": "dev", "data_classification": "pci-dss", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "GDPR-02-deny-missing-classification",
+      "rule": "gdpr.deny[1] unclassified (missing key) unapproved region",
+      "description": "data_classification tag entirely absent, unapproved region",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "ap-south-1",
+        "tags": {"environment": "dev", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "GDPR-02-deny-unspecified",
+      "rule": "gdpr.deny[1] unclassified (explicit 'unspecified') unapproved region",
+      "description": "data_classification explicitly 'unspecified', unapproved region",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "ap-south-1",
+        "tags": {"environment": "dev", "data_classification": "unspecified", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "GDPR-02-boundary-allow",
+      "rule": "gdpr.deny[1] boundary: unclassified in approved region",
+      "description": "data_classification unspecified but region is approved",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "unspecified", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "HIPAA-01-deny",
+      "rule": "hipaa.deny[0] phi without isolated_instance",
+      "description": "phi workload, isolated_instance explicitly false, encryption ok",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "phi", "isolated_instance": "false", "encryption_at_rest": "true", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "HIPAA-01-deny-missing-key",
+      "rule": "hipaa.deny[0] phi, isolated_instance key entirely absent",
+      "description": "phi workload, isolated_instance tag missing entirely",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "phi", "encryption_at_rest": "true", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "HIPAA-02-deny",
+      "rule": "hipaa.deny[1] phi without encryption_at_rest",
+      "description": "phi workload, isolated ok, encryption_at_rest explicitly false",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "phi", "isolated_instance": "true", "encryption_at_rest": "false", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "HIPAA-01-02-combined",
+      "rule": "hipaa.deny[0] AND hipaa.deny[1] simultaneously",
+      "description": "phi workload with no isolated_instance and no encryption_at_rest tags at all - two independent deny messages",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "phi", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "HIPAA-03-deny",
+      "rule": "hipaa.deny[2] hipaa_scope true without data_classification",
+      "description": "hipaa_scope flagged true, data_classification tag absent",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "hipaa_scope": "true", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "HIPAA-03-boundary-allow",
+      "rule": "hipaa.deny[2] boundary: hipaa_scope true WITH data_classification set",
+      "description": "hipaa_scope true but data_classification present (non-phi) - rule 3 should not fire",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "hipaa_scope": "true", "data_classification": "internal", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "SOC2-01-deny",
+      "rule": "soc2.deny[0] prod without encryption_at_rest",
+      "description": "prod environment, encryption_at_rest missing entirely",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "prod", "data_classification": "internal", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "SOC2-01-boundary-case-sensitivity",
+      "rule": "soc2.deny[0] boundary: encryption_at_rest wrong case string",
+      "description": "encryption_at_rest is 'TRUE' (wrong case) - exact string match required, must still deny",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "prod", "data_classification": "internal", "encryption_at_rest": "TRUE", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "SOC2-02-deny-users",
+      "rule": "soc2.deny[1] sensitive table (contains 'users') unmasked",
+      "description": "query on users table, masking_enabled missing",
+      "data_variant": "default",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "users_accounts", "processing_purpose": "billing"
+      }}
+    },
+    {
+      "id": "SOC2-02-deny-pii",
+      "rule": "soc2.deny[1] sensitive table (contains 'pii') unmasked, explicit false",
+      "description": "query on pii table, masking_enabled explicitly false, approved purpose (isolates from GDPR)",
+      "data_variant": "default",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "sensitive_pii_data", "processing_purpose": "billing", "masking_enabled": false
+      }}
+    },
+    {
+      "id": "SOC2-02-boundary-allow",
+      "rule": "soc2.deny[1] boundary: masking_enabled true",
+      "description": "query on pii table with masking enabled and approved purpose - full allow",
+      "data_variant": "default",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "customer_pii", "processing_purpose": "billing", "masking_enabled": true
+      }}
+    },
+    {
+      "id": "GDPR-SOC2-combined-query",
+      "rule": "gdpr query rule AND soc2.deny[1] simultaneously",
+      "description": "pii table, unapproved purpose, unmasked - two independent deny messages",
+      "data_variant": "default",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "customer_pii", "processing_purpose": "sales_ops", "masking_enabled": false
+      }}
+    },
+    {
+      "id": "GDPR-query-deny",
+      "rule": "gdpr query rule: pii table unauthorized purpose",
+      "description": "pii table, unapproved purpose, but masked (isolates GDPR from SOC2)",
+      "data_variant": "default",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "customer_pii", "processing_purpose": "marketing_campaign", "masking_enabled": true
+      }}
+    },
+    {
+      "id": "query-approval",
+      "rule": "approval",
+      "description": "non-sensitive table, no purpose/masking constraints apply",
+      "data_variant": "default",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "product_catalog", "processing_purpose": "analytics", "masking_enabled": false
+      }}
+    },
+    {
+      "id": "SOC2-03-deny",
+      "rule": "soc2.deny[2] production deploy without approval ticket",
+      "description": "deploy to production, approval_ticket empty string",
+      "data_variant": "default",
+      "input": {"tool_name": "deploy_to_production", "tool_args": {
+        "environment": "production", "approval_ticket": "", "bypass_ci": false, "repository_name": "backend-api"
+      }}
+    },
+    {
+      "id": "SOC2-04-deny",
+      "rule": "soc2.deny[3] bypass_ci true",
+      "description": "deploy with bypass_ci true, otherwise compliant",
+      "data_variant": "default",
+      "input": {"tool_name": "deploy_to_production", "tool_args": {
+        "environment": "production", "approval_ticket": "JIRA-123", "bypass_ci": true, "repository_name": "backend-api"
+      }}
+    },
+    {
+      "id": "SOC2-04-boundary-non-production-env",
+      "rule": "soc2.deny[3] boundary: bypass_ci has no environment guard",
+      "description": "bypass_ci true in a non-production environment - rule 4 has no environment condition, must still deny",
+      "data_variant": "default",
+      "input": {"tool_name": "deploy_to_production", "tool_args": {
+        "environment": "staging", "approval_ticket": "JIRA-123", "bypass_ci": true, "repository_name": "backend-api"
+      }}
+    },
+    {
+      "id": "FINOPS-03-deny",
+      "rule": "finops.deny[2] experimental repo to production",
+      "description": "production deploy, repository_name contains 'experimental'",
+      "data_variant": "default",
+      "input": {"tool_name": "deploy_to_production", "tool_args": {
+        "environment": "production", "approval_ticket": "JIRA-123", "bypass_ci": false, "repository_name": "experimental-ml-pipeline"
+      }}
+    },
+    {
+      "id": "FINOPS-03-boundary-non-production",
+      "rule": "finops.deny[2] boundary: experimental repo but non-production environment",
+      "description": "experimental repo name but environment is staging - finops rule requires environment == production",
+      "data_variant": "default",
+      "input": {"tool_name": "deploy_to_production", "tool_args": {
+        "environment": "staging", "approval_ticket": "JIRA-123", "bypass_ci": false, "repository_name": "experimental-ml-pipeline"
+      }}
+    },
+    {
+      "id": "SOC2-SOC2-FINOPS-combined-deploy",
+      "rule": "soc2.deny[2] AND soc2.deny[3] AND finops.deny[2] simultaneously",
+      "description": "production deploy, no ticket, bypass_ci true, experimental repo - three independent deny messages",
+      "data_variant": "default",
+      "input": {"tool_name": "deploy_to_production", "tool_args": {
+        "environment": "production", "approval_ticket": "", "bypass_ci": true, "repository_name": "experimental-thing"
+      }}
+    },
+    {
+      "id": "deploy-approval",
+      "rule": "approval",
+      "description": "fully compliant production deploy",
+      "data_variant": "default",
+      "input": {"tool_name": "deploy_to_production", "tool_args": {
+        "environment": "production", "approval_ticket": "JIRA-999", "bypass_ci": false, "repository_name": "backend-api"
+      }}
+    },
+    {
+      "id": "FINOPS-01-deny",
+      "rule": "finops.deny[0] prod without valid cost_center",
+      "description": "prod, encryption ok, cost_center not in approved set",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "prod", "data_classification": "internal", "encryption_at_rest": "true", "cost_center": "sales", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "FINOPS-01-boundary-allow",
+      "rule": "finops.deny[0] boundary: approved cost center",
+      "description": "prod, cost_center is 'marketing' (in default approved set)",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "prod", "data_classification": "internal", "encryption_at_rest": "true", "cost_center": "marketing", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "FINOPS-02-deny",
+      "rule": "finops.deny[1] restricted instance type without ml-training project",
+      "description": "p4d.24xlarge instance, project tag is 'other'",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "p4d.24xlarge", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "internal", "cost_center": "engineering", "project": "other"}
+      }}
+    },
+    {
+      "id": "FINOPS-02-deny-missing-project",
+      "rule": "finops.deny[1] restricted instance, project tag entirely absent",
+      "description": "p5.48xlarge instance, project tag missing entirely",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "p5.48xlarge", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "internal", "cost_center": "engineering"}
+      }}
+    },
+    {
+      "id": "FINOPS-02-boundary-allow",
+      "rule": "finops.deny[1] boundary: ml-training project tag present",
+      "description": "p4d.24xlarge instance with project=ml-training - rule should not fire",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "p4d.24xlarge", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "internal", "cost_center": "engineering", "project": "ml-training"}
+      }}
+    },
+    {
+      "id": "MULTI-DENY-provision",
+      "rule": "gdpr.deny[0] AND soc2.deny[0] AND finops.deny[0] AND finops.deny[1] simultaneously",
+      "description": "prod + pci-dss + unapproved region + no encryption + bad cost_center + restricted instance without ml-training tag - four independent deny messages",
+      "data_variant": "default",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "p4d.24xlarge", "region": "ap-south-1",
+        "tags": {"environment": "prod", "data_classification": "pci-dss", "cost_center": "sales", "project": "other"}
+      }}
+    },
+    {
+      "id": "EDGE-unknown-tool",
+      "rule": "no pack matches tool_name",
+      "description": "tool_name not recognized by any pack rule - all rules evaluate to undefined at the tool_name check, so deny set is empty and allow is true at the Rego layer (fail-closed for unknown tools is enforced in the Python schema layer, not in Rego)",
+      "data_variant": "default",
+      "input": {"tool_name": "delete_all_backups", "tool_args": {"confirm": true}}
+    },
+    {
+      "id": "EDGE-empty-input",
+      "rule": "no tool_name at all",
+      "description": "completely empty input object",
+      "data_variant": "default",
+      "input": {}
+    },
+    {
+      "id": "TENANT-GDPR-01-deny-default-region-now-unapproved",
+      "rule": "gdpr.deny[0] under tenant_custom data: default-approved region no longer approved",
+      "description": "pci-dss workload in us-east-1, which is approved under the hardcoded default but NOT in the tenant's custom approved_regions",
+      "data_variant": "tenant_custom",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "us-east-1",
+        "tags": {"environment": "dev", "data_classification": "pci-dss", "cost_center": "rnd", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "TENANT-GDPR-01-boundary-allow",
+      "rule": "gdpr.deny[0] under tenant_custom data: custom region approved",
+      "description": "pci-dss workload in ap-southeast-1, which is the tenant's custom approved region",
+      "data_variant": "tenant_custom",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "ap-southeast-1",
+        "tags": {"environment": "dev", "data_classification": "pci-dss", "cost_center": "rnd", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "TENANT-GDPR-query-deny-default-purpose-now-unapproved",
+      "rule": "gdpr query rule under tenant_custom data: default-approved purpose no longer approved",
+      "description": "pii table query with purpose 'billing', approved by default but not by tenant's custom approved_purposes",
+      "data_variant": "tenant_custom",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "customer_pii", "processing_purpose": "billing", "masking_enabled": true
+      }}
+    },
+    {
+      "id": "TENANT-GDPR-query-boundary-allow",
+      "rule": "gdpr query rule under tenant_custom data: custom purpose approved",
+      "description": "pii table query with purpose 'research', the tenant's custom approved purpose",
+      "data_variant": "tenant_custom",
+      "input": {"tool_name": "query_database", "tool_args": {
+        "target_table": "customer_pii", "processing_purpose": "research", "masking_enabled": true
+      }}
+    },
+    {
+      "id": "TENANT-FINOPS-01-deny-default-cost-center-now-unapproved",
+      "rule": "finops.deny[0] under tenant_custom data: default-approved cost center no longer approved",
+      "description": "prod workload with cost_center 'engineering', approved by default but not by tenant's custom allowed_cost_centers",
+      "data_variant": "tenant_custom",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "ap-southeast-1",
+        "tags": {"environment": "prod", "data_classification": "internal", "encryption_at_rest": "true", "cost_center": "engineering", "project": "webapp"}
+      }}
+    },
+    {
+      "id": "TENANT-FINOPS-01-boundary-allow",
+      "rule": "finops.deny[0] under tenant_custom data: custom cost center approved",
+      "description": "prod workload with cost_center 'rnd', the tenant's custom approved cost center",
+      "data_variant": "tenant_custom",
+      "input": {"tool_name": "provision_cloud_server", "tool_args": {
+        "instance_type": "t3.micro", "region": "ap-southeast-1",
+        "tags": {"environment": "prod", "data_classification": "internal", "encryption_at_rest": "true", "cost_center": "rnd", "project": "webapp"}
+      }}
+    }
+  ]
+}
