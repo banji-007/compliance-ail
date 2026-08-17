@@ -1,0 +1,42 @@
+| PCS-01 | approval | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| PCS-02 | approval-prod | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| GDPR-01-deny | gdpr.deny[0] pci-dss unapproved region | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| GDPR-01-boundary-allow | gdpr.deny[0] boundary: approved region | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| GDPR-02-deny-missing-classification | gdpr.deny[1] unclassified (missing key) unapproved region | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| GDPR-02-deny-unspecified | gdpr.deny[1] unclassified (explicit 'unspecified') unapproved region | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| GDPR-02-boundary-allow | gdpr.deny[1] boundary: unclassified in approved region | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| HIPAA-01-deny | hipaa.deny[0] phi without isolated_instance | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| HIPAA-01-deny-missing-key | hipaa.deny[0] phi, isolated_instance key entirely absent | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| HIPAA-02-deny | hipaa.deny[1] phi without encryption_at_rest | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| HIPAA-01-02-combined | hipaa.deny[0] AND hipaa.deny[1] simultaneously | DENY (2 reasons) | DENY (2 reasons) | MATCH |
+| HIPAA-03-deny | hipaa.deny[2] hipaa_scope true without data_classification | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| HIPAA-03-boundary-allow | hipaa.deny[2] boundary: hipaa_scope true WITH data_classification set | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| SOC2-01-deny | soc2.deny[0] prod without encryption_at_rest | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| SOC2-01-boundary-case-sensitivity | soc2.deny[0] boundary: encryption_at_rest wrong case string | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| SOC2-02-deny-users | soc2.deny[1] sensitive table (contains 'users') unmasked | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| SOC2-02-deny-pii | soc2.deny[1] sensitive table (contains 'pii') unmasked, explicit false | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| SOC2-02-boundary-allow | soc2.deny[1] boundary: masking_enabled true | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| GDPR-SOC2-combined-query | gdpr query rule AND soc2.deny[1] simultaneously | DENY (2 reasons) | DENY (2 reasons) | DIFFER (message text) |
+| GDPR-query-deny | gdpr query rule: pii table unauthorized purpose | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| query-approval | approval | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| SOC2-03-deny | soc2.deny[2] production deploy without approval ticket | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| SOC2-04-deny | soc2.deny[3] bypass_ci true | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| SOC2-04-boundary-non-production-env | soc2.deny[3] boundary: bypass_ci has no environment guard | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| FINOPS-03-deny | finops.deny[2] experimental repo to production | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| FINOPS-03-boundary-non-production | finops.deny[2] boundary: experimental repo but non-production environment | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| SOC2-SOC2-FINOPS-combined-deploy | soc2.deny[2] AND soc2.deny[3] AND finops.deny[2] simultaneously | DENY (3 reasons) | DENY (3 reasons) | MATCH |
+| deploy-approval | approval | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| FINOPS-01-deny | finops.deny[0] prod without valid cost_center | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| FINOPS-01-boundary-allow | finops.deny[0] boundary: approved cost center | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| FINOPS-02-deny | finops.deny[1] restricted instance type without ml-training project | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| FINOPS-02-deny-missing-project | finops.deny[1] restricted instance, project tag entirely absent | DENY (1 reasons) | DENY (1 reasons) | MATCH |
+| FINOPS-02-boundary-allow | finops.deny[1] boundary: ml-training project tag present | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| MULTI-DENY-provision | gdpr.deny[0] AND soc2.deny[0] AND finops.deny[0] AND finops.deny[1] simultaneously | DENY (4 reasons) | DENY (4 reasons) | DIFFER (message text) |
+| EDGE-unknown-tool | no pack matches tool_name | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| EDGE-empty-input | no tool_name at all | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| TENANT-GDPR-01-deny-default-region-now-unapproved | gdpr.deny[0] under tenant_custom data: default-approved region no longer approved | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| TENANT-GDPR-01-boundary-allow | gdpr.deny[0] under tenant_custom data: custom region approved | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| TENANT-GDPR-query-deny-default-purpose-now-unapproved | gdpr query rule under tenant_custom data: default-approved purpose no longer approved | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| TENANT-GDPR-query-boundary-allow | gdpr query rule under tenant_custom data: custom purpose approved | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |
+| TENANT-FINOPS-01-deny-default-cost-center-now-unapproved | finops.deny[0] under tenant_custom data: default-approved cost center no longer approved | DENY (1 reasons) | DENY (1 reasons) | DIFFER (message text) |
+| TENANT-FINOPS-01-boundary-allow | finops.deny[0] under tenant_custom data: custom cost center approved | ALLOW (0 reasons) | ALLOW (0 reasons) | MATCH |

@@ -1,0 +1,834 @@
+[
+  {
+    "id": "PCS-01",
+    "rule": "approval",
+    "description": "provision_cloud_server, fully compliant non-prod, default data",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "PCS-02",
+    "rule": "approval-prod",
+    "description": "provision_cloud_server, fully compliant prod, default data",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "GDPR-01-deny",
+    "rule": "gdpr.deny[0] pci-dss unapproved region",
+    "description": "pci-dss workload in unapproved region",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: {\"eu-central-1\", \"us-east-1\"}"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: eu-central-1,us-east-1"
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "GDPR-01-boundary-allow",
+    "rule": "gdpr.deny[0] boundary: approved region",
+    "description": "pci-dss workload in default-approved region (eu-central-1)",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "GDPR-02-deny-missing-classification",
+    "rule": "gdpr.deny[1] unclassified (missing key) unapproved region",
+    "description": "data_classification tag entirely absent, unapproved region",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. Unclassified data defaults to highly sensitive and must run in an approved region. Approved: {\"eu-central-1\", \"us-east-1\"}"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. Unclassified data defaults to highly sensitive and must run in an approved region. Approved: eu-central-1,us-east-1"
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "GDPR-02-deny-unspecified",
+    "rule": "gdpr.deny[1] unclassified (explicit 'unspecified') unapproved region",
+    "description": "data_classification explicitly 'unspecified', unapproved region",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. Unclassified data defaults to highly sensitive and must run in an approved region. Approved: {\"eu-central-1\", \"us-east-1\"}"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. Unclassified data defaults to highly sensitive and must run in an approved region. Approved: eu-central-1,us-east-1"
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "GDPR-02-boundary-allow",
+    "rule": "gdpr.deny[1] boundary: unclassified in approved region",
+    "description": "data_classification unspecified but region is approved",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "HIPAA-01-deny",
+    "rule": "hipaa.deny[0] phi without isolated_instance",
+    "description": "phi workload, isolated_instance explicitly false, encryption ok",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'isolated_instance' set to 'true' (dedicated tenancy required)."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'isolated_instance' set to 'true' (dedicated tenancy required)."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "HIPAA-01-deny-missing-key",
+    "rule": "hipaa.deny[0] phi, isolated_instance key entirely absent",
+    "description": "phi workload, isolated_instance tag missing entirely",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'isolated_instance' set to 'true' (dedicated tenancy required)."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'isolated_instance' set to 'true' (dedicated tenancy required)."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "HIPAA-02-deny",
+    "rule": "hipaa.deny[1] phi without encryption_at_rest",
+    "description": "phi workload, isolated ok, encryption_at_rest explicitly false",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "HIPAA-01-02-combined",
+    "rule": "hipaa.deny[0] AND hipaa.deny[1] simultaneously",
+    "description": "phi workload with no isolated_instance and no encryption_at_rest tags at all - two independent deny messages",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'encryption_at_rest' set to 'true'.",
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'isolated_instance' set to 'true' (dedicated tenancy required)."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'encryption_at_rest' set to 'true'.",
+        "DENIED: HIPAA Violation. PHI-classified workloads must have 'isolated_instance' set to 'true' (dedicated tenancy required)."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "HIPAA-03-deny",
+    "rule": "hipaa.deny[2] hipaa_scope true without data_classification",
+    "description": "hipaa_scope flagged true, data_classification tag absent",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. HIPAA-scoped workloads must carry an explicit 'data_classification' tag."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: HIPAA Violation. HIPAA-scoped workloads must carry an explicit 'data_classification' tag."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "HIPAA-03-boundary-allow",
+    "rule": "hipaa.deny[2] boundary: hipaa_scope true WITH data_classification set",
+    "description": "hipaa_scope true but data_classification present (non-phi) - rule 3 should not fire",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-01-deny",
+    "rule": "soc2.deny[0] prod without encryption_at_rest",
+    "description": "prod environment, encryption_at_rest missing entirely",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Production environments must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Production environments must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-01-boundary-case-sensitivity",
+    "rule": "soc2.deny[0] boundary: encryption_at_rest wrong case string",
+    "description": "encryption_at_rest is 'TRUE' (wrong case) - exact string match required, must still deny",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Production environments must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Production environments must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-02-deny-users",
+    "rule": "soc2.deny[1] sensitive table (contains 'users') unmasked",
+    "description": "query on users table, masking_enabled missing",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Unmasked queries on PII tables are prohibited. Table: 'users_accounts'"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Unmasked queries on PII tables are prohibited. Table: 'users_accounts'"
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-02-deny-pii",
+    "rule": "soc2.deny[1] sensitive table (contains 'pii') unmasked, explicit false",
+    "description": "query on pii table, masking_enabled explicitly false, approved purpose (isolates from GDPR)",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Unmasked queries on PII tables are prohibited. Table: 'sensitive_pii_data'"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: SOC2 Violation. Unmasked queries on PII tables are prohibited. Table: 'sensitive_pii_data'"
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-02-boundary-allow",
+    "rule": "soc2.deny[1] boundary: masking_enabled true",
+    "description": "query on pii table with masking enabled and approved purpose - full allow",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "GDPR-SOC2-combined-query",
+    "rule": "gdpr query rule AND soc2.deny[1] simultaneously",
+    "description": "pii table, unapproved purpose, unmasked - two independent deny messages",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Violation. Unauthorized processing purpose 'sales_ops' for PII table. Approved purposes: {\"billing\", \"customer_support\"}",
+        "DENIED: SOC2 Violation. Unmasked queries on PII tables are prohibited. Table: 'customer_pii'"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Violation. Unauthorized processing purpose 'sales_ops' for PII table. Approved purposes: customer_support,billing",
+        "DENIED: SOC2 Violation. Unmasked queries on PII tables are prohibited. Table: 'customer_pii'"
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "GDPR-query-deny",
+    "rule": "gdpr query rule: pii table unauthorized purpose",
+    "description": "pii table, unapproved purpose, but masked (isolates GDPR from SOC2)",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Violation. Unauthorized processing purpose 'marketing_campaign' for PII table. Approved purposes: {\"billing\", \"customer_support\"}"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Violation. Unauthorized processing purpose 'marketing_campaign' for PII table. Approved purposes: customer_support,billing"
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "query-approval",
+    "rule": "approval",
+    "description": "non-sensitive table, no purpose/masking constraints apply",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-03-deny",
+    "rule": "soc2.deny[2] production deploy without approval ticket",
+    "description": "deploy to production, approval_ticket empty string",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "SOC2 CC8.1 Violation: Production deployments require a valid approval ticket reference."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "SOC2 CC8.1 Violation: Production deployments require a valid approval ticket reference."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-04-deny",
+    "rule": "soc2.deny[3] bypass_ci true",
+    "description": "deploy with bypass_ci true, otherwise compliant",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-04-boundary-non-production-env",
+    "rule": "soc2.deny[3] boundary: bypass_ci has no environment guard",
+    "description": "bypass_ci true in a non-production environment - rule 4 has no environment condition, must still deny",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "FINOPS-03-deny",
+    "rule": "finops.deny[2] experimental repo to production",
+    "description": "production deploy, repository_name contains 'experimental'",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "FinOps Violation: Experimental repositories are not authorized for production deployment."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "FinOps Violation: Experimental repositories are not authorized for production deployment."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "FINOPS-03-boundary-non-production",
+    "rule": "finops.deny[2] boundary: experimental repo but non-production environment",
+    "description": "experimental repo name but environment is staging - finops rule requires environment == production",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "SOC2-SOC2-FINOPS-combined-deploy",
+    "rule": "soc2.deny[2] AND soc2.deny[3] AND finops.deny[2] simultaneously",
+    "description": "production deploy, no ticket, bypass_ci true, experimental repo - three independent deny messages",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "FinOps Violation: Experimental repositories are not authorized for production deployment.",
+        "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited.",
+        "SOC2 CC8.1 Violation: Production deployments require a valid approval ticket reference."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "FinOps Violation: Experimental repositories are not authorized for production deployment.",
+        "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited.",
+        "SOC2 CC8.1 Violation: Production deployments require a valid approval ticket reference."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "deploy-approval",
+    "rule": "approval",
+    "description": "fully compliant production deploy",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "FINOPS-01-deny",
+    "rule": "finops.deny[0] prod without valid cost_center",
+    "description": "prod, encryption ok, cost_center not in approved set",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: {\"engineering\", \"finance\", \"marketing\", \"operations\"}."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: finance,engineering,marketing,operations."
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "FINOPS-01-boundary-allow",
+    "rule": "finops.deny[0] boundary: approved cost center",
+    "description": "prod, cost_center is 'marketing' (in default approved set)",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "FINOPS-02-deny",
+    "rule": "finops.deny[1] restricted instance type without ml-training project",
+    "description": "p4d.24xlarge instance, project tag is 'other'",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Instance type p4d.24xlarge is restricted. 'project' tag must be 'ml-training'."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Instance type p4d.24xlarge is restricted. 'project' tag must be 'ml-training'."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "FINOPS-02-deny-missing-project",
+    "rule": "finops.deny[1] restricted instance, project tag entirely absent",
+    "description": "p5.48xlarge instance, project tag missing entirely",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Instance type p5.48xlarge is restricted. 'project' tag must be 'ml-training'."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Instance type p5.48xlarge is restricted. 'project' tag must be 'ml-training'."
+      ],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "FINOPS-02-boundary-allow",
+    "rule": "finops.deny[1] boundary: ml-training project tag present",
+    "description": "p4d.24xlarge instance with project=ml-training - rule should not fire",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "MULTI-DENY-provision",
+    "rule": "gdpr.deny[0] AND soc2.deny[0] AND finops.deny[0] AND finops.deny[1] simultaneously",
+    "description": "prod + pci-dss + unapproved region + no encryption + bad cost_center + restricted instance without ml-training tag - four independent deny messages",
+    "data_variant": "default",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: {\"eu-central-1\", \"us-east-1\"}",
+        "DENIED: Instance type p4d.24xlarge is restricted. 'project' tag must be 'ml-training'.",
+        "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: {\"engineering\", \"finance\", \"marketing\", \"operations\"}.",
+        "DENIED: SOC2 Violation. Production environments must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: eu-central-1,us-east-1",
+        "DENIED: Instance type p4d.24xlarge is restricted. 'project' tag must be 'ml-training'.",
+        "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: finance,engineering,marketing,operations.",
+        "DENIED: SOC2 Violation. Production environments must have 'encryption_at_rest' set to 'true'."
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "EDGE-unknown-tool",
+    "rule": "no pack matches tool_name",
+    "description": "tool_name not recognized by any pack rule - all rules evaluate to undefined at the tool_name check, so deny set is empty and allow is true at the Rego layer (fail-closed for unknown tools is enforced in the Python schema layer, not in Rego)",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "EDGE-empty-input",
+    "rule": "no tool_name at all",
+    "description": "completely empty input object",
+    "data_variant": "default",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "TENANT-GDPR-01-deny-default-region-now-unapproved",
+    "rule": "gdpr.deny[0] under tenant_custom data: default-approved region no longer approved",
+    "description": "pci-dss workload in us-east-1, which is approved under the hardcoded default but NOT in the tenant's custom approved_regions",
+    "data_variant": "tenant_custom",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: {\"ap-southeast-1\"}"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: ap-southeast-1"
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "TENANT-GDPR-01-boundary-allow",
+    "rule": "gdpr.deny[0] under tenant_custom data: custom region approved",
+    "description": "pci-dss workload in ap-southeast-1, which is the tenant's custom approved region",
+    "data_variant": "tenant_custom",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "TENANT-GDPR-query-deny-default-purpose-now-unapproved",
+    "rule": "gdpr query rule under tenant_custom data: default-approved purpose no longer approved",
+    "description": "pii table query with purpose 'billing', approved by default but not by tenant's custom approved_purposes",
+    "data_variant": "tenant_custom",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Violation. Unauthorized processing purpose 'billing' for PII table. Approved purposes: {\"research\"}"
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: GDPR Violation. Unauthorized processing purpose 'billing' for PII table. Approved purposes: research"
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "TENANT-GDPR-query-boundary-allow",
+    "rule": "gdpr query rule under tenant_custom data: custom purpose approved",
+    "description": "pii table query with purpose 'research', the tenant's custom approved purpose",
+    "data_variant": "tenant_custom",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  },
+  {
+    "id": "TENANT-FINOPS-01-deny-default-cost-center-now-unapproved",
+    "rule": "finops.deny[0] under tenant_custom data: default-approved cost center no longer approved",
+    "description": "prod workload with cost_center 'engineering', approved by default but not by tenant's custom allowed_cost_centers",
+    "data_variant": "tenant_custom",
+    "opa": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: {\"rnd\"}."
+      ],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": false,
+      "violations": [
+        "DENIED: Production environments must include a valid 'cost_center' tag. Approved values: rnd."
+      ],
+      "undefined": false
+    },
+    "match": false
+  },
+  {
+    "id": "TENANT-FINOPS-01-boundary-allow",
+    "rule": "finops.deny[0] under tenant_custom data: custom cost center approved",
+    "description": "prod workload with cost_center 'rnd', the tenant's custom approved cost center",
+    "data_variant": "tenant_custom",
+    "opa": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "wasm": {
+      "compliant": true,
+      "violations": [],
+      "undefined": false
+    },
+    "match": true
+  }
+]
