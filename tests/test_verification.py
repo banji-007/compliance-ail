@@ -391,3 +391,55 @@ def test_control_plane_maps_not_found_state_not_failed():
     tamper_vdata = {"verified": False, "detail": "proof failed", "error_class": "consistency_failure"}
     tamper_verification = control_plane_main._verification_from_200(tamper_vdata)
     assert tamper_verification["state"] == "failed", f"Expected state 'failed', got: {tamper_verification}"
+
+
+# ---------------------------------------------------------------------------
+# D10 (Phase 1.2): failed requires positive identification, not a default
+# ---------------------------------------------------------------------------
+
+def test_control_plane_maps_unknown_error_class_to_unverifiable_not_failed():
+    """
+    Criterion (P12-2): a verifier error_class the control plane cannot
+    positively identify as tamper evidence must not be promoted to
+    "failed". Red-team T1: verifier/main.py's own error_class="unknown"
+    fallback (its blanket except branches) used to fall through to
+    "failed" by default - so a change in the ImmuDB server's message
+    wording alone (no source diff, no build to fail) turned a never-written
+    key into the tamper-alarm state. "unverifiable" carries the same
+    detail; nothing is lost, only mis-escalated.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "control_plane"))
+    import main as control_plane_main  # noqa: E402
+
+    unknown_vdata = {
+        "verified": False,
+        "detail": "<_InactiveRpcError ... status = StatusCode.UNKNOWN, "
+                   "details = \"tbtree: key absent from tree\">",
+        "error_class": "unknown",
+    }
+    verification = control_plane_main._verification_from_200(unknown_vdata)
+    assert verification["state"] == "unverifiable", f"Expected 'unverifiable', got: {verification}"
+    assert verification["detail"] == unknown_vdata["detail"], "detail must be preserved, not dropped"
+    assert verification["error_class"] == "unknown"
+
+    # A never-before-seen error_class must default the same way "unknown"
+    # does - the closed set for "failed" is exactly {consistency_failure,
+    # signature_failure}, not "not_found" or "everything else".
+    novel_vdata = {"verified": False, "detail": "a future SDK error", "error_class": "some_future_error_class"}
+    novel_verification = control_plane_main._verification_from_200(novel_vdata)
+    assert novel_verification["state"] == "unverifiable", f"Expected 'unverifiable', got: {novel_verification}"
+
+
+def test_control_plane_maps_both_tamper_classes_to_failed():
+    """
+    D10 narrows the default; it does not touch the two positively-
+    identified tamper conditions. Both must still map to "failed".
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "control_plane"))
+    import main as control_plane_main  # noqa: E402
+
+    for error_class in ("consistency_failure", "signature_failure"):
+        vdata = {"verified": False, "detail": f"{error_class} detail", "error_class": error_class}
+        verification = control_plane_main._verification_from_200(vdata)
+        assert verification["state"] == "failed", f"Expected 'failed' for {error_class}, got: {verification}"
+        assert verification["error_class"] == error_class

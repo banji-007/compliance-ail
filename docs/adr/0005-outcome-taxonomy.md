@@ -60,6 +60,7 @@ which follows the same pattern D2 uses for verification:
 
 ```json
 {
+  "record_type": "decision",
   "agent_id": "...", "timestamp": "...", "tool_name": "...",
   "call_id": "<uuid4 hex, minted at intercept>",
   "input_sha256": "...",
@@ -70,6 +71,53 @@ which follows the same pattern D2 uses for verification:
   "content_state": "present"
 }
 ```
+
+### `record_type` and erasure as a recorded event (D11, Phase 1.2)
+
+Every ledger record now carries an explicit `record_type`: `"decision"` for
+the shape above, or `"content_erasure"` for the tombstone `DELETE
+/content/{call_id}` writes directly (via the same verifier the interceptor
+uses, `control_plane/main.py::_write_tombstone`) before it deletes a
+content-store row:
+
+```json
+{
+  "record_type": "content_erasure",
+  "call_id": "<the call_id whose content-store row was deleted>",
+  "timestamp": "...",
+  "actor": "control-plane-write-key"
+}
+```
+
+A tombstone carries no personal data - just enough to prove an erasure
+happened, when, and under which authorization boundary. It is written
+*before* the row is deleted, not after: if the tombstone write fails, the
+erasure is refused and the row survives - the same fail-closed ordering D7
+already established for content-before-ledger. `record_type` exists so a
+consumer scanning a broader key range discriminates on this field, not on
+key shape (`control_plane/main.py::get_audit`'s own content_erasure: scan
+still checks the field, not just the prefix, before trusting an entry as a
+tombstone). A tombstone is never rendered as a decision in `/audit` and is
+never counted in `ail_policy_decisions_total` - it is written entirely
+inside the control plane, a different process from the interceptor that
+owns that metric.
+
+Read-time inference of the erasable payload's own state (`payload_state`,
+computed by `control_plane/main.py::_payload_state`, same read-time
+pattern D2/D8 use for verification) is now four states, not three:
+
+| `payload_state` | Meaning |
+| :--- | :--- |
+| `present` | The content-store row still exists. |
+| `unavailable` | `content_state` was already `"unavailable"` at write time (nothing dict-shaped to store) - always wins over the other three. |
+| `erased` | `content_state` was `"present"`, the row is gone, and a `content_erasure` tombstone exists for this `call_id` - the real endpoint always writes one first. |
+| `lost` | `content_state` was `"present"`, the row is gone, and no tombstone exists - the row disappeared some other way (e.g. a direct SQL delete bypassing the endpoint). |
+
+Red-team T5 (`docs/reports/phase-1-1-redteam.md`) found `erased` and what
+is now `lost` rendering byte-for-byte identically - a GDPR Article 17
+request honored through the real endpoint was indistinguishable from an
+operational data-loss incident. `lost` exists specifically so those two
+are never conflated again.
 
 Metrics follow the same closed set (Phase 1, D3): `ail_policy_decisions_total`
 is labeled by `outcome_type` and `fault_class`, not by a substring of a Rego
@@ -132,5 +180,6 @@ written down.
 - `tests/test_outcome_types.py` - automated coverage of every type and fault class
 - `tests/test_response_contract.py` - the contract test this taxonomy's key set feeds
 - `tests/test_policy_response_shape.py` - `malformed_policy_response` (P11-3)
-- `tests/test_content_states.py` - `content_state`/`content_store_unreachable` (D7)
+- `tests/test_content_states.py` - `content_state`/`content_store_unreachable` (D7); `lost` vs `erased`, refused erasure on tombstone-write failure, and tombstone exclusion from the decision view/metric (D11, Phase 1.2)
 - `tests/test_raw_ledger_fields.py` - the raw-stored-value checks S1 #2/#4 named
+- `docs/reports/phase-1-1-redteam.md`, T5 - the erased/lost conflation D11 closes

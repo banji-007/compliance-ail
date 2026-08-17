@@ -47,23 +47,22 @@ _OPA_URL = os.getenv("OPA_URL", "https://localhost:8443/v1/data/ail/main/allow")
 # docs/reports/phase-0-redteam.md, C4, and docs/reports/phase-0-1.md, P01-3.
 _BUNDLE_NAME = os.getenv("AIL_BUNDLE_NAME", "ail-policies")
 
-# Revision of the bundle actually loaded by the OPA instance we just queried.
-# OPA publishes this itself once the Bundle API has activated a bundle, at
-# data.system.bundles.<name>.manifest.revision - no separate round trip to
-# the control plane, so there is no way for this to name a different tenant's
-# bundle than the one that produced the decision.
+# Used only for the startup readiness check below - is OPA's bundle plugin
+# done loading *some* bundle under this name yet. Per-call revision
+# attribution no longer reads this at all (Phase 1.2, D9): the `evaluation`
+# rule finds whichever loaded bundle's manifest claims the `ail` root, not
+# whatever name a caller (or this env var) supplies.
 _OPA_REVISION_URL = _OPA_URL.replace(
     "/v1/data/ail/main/allow", f"/v1/data/system/bundles/{_BUNDLE_NAME}/manifest/revision"
 )
 
 # Single combined query (Phase 1, P1-1): verdict, deny reasons, and bundle
 # revision in one round trip. See policy/core/main.rego's `evaluation` rule.
+# The revision is attributed by OPA itself, from whichever loaded bundle's
+# manifest claims the `ail` root (Phase 1.2, D9) - the request carries no
+# bundle name at all, so a caller cannot influence which bundle's revision
+# gets recorded.
 _OPA_EVAL_URL = _OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/ail/main/evaluation")
-
-# Full bundle map (Phase 1.1, P11-7): who OPA currently has loaded, used only
-# to check that exactly one bundle claims the `ail` root at startup - see
-# _check_bundle_root_ownership. Not used per-call.
-_OPA_BUNDLES_URL = _OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/system/bundles")
 
 # Closed set of outcome types (D1). Never inferred from message text anywhere
 # downstream - this is the only vocabulary that exists.
@@ -247,80 +246,6 @@ def _fetch_opa_bundle_revision(ssl_context) -> str | None:
         return None
 
 
-def _fetch_opa_bundles_map(ssl_context) -> dict | None:
-    """
-    Read back the full map of bundles OPA currently has loaded (P11-7).
-
-    The revision lookup in _fetch_opa_bundle_revision only proves that
-    _BUNDLE_NAME resolves to *some* loaded bundle - it says nothing about
-    whether a second bundle also claims the `ail` root and is contributing
-    deny rules that get attributed to the wrong revision (see
-    docs/reports/phase-1-redteam.md, S2). This checks that directly.
-
-    Returns None on any error or non-dict result. Callers must treat None as
-    the map being unobtainable, not as "no bundles loaded".
-    """
-    try:
-        with httpx.Client(verify=ssl_context) as client:
-            response = client.get(_OPA_BUNDLES_URL, timeout=5)
-        if response.status_code != 200:
-            return None
-        result = response.json().get("result")
-        return result if isinstance(result, dict) else None
-    except Exception as e:
-        logging.error(f"OPA bundles map query failed: {e}")
-        return None
-
-
-def _check_bundle_root_ownership(ssl_context) -> None:
-    """
-    Assert exactly one loaded bundle claims the `ail` root, and that its name
-    matches AIL_BUNDLE_NAME. Exits the process otherwise (P11-7) - this
-    extends verify_bundle_at_startup's existing check rather than adding a
-    second independent gate.
-    """
-    bundles = _fetch_opa_bundles_map(ssl_context)
-    if bundles is None:
-        logging.error(
-            "STARTUP FAILURE: could not read OPA's loaded bundle map (%s) to "
-            "verify root ownership of 'ail'. Check OPA is reachable and "
-            "responding to /v1/data/system/bundles.",
-            _OPA_BUNDLES_URL,
-        )
-        sys.exit(1)
-
-    claimants = sorted(
-        name for name, info in bundles.items()
-        if "ail" in ((info or {}).get("manifest", {}) or {}).get("roots", [])
-    )
-
-    if len(claimants) != 1:
-        logging.error(
-            "STARTUP FAILURE: expected exactly one loaded OPA bundle to claim "
-            "the 'ail' root, found %d: %s. A second bundle serving the same "
-            "root can supply deny rules that get attributed to this agent's "
-            "AIL_BUNDLE_NAME revision instead of its own (docs/reports/"
-            "phase-1-redteam.md, S2). Remove the extra bundle(s) from OPA's "
-            "bundle configuration.",
-            len(claimants), claimants,
-        )
-        sys.exit(1)
-
-    if claimants[0] != _BUNDLE_NAME:
-        logging.error(
-            "STARTUP FAILURE: the bundle claiming the 'ail' root is '%s', but "
-            "this agent's AIL_BUNDLE_NAME is '%s'. The revision read back at "
-            "data.system.bundles.%s.manifest.revision would then name a "
-            "bundle other than the one actually serving policy. Set "
-            "AIL_BUNDLE_NAME to '%s', or remove whichever of the two bundles "
-            "claiming 'ail' is unintended.",
-            claimants[0], _BUNDLE_NAME, _BUNDLE_NAME, claimants[0],
-        )
-        sys.exit(1)
-
-    logging.info("Startup check: bundle '%s' is the sole claimant of the 'ail' root.", _BUNDLE_NAME)
-
-
 def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
     """
     Create an SSL context with SPIFFE SVID fetched entirely in-memory.
@@ -481,8 +406,6 @@ def verify_bundle_at_startup(timeout_seconds: float = 30, poll_interval: float =
 
     logging.info("Startup check: OPA bundle '%s' loaded, revision=%s", _BUNDLE_NAME, revision)
 
-    _check_bundle_root_ownership(ssl_context)
-
 
 def query_opa_policy(tool_name, tool_args):
     """
@@ -554,7 +477,6 @@ def query_opa_policy(tool_name, tool_args):
                 json={"input": {
                     "tool_name": tool_name,
                     "tool_args": tool_args,
-                    "bundle_name": _BUNDLE_NAME,
                 }},
                 timeout=5,
             )

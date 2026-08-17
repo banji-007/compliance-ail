@@ -17,7 +17,10 @@ deny contains msg if {
     payload.tags.environment == "prod"
     cc := object.get(payload.tags, "cost_center", "")
     not approved_cost_centers[cc]
-    msg := sprintf("DENIED: Production environments must include a valid 'cost_center' tag. Approved values: %v.", [approved_cost_centers])
+    # Phase 1.2, P12-4: see gdpr.rego's matching comment - concat over a
+    # sorted array, not sprintf("%v", [set]), for evaluator-independent
+    # rendering (spikes/wasm-parity).
+    msg := sprintf("DENIED: Production environments must include a valid 'cost_center' tag. Approved values: %v.", [concat(", ", sort(approved_cost_centers))])
 }
 
 deny contains msg if {

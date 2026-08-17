@@ -18,6 +18,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 import httpx
@@ -283,6 +284,47 @@ def write_content(
     db.commit()
 
 
+def _write_tombstone(call_id: str) -> None:
+    """
+    D11 (Phase 1.2): append a content_erasure tombstone to the ledger, via
+    the same verifier the interceptor's own ledger writes use, before the
+    row is deleted - same ordering discipline as D7 (the durable record of
+    an event is written before the action it describes becomes
+    irreversible). No personal data: call_id, timestamp, actor only - never
+    the erased payload itself.
+
+    "actor" names the authorization boundary the caller crossed, not an
+    individual - control-plane write access is a single shared
+    write-scoped API key (ADR-0007), not a per-caller credential, so no
+    finer-grained identity exists at this layer to record.
+
+    Raises on any failure (non-2xx, transport error, or verified: false) -
+    the caller (erase_content) treats this as fail-closed: the erasure is
+    refused and the row survives.
+    """
+    tombstone = {
+        "record_type": "content_erasure",
+        "call_id": call_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "actor": "control-plane-write-key",
+    }
+    serialized = json.dumps(tombstone, separators=(",", ":"))
+    key = f"content_erasure:{call_id}"
+    encoded_key = base64.b64encode(key.encode()).decode()
+    encoded_val = base64.b64encode(serialized.encode()).decode()
+
+    with httpx.Client(timeout=15) as client:
+        resp = client.post(
+            f"{VERIFIER_URL}/write",
+            json={"key": encoded_key, "value": encoded_val},
+        )
+        resp.raise_for_status()
+
+    result = resp.json()
+    if not result.get("verified"):
+        raise RuntimeError(f"Tombstone write not verified: {result.get('detail', 'no detail')}")
+
+
 @app.delete("/content/{call_id}", status_code=204)
 def erase_content(
     call_id: str,
@@ -295,21 +337,56 @@ def erase_content(
     is untouched - it still proves what was decided and that the input
     hashed to input_sha256; only the erasable content this hash could be
     checked against is gone. /audit infers "erased" at read time from the
-    ledger's content_state plus the absence of this row (D7).
+    ledger's content_state, the absence of this row, and the presence of a
+    content_erasure tombstone (D7, D11).
+
+    D11 (Phase 1.2): the tombstone is written first. If it fails, the
+    erasure is refused (503) and the row survives - there is no path that
+    deletes a row without a durable record of having done so. A call_id
+    with no row (already erased, or never had one) is a no-op: nothing to
+    erase, so no tombstone is written for it.
     """
-    db.query(CallContent).filter_by(call_id=call_id).delete()
+    existing = db.query(CallContent).filter_by(call_id=call_id).first()
+    if existing is None:
+        return
+
+    try:
+        _write_tombstone(call_id)
+    except Exception as exc:
+        logger.error("Tombstone write failed for call_id=%s: %s", call_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Tombstone write failed; erasure refused: {exc}",
+        )
+
+    db.delete(existing)
     db.commit()
+
+
+_TAMPER_ERROR_CLASSES = frozenset({"consistency_failure", "signature_failure"})
 
 
 def _verification_from_200(vdata: dict) -> dict:
     """
     Map a verifier /verify HTTP-200 body to one of the read-time verification
-    states (D2, D8). Extracted as a pure function - independent of the
+    states (D2, D8, D10). Extracted as a pure function - independent of the
     ImmuDB scan/join in get_audit - so the not_found branch (D8, Phase 1.1)
     is directly unit-testable with a fabricated vdata, without needing a key
     that is both scanned by ImmuDB and simultaneously never written (get_audit's
     own scan only ever lists keys that do exist, so this branch is not
     reachable end-to-end through /audit alone - see tests/test_verification.py).
+
+    D10 (Phase 1.2): "failed" is a positive claim of tamper evidence and
+    requires positive identification - error_class must be exactly
+    "consistency_failure" or "signature_failure" (verifier/main.py's own two
+    exception-derived classes). Everything else that isn't verified and
+    isn't not_found, including "unknown" and any future error_class this
+    function has never seen, maps to "unverifiable" with the detail
+    preserved. Red-team T1: the old default sent any unrecognized
+    error_class to "failed", so a change in the ImmuDB server's own message
+    wording (verifier/main.py's error_class="unknown" fallback) turned a
+    never-written key into a tamper alarm - with no source diff and no build
+    to fail.
     """
     if vdata.get("verified"):
         return {
@@ -318,7 +395,8 @@ def _verification_from_200(vdata: dict) -> dict:
             "detail": None,
             "error_class": None,
         }
-    if vdata.get("error_class") == "not_found":
+    error_class = vdata.get("error_class")
+    if error_class == "not_found":
         # A key with no prior write is not a tamper signal - no proof was
         # ever rejected, because there was never a proof to check. Kept
         # distinct from "failed" so a CISO reading this doesn't see the same
@@ -328,29 +406,48 @@ def _verification_from_200(vdata: dict) -> dict:
             "state": "not_found",
             "state_id": vdata.get("state_id"),
             "detail": vdata.get("detail"),
-            "error_class": vdata.get("error_class"),
+            "error_class": error_class,
+        }
+    if error_class in _TAMPER_ERROR_CLASSES:
+        return {
+            "state": "failed",
+            "state_id": vdata.get("state_id"),
+            "detail": vdata.get("detail"),
+            "error_class": error_class,
         }
     return {
-        "state": "failed",
+        "state": "unverifiable",
         "state_id": vdata.get("state_id"),
         "detail": vdata.get("detail"),
-        "error_class": vdata.get("error_class"),
+        "error_class": error_class,
     }
 
 
-def _payload_state(content_state: str | None, content_row) -> tuple[str, dict | None]:
+def _payload_state(content_state: str | None, content_row, has_tombstone: bool) -> tuple[str, dict | None]:
     """
-    Map a ledger entry's content_state (D7) plus whether its CallContent row
-    still exists to the read-time payload_state: present | erased |
-    unavailable. content_state == "unavailable" always renders unavailable,
-    never erased - it was never attempted, so there was nothing to erase.
-    Pure function, unit-testable independent of the ImmuDB/SQL join.
+    Map a ledger entry's content_state (D7), whether its CallContent row
+    still exists, and whether a content_erasure tombstone exists for its
+    call_id, to the read-time payload_state (D7, D11 - Phase 1.2): present |
+    unavailable | erased | lost. Pure function, unit-testable independent of
+    the ImmuDB/SQL join.
+
+    content_state == "unavailable" always wins - it was never attempted, so
+    there is nothing to erase or lose. Otherwise, a present row is
+    "present"; an absent row is "erased" only if the real erasure endpoint's
+    tombstone exists for this call_id (erase_content always writes it before
+    deleting), and "lost" otherwise - the row disappeared some other way
+    (red-team T5: a direct SQL delete bypassing the endpoint entirely).
+    "lost" and "erased" must never render identically: one is a GDPR
+    Article 17 request honored through the real endpoint, the other is an
+    operational incident with no erasure semantics behind it at all.
     """
     if content_state == "unavailable":
         return "unavailable", None
     if content_row is not None:
         return "present", json.loads(content_row.payload_json)
-    return "erased", None
+    if has_tombstone:
+        return "erased", None
+    return "lost", None
 
 
 @app.get("/audit")
@@ -379,12 +476,18 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
         input_sha256   - hash of the original tool arguments
         payload        - joined from the content store by call_id; null unless
                           payload_state is "present"
-        payload_state  - present | erased | unavailable (D7): "unavailable"
-                          means content_state was already "unavailable" at
-                          write time (nothing dict-shaped to store) and is
-                          never rendered as erased; "erased" is inferred -
-                          content_state was "present" but no CallContent row
-                          exists for this call_id now
+        payload_state  - present | unavailable | erased | lost (D7, D11):
+                          "unavailable" means content_state was already
+                          "unavailable" at write time (nothing dict-shaped
+                          to store) and always wins over the other three;
+                          "erased" and "lost" both mean content_state was
+                          "present" but no CallContent row exists now -
+                          "erased" additionally requires a content_erasure
+                          tombstone for this call_id (the real DELETE
+                          /content/{call_id} endpoint always writes one
+                          first); "lost" is every other way the row could
+                          be gone (e.g. a direct SQL delete bypassing the
+                          endpoint)
         verification   - {state, state_id, detail, error_class}; state is one
                           of verified | failed | unverifiable | asserted | not_found
     """
@@ -422,12 +525,40 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             scan_resp.raise_for_status()
             raw_entries = scan_resp.json().get("entries", [])
 
+            # D11 (Phase 1.2): a second scan, over content_erasure: keys,
+            # never tool_call: - this is what keeps a tombstone structurally
+            # out of the decision entries built below, rather than relying
+            # on a filter that could be gotten wrong. Classification of what
+            # counts as a tombstone still goes through record_type, not the
+            # key prefix alone (D11's own "discriminate on a field" point).
+            tombstone_scan_resp = client.post(
+                f"{IMMUDB_URL}/api/v2/db/scan",
+                json={
+                    "prefix": base64.b64encode(b"content_erasure:").decode(),
+                    "desc": True,
+                    "limit": limit,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            tombstone_scan_resp.raise_for_status()
+            raw_tombstones = tombstone_scan_resp.json().get("entries", [])
+
     except httpx.HTTPStatusError as exc:
         logger.error("ImmuDB HTTP error during audit scan: %s", exc)
         raise HTTPException(status_code=502, detail=f"ImmuDB returned {exc.response.status_code}")
     except Exception as exc:
         logger.error("ImmuDB unavailable for audit scan: %s", exc)
         raise HTTPException(status_code=503, detail=f"ImmuDB unavailable: {exc}")
+
+    tombstoned_call_ids: set[str] = set()
+    for raw in raw_tombstones:
+        try:
+            value = json.loads(base64.b64decode(raw["value"]).decode())
+            if value.get("record_type") == "content_erasure" and value.get("call_id"):
+                tombstoned_call_ids.add(value["call_id"])
+        except Exception as exc:
+            logger.warning("Skipping malformed tombstone entry: %s", exc)
+            continue
 
     # --- Verify each entry via the verifier service; join content by call_id ---
     verifier_up = True
@@ -477,7 +608,8 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
 
             call_id = log_entry.get("call_id")
             content_row = db.query(CallContent).filter_by(call_id=call_id).first() if call_id else None
-            payload_state, payload = _payload_state(log_entry.get("content_state"), content_row)
+            has_tombstone = call_id in tombstoned_call_ids if call_id else False
+            payload_state, payload = _payload_state(log_entry.get("content_state"), content_row, has_tombstone)
 
             entries.append({
                 "tx_id":           tx_id,

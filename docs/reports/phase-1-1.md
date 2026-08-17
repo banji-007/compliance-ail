@@ -200,3 +200,42 @@ Full suite, `docker-compose.test.yml`, fresh volumes (`down -v` / `up`), run cle
 ```
 
 No test skipped, no test newly `xfail`ed, no assertion weakened. Every mutation described in section 3 was applied directly to the working-tree source (never to a copy), confirmed live against the running stack, and reverted with a matching inverse edit before moving to the next - `git status --short` at the end of the session shows only the intended set of modified and new files (the D6/D7/D8/P11-x source and test changes, the three ADRs, and this report), no stray mutation artifacts left in place.
+
+---
+
+## Erratum (Phase 1.2)
+
+Row 34 of the verdict table above records P11-7 as "DONE" against S2
+("single bundle root ownership") without qualification. That is an
+over-claim: P11-7 did not close S2, and this report should not have
+implied that it did.
+
+`docs/reports/phase-1-1-redteam.md`, T7, reproduced S2 byte-for-byte
+against this report's own end SHA (`e7e9607`): a decoy bundle served to a
+running OPA, then an evaluation naming it via `input.bundle_name`, still
+attributed a real FinOps deny reason to the decoy's revision. T7 also
+showed directly that P11-7's own check (`_check_bundle_root_ownership`,
+run fresh against the exact drifted environment) passed cleanly and never
+detected the attack.
+
+What P11-7 actually guarded, precisely: at process start only, that
+exactly one loaded OPA bundle claims the `ail` root, and that its name
+matches `AIL_BUNDLE_NAME`. Two properties follow directly from that scope,
+neither of which S2 needed to defeat it:
+
+- It only ever ran once, at boot. A bundle added to OPA's live
+  configuration after the interceptor had already started successfully
+  was never re-checked.
+- It only ever flagged a *second* bundle claiming the *same* `ail` root.
+  S2's mechanism was never a second claimant of `ail` - it was
+  `data.system.bundles[input.bundle_name].manifest.revision` accepting
+  any caller-supplied `bundle_name`, structurally decoupled from whichever
+  bundle actually populated `data.ail.*`. A decoy bundle claiming a wholly
+  disjoint root (`roots: ["decoy"]`, as T7's own repro used) was
+  sufficient - P11-7's own test suite asserts this exact case must *not*
+  raise (`test_disjoint_roots_do_not_count_as_claiming_ail`).
+
+S2 was closed in Phase 1.2 (D9, P12-1): `input.bundle_name` is removed
+from the request entirely, and the revision is derived from whichever
+loaded bundle's manifest actually claims the `ail` root, on every
+evaluation rather than once at boot. See `docs/reports/phase-1-2.md`.

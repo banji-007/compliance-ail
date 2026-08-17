@@ -140,7 +140,18 @@ def test_fault_opa_unreachable(monkeypatch):
 
 @requires_stack
 def test_fault_revision_unavailable(monkeypatch):
-    monkeypatch.setattr(middleware, "_BUNDLE_NAME", "nonexistent-bundle-for-outcome-test")
+    # Phase 1.2 (D9): the request no longer carries a caller-supplied bundle
+    # name, so a bogus bundle name can no longer force this fault - the
+    # revision now comes from whichever loaded bundle's manifest claims the
+    # `ail` root (see tests/test_bundle_revision_attribution.py for that
+    # mechanism directly). Simulated here the same way any other undefined
+    # /evaluation result would occur: pointing at a rule path OPA has never
+    # heard of, which returns HTTP 200 with no "result" key - the exact
+    # response shape query_opa_policy treats as revision_unavailable.
+    monkeypatch.setattr(
+        middleware, "_OPA_EVAL_URL",
+        middleware._OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/ail/main/nonexistent_entrypoint"),
+    )
     r = middleware.intercept_tool_call("provision_cloud_server", _APPROVED_ARGS, "outcome_test")
     assert r["status"] == "DENIED"
     assert r["outcome_type"] == "fault"

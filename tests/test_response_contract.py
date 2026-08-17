@@ -93,7 +93,14 @@ def _live_response_keys(monkeypatch) -> set[str]:
     ]
 
     with monkeypatch.context() as m:
-        m.setattr(middleware, "_BUNDLE_NAME", "nonexistent-bundle-for-contract-test")
+        # Phase 1.2 (D9): bundle_name no longer travels in the request, so a
+        # bogus bundle name can no longer force a fault outcome - force the
+        # same undefined-/evaluation-result response shape by pointing at a
+        # rule path OPA has never heard of instead.
+        m.setattr(
+            middleware, "_OPA_EVAL_URL",
+            middleware._OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/ail/main/nonexistent_entrypoint"),
+        )
         responses.append(
             middleware.intercept_tool_call("provision_cloud_server", _APPROVED_ARGS, "contract_test")
         )

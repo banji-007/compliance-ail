@@ -75,6 +75,13 @@ class ImmuDBLedger:
         """
         timestamp = datetime.utcnow().isoformat()
         log_entry = {
+            # D11 (Phase 1.2): every ledger record now carries an explicit
+            # record_type so a consumer scanning a broader key range than
+            # tool_call: (e.g. control_plane/main.py's content_erasure: scan)
+            # discriminates on this field, not on key shape - "decision"
+            # here, "content_erasure" for the tombstones erase_content
+            # writes directly via the verifier (see control_plane/main.py).
+            "record_type": "decision",
             "agent_id": agent_id,
             "timestamp": timestamp,
             "tool_name": tool_name,

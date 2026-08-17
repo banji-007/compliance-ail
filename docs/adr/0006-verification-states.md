@@ -31,10 +31,32 @@ Five states, not one boolean:
 | State | Meaning |
 | :--- | :--- |
 | `verified` | A `verifiedGet` ran and every proof passed. Carries `state_id`. |
-| `failed` | A `verifiedGet` ran and a proof or signature was rejected - the tamper signal. Carries `error_class` (`consistency_failure` vs `signature_failure`, from `verifier/main.py`'s own exception handling) and `detail`. |
-| `unverifiable` | A `verifiedGet` was attempted and could not complete (verifier unreachable, non-200, transport error). Carries `detail`. |
+| `failed` | A `verifiedGet` ran and a proof or signature was rejected - the tamper signal. Carries `error_class` (`consistency_failure` vs `signature_failure`, from `verifier/main.py`'s own exception handling) and `detail`. (D10, Phase 1.2: this is the *only* way into `failed` - see below.) |
+| `unverifiable` | A `verifiedGet` was attempted and could not complete (verifier unreachable, non-200, transport error), **or** completed but returned an `error_class` this function does not positively recognize as tamper evidence (D10, Phase 1.2). Carries `detail`. |
 | `asserted` | No `verifiedGet` was attempted for this entry in producing this response. |
 | `not_found` | (Phase 1.1, D8) A `verifiedGet` was attempted against a key no entry was ever written for. Not a tamper signal - no proof was ever rejected, because there was never a proof to check - and not `unverifiable` either, since the check did complete cleanly. Carries `error_class: "not_found"` and `detail`. |
+
+### `failed` requires positive identification, not a default (D10, Phase 1.2)
+
+Red-team T1 (`docs/reports/phase-1-1-redteam.md`): `control_plane/main.py::
+_verification_from_200` had exactly three branches - `verified`, `not_found`,
+and an unconditional `else` that mapped everything else to `failed`. Live
+testing showed the consequence directly: simulating an upstream message-text
+drift (mutating the string `verifier/main.py`'s `not_found` detection
+matches) reclassified a never-written key's `error_class` as `"unknown"`,
+which the old default promoted straight to `failed` - the highest-severity,
+tamper-implying state in this taxonomy, for a condition involving no
+tampering and no rejected proof at all. Nothing about that drift touches
+source code; there is no build for it to fail.
+
+`failed` is now a positive claim, not a fallback: `error_class` must be
+exactly `"consistency_failure"` or `"signature_failure"` - `verifier/main.py`'s
+own two exception-derived classes, the only conditions where a proof or
+signature was actually rejected. `not_found` keeps its own branch, checked
+first (unchanged from D8). Everything else - `"unknown"`, or any
+`error_class` this function has never seen at all - maps to `unverifiable`,
+with `detail` preserved so the information isn't lost, only correctly
+de-escalated from a tamper alarm to "could not positively verify this."
 
 ### `not_found` is not `failed`, and how it's actually detected
 
@@ -78,6 +100,34 @@ Write-time verification is unaffected by this ADR: `ledger/immudb_ledger.py`'s
 write path stays binary and fail-closed - `verifiedSet` passes or the call
 denies (see `docs/adr/0005-outcome-taxonomy.md`'s `verifier_unreachable`
 fault class). These five states describe a *read*, not a write.
+
+### Bundle revision attribution is no longer caller-suppliable (D9, Phase 1.2)
+
+A related but distinct integrity gap sat next to this ADR's own subject:
+`policy/core/main.rego`'s `evaluation` rule (the per-call source of
+`policy_revision`, the field this ledger entry's own attribution
+ultimately rests on) read `data.system.bundles[input.bundle_name].manifest
+.revision` - `input.bundle_name` was part of the request the interceptor
+itself sent, sourced from `AIL_BUNDLE_NAME`. Nothing stopped a caller who
+could reach OPA directly (bypassing the interceptor, or on a compromised
+interceptor) from naming a different loaded bundle instead - red-team T7
+(`docs/reports/phase-1-1-redteam.md`) reproduced exactly this: a decoy
+bundle, added to a running OPA, whose revision got attributed to a real
+FinOps deny reason simply by naming it.
+
+D9 removes `input.bundle_name` from the request document entirely. The
+revision is now derived by `policy/core/main.rego` itself, from whichever
+loaded bundle's manifest actually claims the `ail` root
+(`data.system.bundles[name].manifest.roots`) - a caller supplies nothing
+that influences this. Exactly one claimant resolves; zero or more than one
+makes `evaluation` itself undefined, which `interceptor/middleware.py`
+already treats as `FAULT_REVISION_UNAVAILABLE` (a fault, not a guess). This
+runs on every evaluation, not once at boot - closing T7's second finding,
+that a bundle added to OPA's live configuration after the interceptor had
+already started was never rechecked - and it obsoletes P11-7's own
+startup-only single-claimant check (`_check_bundle_root_ownership`), which
+only ever flagged a second bundle claiming the *same* root and never the
+mechanism T7 actually used (see `docs/reports/phase-1-1.md`'s erratum).
 
 ## Consequences
 
@@ -123,5 +173,10 @@ fault class). These five states describe a *read*, not a write.
 - `dashboard/lib/types.ts::Verification`, `dashboard/components/audit-table.tsx::VerificationCell`
 - `docs/reports/phase-1-redteam.md`, S8 - the conflation this closes
 - `tests/test_verification.py::test_not_found_state`,
-  `::test_control_plane_maps_not_found_state_not_failed`
+  `::test_control_plane_maps_not_found_state_not_failed`,
+  `::test_control_plane_maps_unknown_error_class_to_unverifiable_not_failed`,
+  `::test_control_plane_maps_both_tamper_classes_to_failed` (D10, Phase 1.2)
 - `docs/reports/phase-0-1-redteam.md`, finding #3 - the conflation this closes
+- `docs/reports/phase-1-1-redteam.md`, T1 - the `unknown`-to-`failed` conflation D10 closes; T7 - the caller-suppliable revision D9 closes
+- `policy/core/main.rego::_ail_root_owners`, `_ail_bundle_name`, `evaluation` (D9, Phase 1.2)
+- `tests/test_bundle_revision_attribution.py` (D9, Phase 1.2)

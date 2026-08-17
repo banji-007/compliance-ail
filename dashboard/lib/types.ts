@@ -59,9 +59,15 @@ export interface Verification {
   state: VerificationState;
   /** tx_id of the latest verified state the verifier held, when state is "verified" */
   state_id: number | null;
-  /** Populated for "failed" and "unverifiable" */
+  /** Populated for "failed", "unverifiable", and "not_found" */
   detail: string | null;
-  /** "consistency_failure" | "signature_failure" | "unknown"; only meaningful when state is "failed" */
+  /**
+   * "consistency_failure" | "signature_failure" when state is "failed" -
+   * these are the only two positively-identified tamper conditions (D10).
+   * "not_found" when state is "not_found". "unknown", or any other value
+   * the verifier has never classified, means state is "unverifiable" - it
+   * is never promoted to "failed" by default.
+   */
   error_class: string | null;
 }
 
@@ -89,17 +95,26 @@ export interface AuditEntry {
    */
   payload: Record<string, unknown> | null;
   /**
-   * Read-time inference (D7, Phase 1.1), same pattern as `verification`:
+   * Read-time inference (D7, D11 - Phase 1.1/1.2), same pattern as
+   * `verification`:
    *   present     - content_state was "present" at write time and the
    *                 content-store row still exists.
-   *   erased      - content_state was "present" at write time but the row
-   *                 is gone now (GDPR Article 17 erasure via
-   *                 DELETE /content/{call_id}).
+   *   erased      - content_state was "present" at write time, the row is
+   *                 gone now, and a content_erasure tombstone exists for
+   *                 this call_id (GDPR Article 17 erasure via the real
+   *                 DELETE /content/{call_id} endpoint, which always
+   *                 writes the tombstone before deleting the row).
+   *   lost        - content_state was "present" at write time and the row
+   *                 is gone now, but no tombstone exists - the row
+   *                 disappeared some other way (e.g. a direct SQL delete
+   *                 bypassing the endpoint). Never rendered the same as
+   *                 "erased": one is a request honored, the other is an
+   *                 operational incident.
    *   unavailable - content_state was already "unavailable" at write time
    *                 (nothing dict-shaped to store, e.g. malformed
-   *                 tool_args) — never rendered as erased.
+   *                 tool_args) — never rendered as erased or lost.
    */
-  payload_state: "present" | "erased" | "unavailable";
+  payload_state: "present" | "erased" | "lost" | "unavailable";
   verification: Verification;
 }
 

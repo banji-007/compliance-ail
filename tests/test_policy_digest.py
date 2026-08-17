@@ -125,18 +125,22 @@ def test_recorded_digest_matches_opa_not_interceptor_belief(monkeypatch):
 def test_digest_unavailable_denies_and_writes_a_fault_record(monkeypatch):
     """
     Simulates the bundle-revision read failing in the same cycle as an
-    otherwise-successful OPA decision, by pointing the interceptor's
-    combined evaluation query at a bundle name OPA never loaded (OPA's
-    revision lookup returns undefined, exactly as it would for any other
-    reason the read fails, so `evaluation` itself is undefined - see
-    policy/core/main.rego). Under D1 (Phase 1) this denies AND writes a
-    fault record with a null revision - this reverses the old assertion
-    ("no ledger entry"), the one pre-authorized change in Phase 1.
+    otherwise-successful OPA decision. Under D1 (Phase 1) this denies AND
+    writes a fault record with a null revision - this reverses the old
+    assertion ("no ledger entry"), the one pre-authorized change in Phase 1.
+
+    Phase 1.2 (D9): the request no longer carries a caller-supplied bundle
+    name - policy/core/main.rego's `evaluation` rule now derives the
+    revision from whichever loaded bundle's manifest claims the `ail` root
+    (see tests/test_bundle_revision_attribution.py for that mechanism
+    exercised directly, live). Undefined revision is simulated here the
+    same way any other undefined /evaluation result would occur: pointing
+    the query at a rule path OPA has never heard of.
     """
-    # The bundle name travels in the request body (input.bundle_name), read
-    # from this module global at call time - point it at a bundle OPA never
-    # loaded so policy/core/main.rego's revision lookup is undefined.
-    monkeypatch.setattr(middleware, "_BUNDLE_NAME", "nonexistent-bundle")
+    monkeypatch.setattr(
+        middleware, "_OPA_EVAL_URL",
+        OPA_BASE + "/v1/data/ail/main/nonexistent_entrypoint",
+    )
 
     response = middleware.intercept_tool_call(
         "provision_cloud_server", _APPROVED_ARGS, "test_digest_agent"

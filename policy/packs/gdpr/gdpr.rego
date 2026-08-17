@@ -25,7 +25,13 @@ deny contains msg if {
     payload := input.tool_args
     payload.tags.data_classification == "pci-dss"
     not approved_regions[payload.region]
-    msg := sprintf("DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: %v", [approved_regions])
+    # Phase 1.2, P12-4: sprintf("%v", [set]) renders differently under the
+    # WASM evaluator than under the OPA server (spikes/wasm-parity's own
+    # 42-case corpus, 10/42 differences, all traced to this). concat over an
+    # explicitly sorted array is evaluator-independent - the policy author
+    # specifies the ordering and delimiter, not each evaluator's own default
+    # set-stringification.
+    msg := sprintf("DENIED: GDPR Data Residency Violation. 'pci-dss' workloads must run in an approved region. Approved: %v", [concat(", ", sort(approved_regions))])
 }
 
 # Fail-closed: unclassified data is treated as highly sensitive.
@@ -36,7 +42,7 @@ deny contains msg if {
     unclassified := {"", "unspecified"}
     unclassified[dc]
     not approved_regions[payload.region]
-    msg := sprintf("DENIED: GDPR Data Residency Violation. Unclassified data defaults to highly sensitive and must run in an approved region. Approved: %v", [approved_regions])
+    msg := sprintf("DENIED: GDPR Data Residency Violation. Unclassified data defaults to highly sensitive and must run in an approved region. Approved: %v", [concat(", ", sort(approved_regions))])
 }
 
 # --- query_database rules ---
@@ -48,5 +54,5 @@ deny contains msg if {
     payload := input.tool_args
     contains(payload.target_table, "pii")
     not approved_purposes[payload.processing_purpose]
-    msg := sprintf("DENIED: GDPR Violation. Unauthorized processing purpose '%v' for PII table. Approved purposes: %v", [object.get(payload, "processing_purpose", ""), approved_purposes])
+    msg := sprintf("DENIED: GDPR Violation. Unauthorized processing purpose '%v' for PII table. Approved purposes: %v", [object.get(payload, "processing_purpose", ""), concat(", ", sort(approved_purposes))])
 }

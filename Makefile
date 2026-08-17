@@ -32,6 +32,15 @@ keygen:
 ## new stack starts. This prevents stale verifier state from a prior keygen
 ## rotation from causing opaque proof failures.
 ##
+## --build (P12-5, Phase 1.2): "up -d --wait" alone does not rebuild an
+## image that already exists under this Compose project's tag, even when
+## the source it was built from has changed - five separate sessions hit
+## this as a wall of spurious failures against stale code (docs/reports/
+## phase-1-1.md, section 1: "two full docker compose build <service>
+## passes were needed this session"; a prior session hit 30 at once).
+## --build forces a build (respecting Docker's own layer cache, so an
+## unchanged service is still fast) before the containers start, every run.
+##
 ## OPA bundle timing: opa-config.yaml sets min_delay_seconds=10 for bundle
 ## polling. "docker compose up --wait" blocks until health checks pass (OPA
 ## binary alive), but the first bundle poll may not have completed yet.
@@ -51,7 +60,7 @@ keygen:
 test-integration:
 	docker compose -f docker-compose.test.yml down -v
 	$(MAKE) keygen
-	docker compose -f docker-compose.test.yml up -d --wait
+	docker compose -f docker-compose.test.yml up -d --build --wait
 	@echo "Waiting 15s for OPA to complete its first bundle poll..."
 	sleep 15
 	IMMUDB_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_USER" ) ); \
