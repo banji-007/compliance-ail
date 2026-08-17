@@ -44,11 +44,19 @@ class ImmuDBLedger:
         self,
         agent_id: str,
         tool_name: str,
-        payload: dict,
-        decision: str,
+        input_sha256: str,
+        outcome_type: str,
+        fault_class: str | None,
+        policy_revision: str | None,
+        reasons: list,
     ) -> int:
         """
-        Write a policy decision to ImmuDB via the verifier's verifiedSet.
+        Write an outcome record to ImmuDB via the verifier's verifiedSet.
+
+        The record carries a hash of the tool arguments, not the arguments
+        themselves (D5) - the immutable ledger proves what was decided and
+        that the input hashed to this value; the arguments live in the
+        control plane's erasable content store, joined by tx_id.
 
         The verifier performs inclusion-proof and consistency-proof verification
         on every write. A response with verified: false or any transport error
@@ -62,8 +70,11 @@ class ImmuDBLedger:
             "agent_id": agent_id,
             "timestamp": timestamp,
             "tool_name": tool_name,
-            "payload": payload,
-            "decision": decision,
+            "input_sha256": input_sha256,
+            "outcome_type": outcome_type,
+            "fault_class": fault_class,
+            "policy_revision": policy_revision,
+            "reasons": reasons,
         }
         serialized  = json.dumps(log_entry, separators=(",", ":"))
         key         = f"tool_call:{agent_id}:{uuid.uuid4().hex}:{tool_name}"

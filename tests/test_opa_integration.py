@@ -126,17 +126,18 @@ class TestOpaPolicy:
     def test_small_instance_approved(self):
         """t3.micro in an approved region with valid tags must be allowed."""
         result = query_opa_policy("provision_cloud_server", _APPROVED_ARGS)
-        assert result["allowed"] is True, (
-            f"Expected APPROVED for t3.micro/us-east-1, got: {result}"
+        assert result["outcome_type"] == "policy_allow", (
+            f"Expected policy_allow for t3.micro/us-east-1, got: {result}"
         )
+        assert result["policy_revision"], f"Expected a policy_revision, got: {result}"
 
     def test_restricted_instance_without_ml_training_denied(self):
         """p4d.24xlarge without project=ml-training must be denied by FinOps."""
         result = query_opa_policy("provision_cloud_server", _DENIED_RESTRICTED_INSTANCE)
-        assert result["allowed"] is False, (
-            f"Expected DENIED for p4d.24xlarge/webapp, got: {result}"
+        assert result["outcome_type"] == "policy_deny", (
+            f"Expected policy_deny for p4d.24xlarge/webapp, got: {result}"
         )
-        denial_text = " ".join(result.get("deny", [])) + " " + result.get("reason", "")
+        denial_text = " ".join(result.get("reasons", []))
         assert any(kw in denial_text for kw in ("ml-training", "FinOps", "restricted", "Instance")), (
             f"Expected FinOps denial text, got: {denial_text!r}"
         )
@@ -148,15 +149,15 @@ class TestOpaPolicy:
         'internal' classification is neither, so no rule denies this request.
         """
         result = query_opa_policy("provision_cloud_server", _APPROVED_NON_DEFAULT_REGION)
-        assert result["allowed"] is True, (
-            f"Expected APPROVED for t3.micro/us-west-2/internal, got: {result}"
+        assert result["outcome_type"] == "policy_allow", (
+            f"Expected policy_allow for t3.micro/us-west-2/internal, got: {result}"
         )
 
     def test_restricted_instance_wrong_project_denied(self):
         """p4d.24xlarge with project=webapp (not ml-training) must be denied."""
         result = query_opa_policy("provision_cloud_server", _DENIED_WRONG_PROJECT)
-        assert result["allowed"] is False, (
-            f"Expected DENIED for p4d.24xlarge/webapp/eu-west-1, got: {result}"
+        assert result["outcome_type"] == "policy_deny", (
+            f"Expected policy_deny for p4d.24xlarge/webapp/eu-west-1, got: {result}"
         )
 
 

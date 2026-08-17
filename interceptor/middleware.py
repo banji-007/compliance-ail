@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import sys
@@ -54,7 +55,33 @@ _OPA_REVISION_URL = _OPA_URL.replace(
     "/v1/data/ail/main/allow", f"/v1/data/system/bundles/{_BUNDLE_NAME}/manifest/revision"
 )
 
-_DENIED_UNAVAILABLE = {"allowed": False, "reason": "Compliance engine unavailable. Fail-closed policy enforced."}
+# Single combined query (Phase 1, P1-1): verdict, deny reasons, and bundle
+# revision in one round trip. See policy/core/main.rego's `evaluation` rule.
+_OPA_EVAL_URL = _OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/ail/main/evaluation")
+
+# Closed set of outcome types (D1). Never inferred from message text anywhere
+# downstream - this is the only vocabulary that exists.
+OUTCOME_POLICY_ALLOW = "policy_allow"
+OUTCOME_POLICY_DENY = "policy_deny"
+OUTCOME_SCHEMA_DENY = "schema_deny"
+OUTCOME_FAULT = "fault"
+
+FAULT_OPA_UNREACHABLE = "opa_unreachable"
+FAULT_REVISION_UNAVAILABLE = "revision_unavailable"
+FAULT_VERIFIER_UNREACHABLE = "verifier_unreachable"
+FAULT_SPIFFE_UNAVAILABLE = "spiffe_unavailable"
+
+
+def _outcome(outcome_type, fault_class=None, policy_revision=None, reasons=None):
+    """Build the one shape query_opa_policy ever returns - the single point
+    outcome_type/fault_class/policy_revision are set. Nothing downstream
+    re-derives these from message text."""
+    return {
+        "outcome_type": outcome_type,
+        "fault_class": fault_class,
+        "policy_revision": policy_revision,
+        "reasons": reasons or [],
+    }
 
 # Fields whose values must never appear in container logs.
 # Add any future PII or credential keys here - the helper recurses into nested dicts.
@@ -154,8 +181,8 @@ def _validate_peer_spiffe_san(ssl_ctx: ssl.SSLContext) -> bool:
 try:
     _POLICY_DECISIONS = Counter(
         "ail_policy_decisions_total",
-        "Total AIL policy decisions by status, tool, and policy",
-        ["status", "tool_name", "policy"],
+        "Total AIL policy decisions by status, outcome_type, fault_class, and tool",
+        ["status", "outcome_type", "fault_class", "tool_name"],
     )
 except ValueError:
     _POLICY_DECISIONS = REGISTRY._names_to_collectors["ail_policy_decisions_total"]
@@ -357,171 +384,131 @@ def verify_bundle_at_startup(timeout_seconds: float = 30, poll_interval: float =
 def query_opa_policy(tool_name, tool_args):
     """
     Query OPA policy for tool call authorization using mTLS authentication.
-    Implements two-query fallback: primary /allow check, then /deny for details.
+
+    Single round trip (Phase 1, P1-1): verdict, deny reasons, and the bundle
+    revision that produced them all come from one query to
+    data.ail.main.evaluation. This is the single point outcome_type,
+    fault_class, policy_revision, and reasons are set - callers never
+    reconstruct any of these from message text.
 
     Args:
         tool_name (str): Name of the tool being called
         tool_args (dict): Arguments passed to the tool
 
     Returns:
-        dict: OPA policy decision with denial reasons if applicable
+        dict: see _outcome() - outcome_type, fault_class, policy_revision, reasons
     """
     # Epic 2: Pre-Flight Input Validation
     # Catch LLM hallucinations before they are sent to OPA over the network.
     # Fail-closed: tools not present in TOOL_VALIDATORS are blocked here.
+    # 0 OPA requests for this outcome - schema rejection never reaches evaluation.
     validator = TOOL_VALIDATORS.get(tool_name)
     if validator is None:
-        error_details = f"DENIED: Schema Validation Failed. No registered schema for tool '{tool_name}'."
+        msg = f"No registered schema for tool '{tool_name}'."
         logging.warning(f"Pre-flight validation blocked unregistered tool: {tool_name}")
-        return {
-            "allowed": False,
-            "reason": error_details,
-            "deny": [error_details],
-        }
+        return _outcome(OUTCOME_SCHEMA_DENY, reasons=[msg])
     is_valid, error_message = validator(tool_args)
     if not is_valid:
-        error_details = f"DENIED: Schema Validation Failed. {error_message}"
-        logging.warning(f"Pre-flight validation failed for {tool_name}: {error_details}")
-        return {
-            "allowed": False,
-            "reason": error_details,
-            "deny": [error_details],
-        }
-    
+        logging.warning(f"Pre-flight validation failed for {tool_name}: {error_message}")
+        return _outcome(OUTCOME_SCHEMA_DENY, reasons=[error_message])
+
     if _SPIRE_DISABLED:
         if not (_OPA_URL.startswith("http://localhost") or _OPA_URL.startswith("http://127.0.0.1") or _OPA_URL.startswith("http://opa")):
             logging.error(
                 "SPIRE_DISABLED=true requires a plain http:// OPA_URL pointing to localhost or opa. "
                 "Set OPA_URL=http://localhost:8181/v1/data/ail/main/deny or OPA_URL=http://opa:8181/v1/data/ail/main/deny"
             )
-            return _DENIED_UNAVAILABLE
+            return _outcome(OUTCOME_FAULT, fault_class=FAULT_OPA_UNREACHABLE)
         logging.warning("SPIRE_DISABLED=true: querying OPA over plain HTTP (dev mode only, no transport identity)")
         ssl_context = True  # unused for http://, but explicit
     else:
         ssl_context = _get_spiffe_ssl_context()
         if not ssl_context:
-            return {
-                "allowed": False,
-                "reason": "DENIED: Workload Identity missing or invalid. Execution blocked by AIL.",
-                "deny": ["Workload Identity missing or invalid. Execution blocked by AIL."]
-            }
+            return _outcome(OUTCOME_FAULT, fault_class=FAULT_SPIFFE_UNAVAILABLE)
 
         # Verify the OPA endpoint's SPIFFE URI SAN before transmitting policy
         # data. Prevents any CA-signed workload from impersonating the policy
         # engine — only spiffe://ail.internal/workload/envoy is accepted.
         if not _validate_peer_spiffe_san(ssl_context):
-            return {
-                "allowed": False,
-                "reason": "DENIED: OPA endpoint SPIFFE identity could not be verified. Execution blocked by AIL.",
-                "deny": ["OPA endpoint SPIFFE identity could not be verified. Execution blocked by AIL."]
-            }
+            return _outcome(OUTCOME_FAULT, fault_class=FAULT_SPIFFE_UNAVAILABLE)
 
-    # Primary query to /allow endpoint
+    # Single query: verdict + reasons + revision together.
     try:
         with httpx.Client(verify=ssl_context) as client:
             response = client.post(
-                _OPA_URL,
-                json={"input": {"tool_name": tool_name, "tool_args": tool_args}},
+                _OPA_EVAL_URL,
+                json={"input": {
+                    "tool_name": tool_name,
+                    "tool_args": tool_args,
+                    "bundle_name": _BUNDLE_NAME,
+                }},
                 timeout=5,
             )
-
-        logging.debug(f"OPA /allow status={response.status_code} body={response.text[:200]}")
-
-        if response.status_code == 200:
-            result = response.json().get("result")
-            # result must be explicitly True. Any other value — False, null,
-            # or missing (policy not loaded / compile error) — is DENIED.
-            if result is None:
-                logging.error(
-                    "OPA returned null for /allow — policy not loaded or failed to compile. "
-                    "Fail-closed policy enforced."
-                )
-                return _DENIED_UNAVAILABLE
-
-            # OPA produced a decision in this cycle, so the bundle revision
-            # that decision was evaluated against must be readable from the
-            # same instance right now. If it isn't, the decision cannot be
-            # attributed to a known policy and must not be recorded as if it
-            # could be - deny outright rather than log with no provenance.
-            policy_revision = _fetch_opa_bundle_revision(ssl_context)
-            if policy_revision is None:
-                logging.error(
-                    "OPA answered /allow but its bundle revision could not be read back "
-                    "in the same cycle. Refusing to record an unattributable decision."
-                )
-                return {
-                    "allowed": False,
-                    "reason": "DENIED: Unable to establish the policy revision that produced this "
-                              "decision. Execution blocked.",
-                    "deny": ["Unable to establish the policy revision that produced this decision."],
-                    "digest_unavailable": True,
-                }
-
-            if result is True:
-                return {
-                    "allowed": True,
-                    "reason": "Action approved by policy",
-                    "deny": [],
-                    "policy_revision": policy_revision,
-                }
-            else:
-                # allow is False, execute second query to /deny for specific reasons
-                deny_url = _OPA_URL.replace("/allow", "/deny")
-                try:
-                    with httpx.Client(verify=ssl_context) as client:
-                        deny_response = client.post(
-                            deny_url,
-                            json={"input": {"tool_name": tool_name, "tool_args": tool_args}},
-                            timeout=5,
-                        )
-
-                    logging.debug(f"OPA /deny status={deny_response.status_code} body={deny_response.text[:200]}")
-
-                    if deny_response.status_code == 200:
-                        deny_result = deny_response.json().get("result", [])
-                        # Ensure deny_result is a list of strings
-                        if isinstance(deny_result, list) and deny_result:
-                            combined_reason = "; ".join(deny_result)
-                            return {
-                                "allowed": False,
-                                "reason": f"DENIED: {combined_reason}",
-                                "deny": deny_result,
-                                "policy_revision": policy_revision,
-                            }
-                        else:
-                            return {
-                                "allowed": False,
-                                "reason": "DENIED: Action did not pass policy evaluation.",
-                                "deny": ["Action did not pass policy evaluation."],
-                                "policy_revision": policy_revision,
-                            }
-                    else:
-                        return {
-                            "allowed": False,
-                            "reason": "DENIED: Action did not pass policy evaluation.",
-                            "deny": ["Action did not pass policy evaluation."],
-                            "policy_revision": policy_revision,
-                        }
-                except Exception as e:
-                    logging.error(f"OPA /deny query failed: {e}")
-                    return {
-                        "allowed": False,
-                        "reason": "DENIED: Action did not pass policy evaluation.",
-                        "deny": ["Action did not pass policy evaluation."],
-                        "policy_revision": policy_revision,
-                    }
-        else:
-            return _DENIED_UNAVAILABLE
-
     except httpx.ConnectError as e:
         logging.error(f"OPA connection error: {e}")
-        return _DENIED_UNAVAILABLE
+        return _outcome(OUTCOME_FAULT, fault_class=FAULT_OPA_UNREACHABLE)
     except httpx.RequestError as e:
         logging.error(f"OPA request error: {e}")
-        return _DENIED_UNAVAILABLE
+        return _outcome(OUTCOME_FAULT, fault_class=FAULT_OPA_UNREACHABLE)
     except Exception as e:
         logging.error(f"OPA query failed: {e}")
-        return _DENIED_UNAVAILABLE
+        return _outcome(OUTCOME_FAULT, fault_class=FAULT_OPA_UNREACHABLE)
+
+    logging.debug(f"OPA /evaluation status={response.status_code} body={response.text[:200]}")
+
+    if response.status_code != 200:
+        logging.error(f"OPA /evaluation returned HTTP {response.status_code}. Fail-closed policy enforced.")
+        return _outcome(OUTCOME_FAULT, fault_class=FAULT_OPA_UNREACHABLE)
+
+    result = response.json().get("result")
+    if result is None:
+        # evaluation is only undefined if the revision lookup was - allow and
+        # reasons both always have a value by construction (see main.rego).
+        logging.error(
+            "OPA answered /evaluation but the result was undefined - the bundle revision "
+            "could not be read back in the same cycle. Refusing to record an unattributable decision."
+        )
+        return _outcome(OUTCOME_FAULT, fault_class=FAULT_REVISION_UNAVAILABLE)
+
+    policy_revision = result.get("revision")
+    reasons = result.get("reasons") or []
+
+    if result.get("allow") is True:
+        return _outcome(OUTCOME_POLICY_ALLOW, policy_revision=policy_revision)
+    return _outcome(OUTCOME_POLICY_DENY, policy_revision=policy_revision, reasons=list(reasons))
+
+
+def _canonical_hash(tool_args: dict) -> str:
+    """SHA-256 over the canonically serialized tool arguments (D5). Sorted
+    keys and a fixed separator so the same logical payload always hashes
+    the same way regardless of dict construction order."""
+    canonical = json.dumps(tool_args, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+_DENIED_PREFIX = "DENIED: "
+
+
+def _strip_denied_prefix(reason: str) -> str:
+    """Some Rego packs already prefix their own message with "DENIED: "
+    (finops.rego, some of gdpr.rego/soc2.rego); others don't (soc2.rego's
+    and finops.rego's deploy_to_production rules). Normalize so the single
+    canonical prefix added below is never doubled."""
+    return reason[len(_DENIED_PREFIX):] if reason.startswith(_DENIED_PREFIX) else reason
+
+
+def _render_message(outcome_type, fault_class, reasons):
+    """Presentational text only - classification already happened in
+    query_opa_policy. This never feeds back into outcome_type/fault_class."""
+    if outcome_type == OUTCOME_POLICY_ALLOW:
+        return "Action approved by policy"
+    if outcome_type == OUTCOME_POLICY_DENY:
+        normalized = [_strip_denied_prefix(r) for r in reasons]
+        return _DENIED_PREFIX + ("; ".join(normalized) if normalized else "Action did not pass policy evaluation.")
+    if outcome_type == OUTCOME_SCHEMA_DENY:
+        return _DENIED_PREFIX + "Schema Validation Failed. " + "; ".join(reasons)
+    # OUTCOME_FAULT
+    return f"{_DENIED_PREFIX}Compliance engine fault ({fault_class}). Fail-closed policy enforced."
 
 
 def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
@@ -534,67 +521,24 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         agent_id (str): Identifier for the agent making the call
 
     Returns:
-        dict: Response with 'status', 'message', and, on a completed ledger
-        write, 'ledger_tx_id' keys
+        dict: 'status', 'message', 'outcome_type', 'fault_class',
+        'policy_revision', and, only when a ledger record actually exists,
+        'ledger_tx_id'.
     """
     logging.info(f"Agent Request -> AIL Intercept: {tool_name} | args={json.dumps(_redact_args(tool_args))}")
 
-    opa_decision = query_opa_policy(tool_name, tool_args)
+    outcome = query_opa_policy(tool_name, tool_args)
+    outcome_type = outcome["outcome_type"]
+    fault_class = outcome["fault_class"]
+    policy_revision = outcome["policy_revision"]
+    reasons = outcome["reasons"]
 
-    if opa_decision.get("allowed", False):
-        response = {
-            "status": "APPROVED",
-            "message": opa_decision.get("reason", "Action approved by policy")
-        }
-        decision_for_ledger = "APPROVED"
-        # For approved requests, use "approved" as policy label
-        policy_label = "approved"
-    else:
-        deny_messages = opa_decision.get("deny", [])
-        combined_reason = (
-            "; ".join(deny_messages) if deny_messages
-            else opa_decision.get("reason", "Action denied by policy")
-        )
-        response = {"status": "DENIED", "message": combined_reason}
-        decision_for_ledger = f"DENIED: {combined_reason}"
-        
-        # Extract policy name from denial reason for Prometheus labeling
-        # Get the first denial message and extract first word (e.g., "SOC2", "FinOps")
-        if deny_messages and deny_messages[0]:
-            first_denial = deny_messages[0]
-            # Extract first word, removing any "DENIED:" prefix
-            policy_label = first_denial.replace("DENIED:", "").strip().split()[0].lower()
-        else:
-            # Fallback: extract from combined reason
-            policy_label = combined_reason.replace("DENIED:", "").strip().split()[0].lower()
+    input_sha256 = _canonical_hash(tool_args)
 
-    logging.info(f"Policy Engine Decision: {response['status']}: {response['message']}")
-    _POLICY_DECISIONS.labels(status=response["status"], tool_name=tool_name, policy=policy_label).inc()
-
-    # OPA produced a decision but its own bundle revision could not be read
-    # back in the same cycle (see query_opa_policy). Recording this decision
-    # would attribute it to no known policy, or worse, to a stale one read
-    # separately - deny and write nothing rather than log an unattributable
-    # entry.
-    if opa_decision.get("digest_unavailable"):
-        # Distinguishes this from an ordinary policy denial: nothing about
-        # tool_args violated policy, the bundle revision that produced the
-        # decision simply could not be established. status stays DENIED so
-        # existing consumers gated on it are unaffected; callers that want
-        # to tell operators the difference check "fault" instead.
-        return {"status": "DENIED", "message": response["message"], "fault": "infrastructure"}
-
-    # policy_revision is only present when OPA itself produced the decision
-    # (see query_opa_policy). Pre-flight rejections (schema validation, no
-    # registered tool) and OPA-unreachable denials never consulted a policy,
-    # so there is nothing to attribute to a revision - the ledger entry is
-    # written without a policy tag rather than a synthesized one.
-    policy_revision = opa_decision.get("policy_revision")
-    decision_text = (
-        f"{decision_for_ledger} (policy: {policy_revision})" if policy_revision else decision_for_ledger
-    )
-
-    # Fail-closed: log to ImmuDB ledger or block execution if unavailable
+    # Fail-closed: log to ImmuDB ledger or the call denies. A fault here is
+    # itself undocumentable (D1's boundary): the recording path is what just
+    # failed, so no record exists and outcome_type is overwritten to fault -
+    # this is the one outcome that never produces a ledger_tx_id.
     ledger_tx_id = None
     try:
         from immudb_ledger import get_ledger
@@ -603,16 +547,50 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         ledger_tx_id = ledger.log_tool_call(
             agent_id=agent_id,
             tool_name=tool_name,
-            payload=tool_args,
-            decision=decision_text,
+            input_sha256=input_sha256,
+            outcome_type=outcome_type,
+            fault_class=fault_class,
+            policy_revision=policy_revision,
+            reasons=reasons,
         )
         logging.info(f"Ledger tx_id: {ledger_tx_id}")
     except Exception as e:
         logging.error(f"ImmuDB ledger unavailable: {e}")
-        return {
-            "status": "DENIED",
-            "message": "Audit ledger unavailable. Execution blocked.",
-        }
+        outcome_type = OUTCOME_FAULT
+        fault_class = FAULT_VERIFIER_UNREACHABLE
+        policy_revision = None
+        reasons = []
 
-    response["ledger_tx_id"] = ledger_tx_id
+    # One increment per call, using the final recorded outcome - not the
+    # OPA-only verdict - so a call OPA approved but never got written never
+    # shows up in metrics as "approved" (see D1/D3).
+    status = "APPROVED" if outcome_type == OUTCOME_POLICY_ALLOW else "DENIED"
+    _POLICY_DECISIONS.labels(
+        status=status,
+        outcome_type=outcome_type,
+        fault_class=fault_class or "",
+        tool_name=tool_name,
+    ).inc()
+
+    message = _render_message(outcome_type, fault_class, reasons)
+    logging.info(f"Policy Engine Decision: {status}: {message}")
+
+    response = {
+        "status": status,
+        "message": message,
+        "outcome_type": outcome_type,
+        "fault_class": fault_class,
+        "policy_revision": policy_revision,
+    }
+
+    if ledger_tx_id is not None:
+        response["ledger_tx_id"] = ledger_tx_id
+        try:
+            from content_store import store_content
+            store_content(ledger_tx_id, tool_args)
+        except Exception as e:
+            # Best-effort join convenience, not part of the integrity chain -
+            # the decision is already durably recorded with its hash (D5).
+            logging.error(f"Content store write failed for tx={ledger_tx_id}: {e}")
+
     return response

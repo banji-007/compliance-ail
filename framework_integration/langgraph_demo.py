@@ -162,15 +162,15 @@ def provision_cloud_server(
         result = execute_provision_cloud_server(instance_type, region, cost_per_hour, tags)
         print(f"{pipeline_prefix} -> [Execution] {result}")
 
-    elif decision.get("fault") == "infrastructure":
+    elif decision.get("outcome_type") == "fault":
+        fault_class = decision.get("fault_class")
         result = (
-            f"AIL INFRASTRUCTURE FAULT (not a policy denial): {decision['message']}\n"
+            f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): {decision['message']}\n"
             f"This request was not evaluated against policy - the compliance "
-            f"gateway could not confirm which policy bundle OPA has loaded. "
-            f"An operator should check the OPA bundle configuration; retrying "
-            f"the same parameters will not fix this."
+            f"gateway could not confirm the decision. An operator should "
+            f"investigate {fault_class}; retrying the same parameters will not fix this."
         )
-        print(f"{pipeline_prefix} -> [Infrastructure Fault] {decision['message']}")
+        print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {decision['message']}")
 
     else:
         result = (
@@ -231,15 +231,15 @@ def query_database(
     if decision["status"] == "APPROVED":
         result = execute_query_database(target_table, query, processing_purpose)
         print(f"{pipeline_prefix} -> [Execution] {result}")
-    elif decision.get("fault") == "infrastructure":
+    elif decision.get("outcome_type") == "fault":
+        fault_class = decision.get("fault_class")
         result = (
-            f"AIL INFRASTRUCTURE FAULT (not a policy denial): {decision['message']}\n"
+            f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): {decision['message']}\n"
             f"This request was not evaluated against policy - the compliance "
-            f"gateway could not confirm which policy bundle OPA has loaded. "
-            f"An operator should check the OPA bundle configuration; retrying "
-            f"the same parameters will not fix this."
+            f"gateway could not confirm the decision. An operator should "
+            f"investigate {fault_class}; retrying the same parameters will not fix this."
         )
-        print(f"{pipeline_prefix} -> [Infrastructure Fault] {decision['message']}")
+        print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {decision['message']}")
     else:
         result = (
             f"BLOCKED by AIL: {decision['message']}\n"
@@ -299,15 +299,15 @@ def deploy_to_production(
     if decision["status"] == "APPROVED":
         result = execute_deploy_to_production(repository_name, commit_hash, environment, approval_ticket)
         print(f"{pipeline_prefix} -> [Execution] {result}")
-    elif decision.get("fault") == "infrastructure":
+    elif decision.get("outcome_type") == "fault":
+        fault_class = decision.get("fault_class")
         result = (
-            f"AIL INFRASTRUCTURE FAULT (not a policy denial): {decision['message']}\n"
+            f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): {decision['message']}\n"
             f"This request was not evaluated against policy - the compliance "
-            f"gateway could not confirm which policy bundle OPA has loaded. "
-            f"An operator should check the OPA bundle configuration; retrying "
-            f"the same parameters will not fix this."
+            f"gateway could not confirm the decision. An operator should "
+            f"investigate {fault_class}; retrying the same parameters will not fix this."
         )
-        print(f"{pipeline_prefix} -> [Infrastructure Fault] {decision['message']}")
+        print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {decision['message']}")
     else:
         result = (
             f"BLOCKED by AIL: {decision['message']}\n"

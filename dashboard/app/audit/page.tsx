@@ -77,7 +77,7 @@ export default function AuditPage() {
 
       {/* Summary stats */}
       {data && (
-        <div className="grid grid-cols-3 gap-4">
+        <div className="grid grid-cols-4 gap-4">
           <StatCard
             label="Total Decisions"
             value={data.total}
@@ -86,20 +86,23 @@ export default function AuditPage() {
           <StatCard
             label="Approved"
             value={
-              data.entries.filter((e) =>
-                e.decision?.toUpperCase().startsWith("APPROVED")
-              ).length
+              data.entries.filter((e) => e.outcome_type === "policy_allow").length
             }
             color="text-emerald-600"
           />
           <StatCard
             label="Denied"
             value={
-              data.entries.filter((e) =>
-                e.decision?.toUpperCase().startsWith("DENIED")
+              data.entries.filter(
+                (e) => e.outcome_type === "policy_deny" || e.outcome_type === "schema_deny"
               ).length
             }
             color="text-red-600"
+          />
+          <StatCard
+            label="Faults"
+            value={data.entries.filter((e) => e.outcome_type === "fault").length}
+            color="text-violet-600"
           />
         </div>
       )}

@@ -12,11 +12,11 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/package-lock.json ./package-lock.json
 COPY . .
-# NEXT_PUBLIC_* vars are baked into the JS bundle at build time.
-# The browser calls localhost:8002 because port 8002 is exposed on the host.
-ARG NEXT_PUBLIC_API_URL=http://localhost:8002
+# NEXT_PUBLIC_* vars are baked into the JS bundle at build time - only a UI
+# default belongs here. CONTROL_PLANE_API_KEY is never a build ARG; it is
+# read from a runtime environment variable by app/api/*/route.ts, which run
+# server-side in the standalone Node server (see docker-compose.yml).
 ARG NEXT_PUBLIC_TENANT_ID=tenant_default
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_TENANT_ID=$NEXT_PUBLIC_TENANT_ID
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build

@@ -40,11 +40,6 @@ ImmuDB runs as a single container with a local volume. There is no backup, no re
 
 **Scope:** Add a test that exercises the vector an attacker (or a misconfigured deployment) with disk access to the verifier's mounted `IMMUDB_SIGNING_PUBKEY` file could actually cause: swap the file the *running* verifier process reads its public key from (e.g. mount a different key file, or point `IMMUDB_SIGNING_PUBKEY` at a second, unrelated keypair's public half before the verifier starts), then confirm the real `/verify` HTTP endpoint on the running verifier container returns `verified: false` for an otherwise-legitimate entry, exercising the same failure through the actual deployed service rather than a hand-modified client object.
 
-### Dashboard Cannot Authenticate to Control Plane
-`control_plane/main.py`'s `/audit` endpoint requires an `X-API-Key` header matching `CONTROL_PLANE_API_KEY`. `dashboard/lib/api.ts` never sends this header on any request, and `docker-compose.yml`'s `dashboard` service is only given `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_TENANT_ID` - no API key at all, and `NEXT_PUBLIC_*` vars are baked into the client-side JS bundle at build time regardless, which is not a safe place for a server-side secret to live in the first place. The Audit Ledger view in the dashboard cannot show a single entry as shipped (see README §3.5). This is dashboard authentication, explicitly out of scope for Phase 0.1 (see `docs/reports/phase-0-1.md`) and deferred to Phase 1 along with the rest of the dashboard's authentication mechanism.
-
-**Scope:** Design a way for the dashboard's server-side (not browser-side) code to hold and send `CONTROL_PLANE_API_KEY`, or replace the static-key scheme with per-session auth the browser can legitimately hold. Out of scope until Phase 1 decides the dashboard's overall auth mechanism.
-
 ### Workload Registrar Retry Logic
 The `workload-registrar` script currently runs exactly once at startup. If it executes and completes before the agent is fully attested, the `langgraph-demo` container may start with stale or missing SPIFFE identity entries, causing a race condition in local environments.
 

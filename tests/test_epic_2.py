@@ -145,16 +145,16 @@ from middleware import query_opa_policy  # noqa: E402
 class TestMiddlewareRoutingFailClosed:
     """Tests for the TOOL_VALIDATORS routing stage inside query_opa_policy.
 
-    query_opa_policy returns a fail-closed denial at the registry lookup
-    (middleware.py lines 202-210) before any network call to OPA is made
-    and before intercept_tool_call's ImmuDB block is reached.
-    No mocking is required.
+    query_opa_policy returns a fail-closed schema_deny outcome at the
+    registry lookup before any network call to OPA is made and before
+    intercept_tool_call's ImmuDB block is reached. No mocking is required.
     """
 
-    def test_hallucinated_tool_is_denied(self):
-        """An unregistered tool name must produce allowed=False."""
+    def test_hallucinated_tool_is_schema_denied(self):
+        """An unregistered tool name must produce outcome_type=schema_deny, not a policy verdict."""
         result = query_opa_policy("hallucinated_tool", {"arbitrary": "payload"})
-        assert result["allowed"] is False
+        assert result["outcome_type"] == "schema_deny"
+        assert result["fault_class"] is None
 
     def test_hallucinated_tool_denial_names_the_tool(self):
         """The denial reason must reference the unknown tool name, not a generic OPA error.
@@ -162,13 +162,13 @@ class TestMiddlewareRoutingFailClosed:
         This distinguishes a pre-flight registry miss from an OPA network failure.
         """
         result = query_opa_policy("hallucinated_tool", {"arbitrary": "payload"})
-        assert "hallucinated_tool" in result["reason"]
+        assert any("hallucinated_tool" in r for r in result["reasons"])
 
-    def test_hallucinated_tool_returns_populated_deny_list(self):
-        """deny must be a non-empty list so downstream Prometheus labeling never KeyErrors."""
+    def test_hallucinated_tool_returns_populated_reasons_list(self):
+        """reasons must be a non-empty list so downstream Prometheus labeling never KeyErrors."""
         result = query_opa_policy("hallucinated_tool", {"arbitrary": "payload"})
-        assert isinstance(result.get("deny"), list)
-        assert len(result["deny"]) > 0
+        assert isinstance(result.get("reasons"), list)
+        assert len(result["reasons"]) > 0
 
 
 # ===========================================================================
@@ -221,8 +221,8 @@ class TestQueryDatabaseOpaIntegration:
         args = {**self._BASE, "masking_enabled": False}
         result = query_opa_policy("query_database", args)
 
-        assert result["allowed"] is False
-        denial_text = " ".join(result.get("deny", [])) + " " + result.get("reason", "")
+        assert result["outcome_type"] == "policy_deny"
+        denial_text = " ".join(result.get("reasons", []))
         assert "SOC2" in denial_text, (
             f"Expected SOC2 in denial text, got: {denial_text!r}"
         )
@@ -236,8 +236,8 @@ class TestQueryDatabaseOpaIntegration:
         args = {**self._BASE, "processing_purpose": "marketing_profiling"}
         result = query_opa_policy("query_database", args)
 
-        assert result["allowed"] is False
-        denial_text = " ".join(result.get("deny", [])) + " " + result.get("reason", "")
+        assert result["outcome_type"] == "policy_deny"
+        denial_text = " ".join(result.get("reasons", []))
         assert "GDPR" in denial_text, (
             f"Expected GDPR in denial text, got: {denial_text!r}"
         )
@@ -270,8 +270,8 @@ class TestDeployToProductionOpaIntegration:
         args = {**self._BASE, "environment": "production", "approval_ticket": ""}
         result = query_opa_policy("deploy_to_production", args)
 
-        assert result["allowed"] is False
-        denial_text = " ".join(result.get("deny", [])) + " " + result.get("reason", "")
+        assert result["outcome_type"] == "policy_deny"
+        denial_text = " ".join(result.get("reasons", []))
         assert "SOC2" in denial_text, (
             f"Expected SOC2 in denial text, got: {denial_text!r}"
         )
@@ -284,8 +284,8 @@ class TestDeployToProductionOpaIntegration:
         args = {**self._BASE, "bypass_ci": True}
         result = query_opa_policy("deploy_to_production", args)
 
-        assert result["allowed"] is False
-        denial_text = " ".join(result.get("deny", [])) + " " + result.get("reason", "")
+        assert result["outcome_type"] == "policy_deny"
+        denial_text = " ".join(result.get("reasons", []))
         assert "SOC2" in denial_text, (
             f"Expected SOC2 in denial text, got: {denial_text!r}"
         )
@@ -304,8 +304,8 @@ class TestDeployToProductionOpaIntegration:
         }
         result = query_opa_policy("deploy_to_production", args)
 
-        assert result["allowed"] is False
-        denial_text = " ".join(result.get("deny", [])) + " " + result.get("reason", "")
+        assert result["outcome_type"] == "policy_deny"
+        denial_text = " ".join(result.get("reasons", []))
         assert "FinOps" in denial_text, (
             f"Expected FinOps in denial text, got: {denial_text!r}"
         )

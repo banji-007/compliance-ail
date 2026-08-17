@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from bundle import generate_bundle
 from database import Base, engine, get_db
-from models import Tenant
+from models import CallContent, Tenant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -154,6 +154,13 @@ class TenantRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ContentWrite(BaseModel):
+    """D5: raw tool arguments for a ledger transaction, stored separately
+    from the immutable ledger so they remain erasable."""
+    tx_id: int
+    payload: dict
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -234,31 +241,70 @@ def get_bundle(tenant_id: str, request: Request, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/audit")
-def get_audit(limit: int = 100, _: None = Depends(_require_api_key)):
+@app.post("/content", status_code=204)
+def write_content(
+    payload: ContentWrite,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_api_key),
+):
     """
-    Return verified audit entries from ImmuDB.
+    Upsert the raw tool arguments for a ledger transaction (D5). Called by
+    the interceptor, best-effort, after the ledger write for that tx_id has
+    already succeeded - this store is a join convenience, not part of the
+    integrity chain, so it is intentionally separate from the ledger write
+    path and can be erased independently (see DELETE /content/{tx_id}).
+    """
+    existing = db.query(CallContent).filter_by(tx_id=payload.tx_id).first()
+    payload_json = json.dumps(payload.payload)
+    if existing:
+        existing.payload_json = payload_json
+    else:
+        db.add(CallContent(tx_id=payload.tx_id, payload_json=payload_json))
+    db.commit()
+
+
+@app.delete("/content/{tx_id}", status_code=204)
+def erase_content(
+    tx_id: int,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_api_key),
+):
+    """
+    GDPR Article 17 erasure: delete the raw-argument row for a transaction.
+    The ledger entry for the same tx_id is untouched - it still proves what
+    was decided and that the input hashed to input_sha256; only the erasable
+    content this hash could be checked against is gone.
+    """
+    db.query(CallContent).filter_by(tx_id=tx_id).delete()
+    db.commit()
+
+
+@app.get("/audit")
+def get_audit(limit: int = 100, _: None = Depends(_require_api_key), db: Session = Depends(get_db)):
+    """
+    Return audit entries: the structured outcome record from ImmuDB, the
+    read-time verification state (D2 - never self-certified by the entry),
+    and the raw arguments joined from the erasable content store (D5).
 
     Scans for all tool_call: keys via REST (no SDK needed for a key listing),
-    then calls the verifier service for each key. The verifier uses
-    immudb-py verifiedGet, which walks the inclusion proof (leaf->eH) and the
-    dual consistency proof from the persisted signed state. The result is
-    authoritative: if the SDK says verified: true, the entry is cryptographically
-    bound to the stored state chain. verified: false means the entry should be
-    treated as potentially tampered and is flagged in the response.
+    then calls the verifier service for each key to compute verification
+    state. See docs/adr/0006-verification-states.md for why this is computed
+    here, at read time, rather than stored in the entry.
 
     Returns:
         {"entries": [...], "total": <int>}
 
     Each entry:
-        tx_id     - ImmuDB transaction ID
-        agent_id  - SPIFFE workload identity
-        timestamp - ISO-8601 UTC string
-        tool_name - tool that was intercepted
-        payload   - original tool arguments
-        decision  - OPA verdict
-        verified  - bool; false means the SDK proof check failed - treat as integrity warning
-        state_id  - tx_id of the latest verified state the verifier holds after this check
+        tx_id, agent_id, timestamp, tool_name  - as recorded
+        outcome_type   - policy_allow | policy_deny | schema_deny | fault
+        fault_class    - null, or the closed-set fault reason
+        policy_revision - the bundle revision that produced the decision, or null
+        reasons        - deny messages, empty for an allow
+        input_sha256   - hash of the original tool arguments
+        payload        - joined from the content store by tx_id; null if never
+                          stored or erased
+        verification   - {state, state_id, detail, error_class}; state is one
+                          of verified | failed | unverifiable | asserted
     """
     if not IMMUDB_USER or not IMMUDB_PASSWORD:
         raise HTTPException(
@@ -301,7 +347,7 @@ def get_audit(limit: int = 100, _: None = Depends(_require_api_key)):
         logger.error("ImmuDB unavailable for audit scan: %s", exc)
         raise HTTPException(status_code=503, detail=f"ImmuDB unavailable: {exc}")
 
-    # --- Verify each entry via the verifier service ---
+    # --- Verify each entry via the verifier service; join content by tx_id ---
     verifier_up = True
     entries = []
     for raw in raw_entries:
@@ -311,50 +357,78 @@ def get_audit(limit: int = 100, _: None = Depends(_require_api_key)):
             log_entry: dict        = json.loads(serialized_entry)
             tx_id: int             = int(raw.get("tx", 0))
 
-            verified  = False
-            state_id  = None
-            if verifier_up:
+            if not verifier_up:
+                # A prior entry in this same scan already failed to reach the
+                # verifier - this entry was never attempted at all.
+                verification = {"state": "asserted", "state_id": None, "detail": None, "error_class": None}
+            else:
                 try:
                     with httpx.Client(timeout=10.0) as vc:
-                        vr = vc.post(
-                            f"{VERIFIER_URL}/verify",
-                            json={"key": encoded_key},
-                        )
+                        vr = vc.post(f"{VERIFIER_URL}/verify", json={"key": encoded_key})
                     if vr.status_code == 200:
-                        vdata    = vr.json()
-                        verified = vdata.get("verified", False)
-                        state_id = vdata.get("state_id")
-                        if not verified:
+                        vdata = vr.json()
+                        if vdata.get("verified"):
+                            verification = {
+                                "state": "verified",
+                                "state_id": vdata.get("state_id"),
+                                "detail": None,
+                                "error_class": None,
+                            }
+                        else:
                             logger.warning(
-                                "Audit: entry tx=%d failed verification: %s",
-                                tx_id,
-                                vdata.get("detail"),
+                                "Audit: entry tx=%d failed verification: %s", tx_id, vdata.get("detail")
                             )
+                            verification = {
+                                "state": "failed",
+                                "state_id": vdata.get("state_id"),
+                                "detail": vdata.get("detail"),
+                                "error_class": vdata.get("error_class"),
+                            }
                     else:
                         logger.warning("Verifier returned HTTP %d for tx=%d", vr.status_code, tx_id)
+                        verification = {
+                            "state": "unverifiable",
+                            "state_id": None,
+                            "detail": f"verifier returned HTTP {vr.status_code}",
+                            "error_class": None,
+                        }
                 except Exception as vexc:
                     logger.error("Verifier unreachable during audit: %s", vexc)
-                    verifier_up = False  # stop hammering on every entry
+                    verifier_up = False  # stop hammering; remaining entries become "asserted"
+                    verification = {
+                        "state": "unverifiable",
+                        "state_id": None,
+                        "detail": str(vexc),
+                        "error_class": None,
+                    }
+
+            content_row = db.query(CallContent).filter_by(tx_id=tx_id).first()
+            payload = json.loads(content_row.payload_json) if content_row else None
 
             entries.append({
-                "tx_id":     tx_id,
-                "agent_id":  log_entry.get("agent_id"),
-                "timestamp": log_entry.get("timestamp"),
-                "tool_name": log_entry.get("tool_name"),
-                "payload":   log_entry.get("payload"),
-                "decision":  log_entry.get("decision"),
-                "verified":  verified,
-                "state_id":  state_id,
+                "tx_id":           tx_id,
+                "agent_id":        log_entry.get("agent_id"),
+                "timestamp":       log_entry.get("timestamp"),
+                "tool_name":       log_entry.get("tool_name"),
+                "outcome_type":    log_entry.get("outcome_type"),
+                "fault_class":     log_entry.get("fault_class"),
+                "policy_revision": log_entry.get("policy_revision"),
+                "reasons":         log_entry.get("reasons", []),
+                "input_sha256":    log_entry.get("input_sha256"),
+                "payload":         payload,
+                "verification":    verification,
             })
         except Exception as exc:
             logger.warning("Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc)
             continue
 
     logger.info(
-        "Audit: %d entries; verifier_up=%s verified=%d unverified=%d",
+        "Audit: %d entries; verifier_up=%s by state: verified=%d failed=%d unverifiable=%d asserted=%d",
         len(entries),
         verifier_up,
-        sum(1 for e in entries if e["verified"]),
-        sum(1 for e in entries if not e["verified"]),
+        sum(1 for e in entries if e["verification"]["state"] == "verified"),
+        sum(1 for e in entries if e["verification"]["state"] == "failed"),
+        sum(1 for e in entries if e["verification"]["state"] == "unverifiable"),
+        sum(1 for e in entries if e["verification"]["state"] == "asserted"),
     )
     return {"entries": entries, "total": len(entries)}

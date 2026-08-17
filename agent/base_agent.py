@@ -80,12 +80,13 @@ class BaseAgent:
                     )
                     print(f"{pipeline_prefix} -> [Execution] {result}")
                     result += f"\n[Interceptor: {interceptor_response['message']}]"
-                elif interceptor_response.get("fault") == "infrastructure":
+                elif interceptor_response.get("outcome_type") == "fault":
+                    fault_class = interceptor_response.get("fault_class")
                     result = (
-                        f"AIL INFRASTRUCTURE FAULT (not a policy denial): {interceptor_response['message']}. "
-                        f"An operator should check the OPA bundle configuration."
+                        f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): "
+                        f"{interceptor_response['message']}. An operator should investigate."
                     )
-                    print(f"{pipeline_prefix} -> [Infrastructure Fault] {interceptor_response['message']}")
+                    print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {interceptor_response['message']}")
                 else:
                     result = f"Action blocked by interceptor: {interceptor_response['message']}"
                     print(f"{pipeline_prefix} -> [Block] {interceptor_response['message']}")

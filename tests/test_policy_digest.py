@@ -14,7 +14,6 @@ verifier). SPIRE_DISABLED=true bypasses mTLS, matching Makefile:45-53.
 """
 
 import os
-import re
 import sys
 
 import httpx
@@ -113,10 +112,8 @@ def test_recorded_digest_matches_opa_not_interceptor_belief(monkeypatch):
     matching = [e for e in entries if e.get("tx_id") == response["ledger_tx_id"]]
     assert matching, f"tx_id {response['ledger_tx_id']} not found in /audit"
 
-    decision = matching[0]["decision"]
-    m = re.search(r"\(policy: ([0-9a-f]+)\)", decision)
-    assert m, f"No policy revision recorded in decision string: {decision!r}"
-    recorded_digest = m.group(1)
+    recorded_digest = matching[0]["policy_revision"]
+    assert recorded_digest, f"No policy_revision recorded on entry: {matching[0]!r}"
 
     assert recorded_digest == live_revision, (
         f"Recorded digest {recorded_digest} does not match OPA's live revision "
@@ -125,31 +122,36 @@ def test_recorded_digest_matches_opa_not_interceptor_belief(monkeypatch):
 
 
 @requires_stack
-def test_digest_unavailable_denies_and_writes_no_ledger_entry(monkeypatch):
+def test_digest_unavailable_denies_and_writes_a_fault_record(monkeypatch):
     """
     Simulates the bundle-revision read failing in the same cycle as an
-    otherwise-successful OPA decision, by pointing the revision lookup at a
-    bundle name OPA never loaded (OPA returns {} - undefined - for that
-    path, exactly as it would for any other reason the read fails). The
-    call must deny and must not write to the ledger - no placeholder digest,
-    no unattributable entry.
+    otherwise-successful OPA decision, by pointing the interceptor's
+    combined evaluation query at a bundle name OPA never loaded (OPA's
+    revision lookup returns undefined, exactly as it would for any other
+    reason the read fails, so `evaluation` itself is undefined - see
+    policy/core/main.rego). Under D1 (Phase 1) this denies AND writes a
+    fault record with a null revision - this reverses the old assertion
+    ("no ledger entry"), the one pre-authorized change in Phase 1.
     """
-    monkeypatch.setattr(
-        middleware,
-        "_OPA_REVISION_URL",
-        f"{OPA_BASE}/v1/data/system/bundles/nonexistent-bundle/manifest/revision",
-    )
-
-    before = {e["tx_id"] for e in _audit_entries()}
+    # The bundle name travels in the request body (input.bundle_name), read
+    # from this module global at call time - point it at a bundle OPA never
+    # loaded so policy/core/main.rego's revision lookup is undefined.
+    monkeypatch.setattr(middleware, "_BUNDLE_NAME", "nonexistent-bundle")
 
     response = middleware.intercept_tool_call(
         "provision_cloud_server", _APPROVED_ARGS, "test_digest_agent"
     )
 
     assert response["status"] == "DENIED", f"Expected DENIED, got: {response}"
-    assert "ledger_tx_id" not in response, f"Expected no ledger write, got: {response}"
+    assert response["outcome_type"] == "fault", f"Expected a fault outcome, got: {response}"
+    assert response["fault_class"] == "revision_unavailable", f"Expected revision_unavailable, got: {response}"
+    assert response["policy_revision"] is None, f"Expected a null revision, got: {response}"
+    assert "ledger_tx_id" in response, f"Expected a fault record to still be written, got: {response}"
 
-    after = {e["tx_id"] for e in _audit_entries()}
-    assert after == before, (
-        f"Ledger gained entries {after - before} despite the digest being unobtainable"
-    )
+    entries = _audit_entries()
+    matching = [e for e in entries if e.get("tx_id") == response["ledger_tx_id"]]
+    assert matching, f"tx_id {response['ledger_tx_id']} not found in /audit"
+    entry = matching[0]
+    assert entry["outcome_type"] == "fault"
+    assert entry["fault_class"] == "revision_unavailable"
+    assert entry["policy_revision"] is None

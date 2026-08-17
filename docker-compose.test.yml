@@ -74,6 +74,12 @@ services:
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
     volumes:
       - ./keys:/keys:ro
+      # ImmuDB's own data dir - must persist symmetrically with
+      # test-verifier-state (P1-10) or a down (no -v) + up cycle leaves the
+      # verifier's trust anchor pointing at transactions a fresh, empty
+      # ImmuDB no longer has, and the next verifiedGet fails with "illegal
+      # state".
+      - test-immudb-data:/var/lib/immudb
     command:
       - "--signingKey=/keys/signing.key"
     healthcheck:
@@ -110,3 +116,4 @@ services:
 volumes:
   test-control-plane-data:
   test-verifier-state:
+  test-immudb-data:

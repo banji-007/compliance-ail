@@ -297,7 +297,7 @@ def test_cross_process():
         f"Written tx={written_tx} not found in audit "
         f"(present: {[e.get('tx_id') for e in entries]})"
     )
-    assert matching[0]["verified"] is True, (
+    assert matching[0]["verification"]["state"] == "verified", (
         f"Entry tx={written_tx} is not verified in /audit: {matching[0]}"
     )
 

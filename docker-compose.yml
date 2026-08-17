@@ -75,6 +75,11 @@ services:
       # "make keygen" before starting. Without this file, ImmuDB starts without
       # signing; the verifier will log a warning but still run.
       - ./keys:/keys:ro
+      # ImmuDB's own data dir. Without this, a `down` (no -v) + `up` cycle
+      # recreates ImmuDB empty while verifier-state (below) persists its old
+      # trust anchor, and the next verifiedGet fails with "illegal state"
+      # (Phase 1, P1-10) - the two volumes must be symmetric.
+      - immudb-data:/var/lib/immudb
     command:
       - "--signingKey=/keys/signing.key"
     healthcheck:
@@ -246,6 +251,10 @@ services:
       - OPA_URL=https://envoy:8443/v1/data/ail/main/allow
       - SPIRE_DISABLED=false
       - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      # Content-store writes (D5) go straight to the control plane, not
+      # through the verifier - same key the control plane itself enforces
+      # on POST/DELETE /content.
+      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
       - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
     volumes:
@@ -408,12 +417,18 @@ services:
       context: ./dashboard
       dockerfile: Dockerfile
       args:
-        # NEXT_PUBLIC_* vars are baked into the JS bundle at build time.
-        # Browser-side fetches hit localhost:8002 (host-exposed port).
-        NEXT_PUBLIC_API_URL: http://localhost:8002
+        # Only a UI default (which tenant is preselected), not a secret -
+        # safe to bake into the JS bundle. The control plane's API key is
+        # never a build arg or a NEXT_PUBLIC_* var - see D4 and
+        # dashboard/app/api/*/route.ts, which hold it server-side only.
         NEXT_PUBLIC_TENANT_ID: tenant_default
     ports:
       - "3001:3001"
+    environment:
+      # Server-side only (Route Handlers under app/api/) - never reaches
+      # the browser bundle.
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
     depends_on:
       ail-control-plane:
         condition: service_healthy
@@ -434,3 +449,7 @@ volumes:
   # Verifier's rolling SDK state (PersistentRootService pickle).
   # Not mounted in the interceptor container — enforces write/verify separation.
   verifier-state:
+  # ImmuDB's own data directory. Must persist symmetrically with
+  # verifier-state (Phase 1, P1-10) or a down/up cycle without -v produces a
+  # verifier trust anchor pointing at transactions ImmuDB no longer has.
+  immudb-data:

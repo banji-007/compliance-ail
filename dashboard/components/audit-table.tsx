@@ -1,47 +1,62 @@
 "use client";
 
 import { useState, useMemo } from "react";
-import { Search, ShieldCheck, ShieldAlert } from "lucide-react";
+import { Search, ShieldCheck, ShieldAlert, ShieldQuestion, CircleDashed } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import type { BadgeProps } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { formatTimestamp } from "@/lib/utils";
-import type { AuditEntry } from "@/lib/types";
+import type { AuditEntry, OutcomeType } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function decisionVariant(
-  decision: string | null
-): "approved" | "denied" | "secondary" {
-  if (!decision) return "secondary";
-  const upper = decision.toUpperCase();
-  if (upper.startsWith("APPROVED")) return "approved";
-  if (upper.startsWith("DENIED")) return "denied";
-  return "secondary";
-}
+const OUTCOME_LABEL: Record<OutcomeType, string> = {
+  policy_allow: "APPROVED",
+  policy_deny: "POLICY DENIED",
+  schema_deny: "SCHEMA REJECTED",
+  fault: "INFRASTRUCTURE FAULT",
+};
+
+const OUTCOME_VARIANT: Record<OutcomeType, NonNullable<BadgeProps["variant"]>> = {
+  policy_allow: "approved",
+  policy_deny: "denied",
+  schema_deny: "warning",
+  fault: "fault",
+};
 
 /**
- * Renders a compact verdict badge ("APPROVED" / "DENIED") with the full
- * policy reason displayed as smaller muted text beneath it.
+ * Renders a badge distinguishing all four outcome_types (P1-7) — a policy
+ * denial (a real compliance violation), a schema rejection (the LLM's
+ * payload was malformed, never reached policy), and an infrastructure
+ * fault (no decision was made at all) must never look alike. Reasons/
+ * fault_class render as smaller text beneath, same as the policy revision.
  */
-function DecisionCell({ decision }: { decision: string | null }) {
-  if (!decision) return <span className="text-muted-foreground text-xs">—</span>;
+function DecisionCell({ entry }: { entry: AuditEntry }) {
+  if (!entry.outcome_type) return <span className="text-muted-foreground text-xs">—</span>;
 
-  // Split "DENIED: gdpr.data_residency_required" into verdict + reason
-  const colonIdx = decision.indexOf(":");
-  const verdict = colonIdx === -1 ? decision : decision.slice(0, colonIdx).trim();
-  const reason = colonIdx === -1 ? null : decision.slice(colonIdx + 1).trim();
+  const detail =
+    entry.outcome_type === "fault"
+      ? entry.fault_class
+      : entry.reasons.length > 0
+      ? entry.reasons.join("; ")
+      : null;
 
   return (
     <div className="flex flex-col gap-1">
-      <Badge variant={decisionVariant(decision)} className="w-fit text-xs">
-        {verdict}
+      <Badge variant={OUTCOME_VARIANT[entry.outcome_type]} className="w-fit text-xs">
+        {OUTCOME_LABEL[entry.outcome_type]}
       </Badge>
-      {reason && (
+      {detail && (
         <span className="text-xs text-muted-foreground break-words leading-tight">
-          {reason}
+          {detail}
+        </span>
+      )}
+      {entry.policy_revision && (
+        <span className="text-[10px] text-muted-foreground/70 font-mono">
+          policy: {entry.policy_revision}
         </span>
       )}
     </div>
@@ -49,27 +64,63 @@ function DecisionCell({ decision }: { decision: string | null }) {
 }
 
 /**
- * verified is the one signal in this table that a tamper check actually
- * failed (or could not be run - the API does not currently distinguish the
- * two, see AuditEntry.verified). It must never render as blank or absent.
+ * Renders one of the four verification states distinctly (P1-7, D2).
+ * "asserted" is deliberately the quiet, neutral one — it is not a problem,
+ * it means no check was attempted for this entry. "unverifiable" and
+ * "failed" are both problems, but different ones: one is "we could not
+ * check", the other is the actual tamper signal.
  */
 function VerificationCell({ entry }: { entry: AuditEntry }) {
-  if (entry.verified) {
+  const v = entry.verification;
+
+  if (v.state === "verified") {
     return (
       <div className="flex items-center gap-1.5 text-xs">
         <ShieldCheck className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
         <span className="text-muted-foreground">
-          Verified{entry.state_id != null ? ` · state ${entry.state_id}` : ""}
+          Verified{v.state_id != null ? ` · state ${v.state_id}` : ""}
         </span>
       </div>
     );
   }
 
+  if (v.state === "failed") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <ShieldAlert className="h-3.5 w-3.5 text-red-500 shrink-0" />
+        <div className="flex flex-col gap-0.5">
+          <Badge variant="denied" className="w-fit">
+            FAILED{v.error_class ? `: ${v.error_class.toUpperCase()}` : ""}
+          </Badge>
+        </div>
+      </div>
+    );
+  }
+
+  if (v.state === "unverifiable") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <ShieldQuestion className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+        <div className="flex flex-col gap-0.5">
+          <Badge variant="warning" className="w-fit">
+            UNVERIFIABLE
+          </Badge>
+          {v.detail && (
+            <span className="text-[10px] text-muted-foreground break-words leading-tight">
+              {v.detail}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // asserted — quiet by design: we simply did not look.
   return (
     <div className="flex items-center gap-1.5 text-xs">
-      <ShieldAlert className="h-3.5 w-3.5 text-red-500 shrink-0" />
-      <Badge variant="denied" className="w-fit">
-        UNVERIFIED
+      <CircleDashed className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+      <Badge variant="muted" className="w-fit">
+        NOT CHECKED
       </Badge>
     </div>
   );
@@ -101,9 +152,11 @@ export function AuditTable({ entries }: Props) {
       const haystack = [
         e.agent_id,
         e.tool_name,
-        e.decision,
+        e.outcome_type,
+        e.fault_class,
+        e.reasons.join(" "),
         e.timestamp,
-        e.verified ? "verified" : "unverified",
+        e.verification.state,
         JSON.stringify(e.payload ?? {}),
       ]
         .join(" ")
@@ -171,7 +224,7 @@ export function AuditTable({ entries }: Props) {
                     {entry.tool_name ?? "—"}
                   </td>
                   <td className="px-4 py-3 max-w-[14rem]">
-                    <DecisionCell decision={entry.decision} />
+                    <DecisionCell entry={entry} />
                   </td>
                   <td className="px-4 py-3">
                     <VerificationCell entry={entry} />

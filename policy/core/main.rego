@@ -53,3 +53,18 @@ compliance_summary := {
     "violations": all_violations,
     "compliant": count(all_violations) == 0,
 }
+
+# --- Combined evaluation (Phase 1, P1-1) ---
+# One query returns the verdict, the deny reasons, and the bundle revision
+# that produced them together, over the same channel. allow always has a
+# default and all_violations is a partial set (always at least empty), so
+# neither can be undefined - the only way this whole rule is undefined is
+# if the revision lookup is, e.g. a bundle-name mismatch or a bundle that
+# has not loaded yet. That makes "no result" an unambiguous signal: the
+# decision cannot be attributed to a known policy revision, not that
+# something else went wrong.
+evaluation := {
+    "allow": allow,
+    "reasons": all_violations,
+    "revision": data.system.bundles[input.bundle_name].manifest.revision,
+}

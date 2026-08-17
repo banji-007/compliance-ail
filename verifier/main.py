@@ -108,6 +108,11 @@ class VerifyResponse(BaseModel):
     timestamp: int | None = None
     state_id: int | None = None  # latest verified state tx_id
     detail: str | None = None
+    # Closed set distinguishing which proof failed (D2): "consistency_failure"
+    # (ErrCorruptedData - the linear-hash chain diverged), "signature_failure"
+    # (BadSignatureError - the server's ECDSA state signature didn't verify),
+    # or "unknown" for anything else. Only meaningful when verified is False.
+    error_class: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +162,7 @@ def verify(payload: VerifyRequest):
     If signing is configured, the returned state is verified against the
     server's ECDSA signature before updating local state.
     """
+    from ecdsa.keys import BadSignatureError
     from immudb.exceptions import ErrCorruptedData
 
     key = base64.b64decode(payload.key)
@@ -179,10 +185,21 @@ def verify(payload: VerifyRequest):
         )
     except ErrCorruptedData:
         logger.warning("verifiedGet: proof failed for key %.32s...", payload.key)
-        return VerifyResponse(verified=False, detail="proof verification failed")
+        return VerifyResponse(
+            verified=False,
+            detail="consistency proof failed - the linear-hash chain diverged",
+            error_class="consistency_failure",
+        )
+    except BadSignatureError:
+        logger.warning("verifiedGet: state signature failed for key %.32s...", payload.key)
+        return VerifyResponse(
+            verified=False,
+            detail="state signature verification failed",
+            error_class="signature_failure",
+        )
     except Exception as exc:
         logger.error("verifiedGet error: %s", exc)
-        return VerifyResponse(verified=False, detail=str(exc))
+        return VerifyResponse(verified=False, detail=str(exc), error_class="unknown")
 
 
 if __name__ == "__main__":
