@@ -275,3 +275,30 @@ Full suite, `docker-compose.test.yml`, fresh volumes (`down -v` / `up -d --build
 No test skipped, no test newly `xfail`ed, no assertion weakened (§5). 84 = 78 (Phase 1.1's own baseline) - 6 (`tests/test_bundle_ownership.py`, removed as obsolete, P12-1) + 12 new (3 in `test_bundle_revision_attribution.py`, 4 in `test_deny_message_formatting.py`, 3 new in `test_content_states.py`, 2 new in `test_verification.py`).
 
 **End SHA for audit purposes:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1` (§1's reflexivity note explains why every subsequent commit on this branch, as of this writing, is documentation-only and does not move this number). CI run `32073638413` (`integration-tests`, `success`, 2m9s) ran at this exact commit. A second CI run, `32073875146` (`integration-tests`, `success`, 2m1s), ran at one of the documentation-only commits on top of it, confirming those edits didn't disturb anything - not evidence of any further code change. PR #2 confirmed `OPEN`, `mergedAt: null` throughout - not merged.
+
+---
+
+## 8. Discovered outside scope
+
+**Claim (falsifiable):** OPA's own HTTP Data API accepts unauthenticated writes to paths outside any loaded bundle's declared `roots` - including `data.system.bundles.<name>`, the exact path D9's `evaluation` rule reads for revision attribution - from any caller able to reach OPA's port, with no credential of any kind.
+
+**Falsifier:** an unauthenticated `PUT /v1/data/system/bundles/<name>` returns anything other than a 2xx, or has no effect on a subsequent read of that path.
+
+**Evidence (command, live, this session - the same calls §3/P12-1 already uses to test D9 itself):**
+
+```
+$ curl -s -X PUT http://localhost:8181/v1/data/system/bundles/decoy-ail-<id> \
+    -H "Content-Type: application/json" \
+    -d '{"manifest":{"revision":"DECOY-AIL-REV","roots":["ail"]}}'
+(200, empty body)
+$ curl -s http://localhost:8181/v1/data/system/bundles
+{"result":{"ail-policies":{...},"decoy-ail-<id>":{"manifest":{"revision":"DECOY-AIL-REV","roots":["ail"]}}}}
+```
+
+Confirmed for both a disjoint-root decoy (`roots: ["decoy"]`) and an `ail`-root decoy (`roots: ["ail"]`) - the latter is the exact live repro behind §3/P12-1's `test_two_claimants_of_ail_root_is_undefined`: once written, every subsequent `/evaluation` call returns undefined, which the interceptor already treats as `FAULT_REVISION_UNAVAILABLE` (deny). That is a fail-closed denial-of-service reachable from OPA's port with zero credentials, on demand, by anyone.
+
+**Root cause, shared with S2 (pre-D9):** a bundle's declared `roots` restrict what *that bundle's own content* may claim inside the aggregated policy tree; they say nothing about who may issue an arbitrary `PUT`/`DELETE` against OPA's general-purpose Data API. D9 removes the caller's ability to *choose* which bundle's revision gets attributed - it does not, and cannot from inside Rego, close the write path itself. The write still succeeds either way; D9 only changed what a successful write can do.
+
+**Blast radius - not established this session, out of D9-D11's mandate to establish:** whether this same unauthenticated-write surface can produce an *approval* a correctly-configured policy would otherwise refuse (a full bypass of the enforcement layer), or is confined to the denial side (a DoS with a clear diagnostic signature once an operator knows to look for a `decoy-*` key under `data.system.bundles`). Untested this session: writes to `data.ail.config.*` (the tenant values `approved_regions`/`approved_purposes`/`allowed_cost_centers` the GDPR/FinOps packs read), `POST /v1/policies` module installation and its interaction with `deny` as a partial set, and unloading or reconfiguring the real `ail-policies` bundle.
+
+**Disposition:** deferred to Phase 2 per architect decision (2026-08-18) - Envoy/network-layer authorization on OPA's exposed API surface is a deployment-configuration fix, not a Rego or record-integrity change, and out of scope for "no design changes beyond D9-D11." Recorded here rather than left for a red-team session to independently rediscover, per this project's own review protocol (`docs/process/review-protocol.md`): a disclosure volunteered in the build report is not a finding for the red team to take credit for, but a live-confirmed unauthenticated write to a running policy engine does not get quietly dropped either.
