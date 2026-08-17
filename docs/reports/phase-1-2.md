@@ -6,7 +6,9 @@
 
 **Start SHA:** `e7e9607`.
 
-**End SHA - the commit to audit:** `832c5e630cce31ea6d40d001cc65e2749ede9737`. Two commits went onto `phase-1-1-remediation`, pushed to origin: `82777b2` (the code change - policy, interceptor, control plane, ledger, tests) and `832c5e6` (docs-only, this report's own end-of-report pointers). `832c5e6` is the actual branch head and the one to check out for audit - it contains everything in `82777b2` plus nothing else code-relevant. An earlier version of this report named `82777b2` as the end SHA, written before the docs-only commit was pushed; that was stale the moment it was superseded and is corrected here. PR #2 confirmed `OPEN`, `mergedAt: null` at `832c5e6` - not merged.
+**End SHA for audit purposes - the last commit that changes code or tests:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1`. This is the commit to diff/build/test against; everything §3-§7 describes is true as of this commit and no other.
+
+**A reflexivity note, stated once here rather than chased with more commits:** every commit after `82777b2` on this branch, including this sentence's own commit, only edits this report file (fixing its own SHA/CI-run pointers, like this one). Each such edit necessarily lags the branch head it names by exactly one commit, because a commit cannot state its own hash before it exists - a prior version of this section learned this the hard way, naming `82777b2` as "the end SHA" in the same breath as a second, not-yet-written commit, then naming that second commit in a third that was itself already stale on arrival. Do not chase this further. For the true current branch head at audit time, run `git rev-parse origin/phase-1-1-remediation` (or `gh pr view 2 --json headRefOid`) - it will be some commit at or after `82777b2` whose only diff from `82777b2` is to this file's own bookkeeping. PR #2 was confirmed `OPEN`, `mergedAt: null` as of every check performed in this session - not merged.
 
 **Environment:**
 
@@ -272,6 +274,4 @@ Full suite, `docker-compose.test.yml`, fresh volumes (`down -v` / `up -d --build
 
 No test skipped, no test newly `xfail`ed, no assertion weakened (§5). 84 = 78 (Phase 1.1's own baseline) - 6 (`tests/test_bundle_ownership.py`, removed as obsolete, P12-1) + 12 new (3 in `test_bundle_revision_attribution.py`, 4 in `test_deny_message_formatting.py`, 3 new in `test_content_states.py`, 2 new in `test_verification.py`).
 
-**Code commit:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1` - CI run `32073638413` (`integration-tests`, `success`, 2m9s) ran at this head.
-
-**End SHA - the commit to audit:** `832c5e630cce31ea6d40d001cc65e2749ede9737` (docs-only, on top of `82777b2`, no code or test changes - see §1) - CI run `32073875146` (`integration-tests`, `success`, 2m1s) ran at this head, confirming the docs-only commit didn't disturb anything. This is the actual branch head; check it out for audit, not `82777b2`. PR #2 confirmed `OPEN`, `mergedAt: null` at this head - not merged.
+**End SHA for audit purposes:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1` (§1's reflexivity note explains why every subsequent commit on this branch, as of this writing, is documentation-only and does not move this number). CI run `32073638413` (`integration-tests`, `success`, 2m9s) ran at this exact commit. A second CI run, `32073875146` (`integration-tests`, `success`, 2m1s), ran at one of the documentation-only commits on top of it, confirming those edits didn't disturb anything - not evidence of any further code change. PR #2 confirmed `OPEN`, `mergedAt: null` throughout - not merged.
