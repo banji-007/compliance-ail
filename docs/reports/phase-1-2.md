@@ -6,9 +6,9 @@
 
 **Start SHA:** `e7e9607`.
 
-**End SHA:** see section 7 for the commit(s) made on `phase-1-1-remediation` and the CI run id for the updated head.
+**End SHA:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1`, one commit onto `phase-1-1-remediation`, pushed to origin. PR #2 confirmed still `OPEN`/`MERGEABLE` after the push, head updated to this SHA - not merged.
 
-**Environment:**　
+**Environment:**
 
 - Windows 11, Docker Desktop, Docker Compose v2 (`docker compose`), OPA `1.14.1` (the pinned image in `docker-compose.test.yml`). `make` is not installed in this environment (same as Phase 1.1's own report noted) - `test-integration`'s steps were run by hand, the same commands the fixed Makefile issues.
 - Work was done in a fresh scratch clone (`phase12-work`, a directory name not used by any earlier session), `git clone` + `git checkout phase-1-1-remediation` at `e7e9607`, origin repointed at the GitHub remote. Docker images were built with `docker compose build --no-cache` for all three custom services (`ail-control-plane`, `verifier`, `dashboard`) before any test ran.
@@ -272,6 +272,6 @@ Full suite, `docker-compose.test.yml`, fresh volumes (`down -v` / `up -d --build
 
 No test skipped, no test newly `xfail`ed, no assertion weakened (§5). 84 = 78 (Phase 1.1's own baseline) - 6 (`tests/test_bundle_ownership.py`, removed as obsolete, P12-1) + 12 new (3 in `test_bundle_revision_attribution.py`, 4 in `test_deny_message_formatting.py`, 3 new in `test_content_states.py`, 2 new in `test_verification.py`).
 
-**End SHA / commit:** `<filled in after commit>`
+**End SHA / commit:** `82777b2ace8de04c0fca3d941fd28c2aee92a8d1`, one commit onto `phase-1-1-remediation`.
 
-**CI run id (updated PR #2 head):** `<filled in after push>`
+**CI run id (updated PR #2 head):** `32073638413` (`gh run watch 32073638413 --exit-status`) - `integration-tests` job, `success`, 2m9s. PR #2 confirmed `OPEN`/`MERGEABLE` at this head after the push - not merged.
