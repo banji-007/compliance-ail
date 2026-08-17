@@ -28,7 +28,7 @@ import middleware  # noqa: E402
 
 OPA_BASE = os.environ["OPA_URL"].replace("/v1/data/ail/main/allow", "")
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
-API_KEY = os.getenv("CONTROL_PLANE_API_KEY", "test-api-key")
+READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 
 _APPROVED_ARGS = {
     "instance_type": "t3.micro",
@@ -79,7 +79,7 @@ def _opa_live_revision() -> str:
 
 
 def _audit_entries() -> list[dict]:
-    resp = httpx.get(f"{CONTROL_PLANE_URL}/audit", headers={"X-API-Key": API_KEY}, timeout=30)
+    resp = httpx.get(f"{CONTROL_PLANE_URL}/audit", headers={"X-API-Key": READ_API_KEY}, timeout=30)
     resp.raise_for_status()
     return resp.json()["entries"]
 

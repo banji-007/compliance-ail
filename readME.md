@@ -156,11 +156,11 @@ Every policy decision is written to ImmuDB through an isolated verifier service 
 
 **The record, not a message.** The ledger entry itself is a structured outcome record, not a free-text string: `outcome_type` (one of `policy_allow`, `policy_deny`, `schema_deny`, `fault`), `fault_class` when `outcome_type` is `fault`, the `policy_revision` that produced the decision, and the deny `reasons`. This is set at one point in the interceptor (`query_opa_policy`) and never reconstructed downstream by inspecting message text — a policy denial, a schema rejection, and an infrastructure fault are distinguishable everywhere: the ledger, `/audit`, the dashboard, and Prometheus. See `docs/adr/0005-outcome-taxonomy.md`.
 
-**The hash, not the payload.** The entry carries `input_sha256`, a hash over the canonically serialized tool arguments, not the arguments themselves. The full arguments are stored separately, in the control plane's own database, keyed by the ImmuDB transaction id — erasable independently of the immutable ledger, so a GDPR Article 17 request can delete the arguments without touching the proof of what was decided or that the input hashed to that value.
+**The hash, not the payload.** The entry carries `input_sha256`, a hash over the canonically serialized tool arguments, not the arguments themselves. The full arguments are stored separately, in the control plane's own database, keyed by `call_id` (minted at intercept, independent of ImmuDB's own transaction numbering) — erasable independently of the immutable ledger, so a GDPR Article 17 request can delete the arguments without touching the proof of what was decided or that the input hashed to that value. The content write happens *before* the ledger write; the ledger entry then records `content_state` (`present` or `unavailable`), and a content-store failure denies the call as a fault rather than recording a decision it cannot describe.
 
 Writes use `verifiedSet` and reads use `verifiedGet`. On each write the SDK checks the inclusion proof binding the `(key, value)` leaf to the transaction's entries hash, and the consistency proof from the verifier's persisted state to the new transaction, before the entry is treated as durable. A write the SDK cannot verify makes the interceptor fail closed and return DENY; no tool call executes against an unverifiable audit record — this is the one outcome that produces no ledger entry at all (`fault_class: verifier_unreachable`; see the documented boundary in `docs/adr/0005-outcome-taxonomy.md`).
 
-**Verification is a read, not a record.** A ledger entry cannot assert its own verification status. `/audit` computes one of four states per entry, at request time: `verified` (a proof check ran and passed), `failed` (a proof or signature was rejected — the tamper signal, with `error_class` distinguishing a consistency failure from a signature failure), `unverifiable` (a check was attempted and could not complete), or `asserted` (no check was attempted for this entry in producing this response). See `docs/adr/0006-verification-states.md`.
+**Verification is a read, not a record.** A ledger entry cannot assert its own verification status. `/audit` computes one of five states per entry, at request time: `verified` (a proof check ran and passed), `failed` (a proof or signature was rejected — the tamper signal, with `error_class` distinguishing a consistency failure from a signature failure), `unverifiable` (a check was attempted and could not complete), `asserted` (no check was attempted for this entry in producing this response), or `not_found` (a check was attempted and the underlying gRPC call returned `NOT_FOUND` — no entry was ever written for this key; not a tamper signal, since no proof was ever rejected). See `docs/adr/0006-verification-states.md`.
 
 When ImmuDB runs with a signing key, each state it returns is ECDSA-signed, and the verifier rejects any state whose signature does not verify against the configured public key before accepting a proof result. The persisted signed state is the trust anchor; it sits on a volume separate from the ledger-writing identity, so the process that records entries cannot rewrite the anchor it is checked against.
 
@@ -176,7 +176,7 @@ The Python interceptor middleware exports native **Prometheus metrics** (`ail_po
 - Per-tool breakdown of policy violation rate
 - Network latency through the mTLS proxy
 
-The CISO Control Plane dashboard (Next.js 15, Tailwind, Shadcn UI) authenticates to the control plane entirely server-side: every dashboard request goes through this app's own Next.js Route Handlers (`dashboard/app/api/*/route.ts`), which hold `CONTROL_PLANE_API_KEY` as an ordinary server-side environment variable and attach it — the key is never a `NEXT_PUBLIC_*` variable and never reaches the browser bundle. It provides:
+The CISO Control Plane dashboard (Next.js 15, Tailwind, Shadcn UI) authenticates to the control plane entirely server-side: every dashboard request goes through this app's own Next.js Route Handlers (`dashboard/app/api/*/route.ts`), which hold `CONTROL_PLANE_READ_KEY`/`CONTROL_PLANE_WRITE_KEY` as ordinary server-side environment variables and attach the appropriate one — neither key is ever a `NEXT_PUBLIC_*` variable or reaches the browser bundle. Those route handlers are themselves gated by `dashboard/middleware.ts`, which requires the caller (browser or curl) to authenticate with a separate read/write credential pair over HTTP Basic Auth before any control-plane key is attached — an anonymous request to `/api/audit` or `/api/tenants/{id}` is rejected before it ever reaches the control plane. It provides:
 
 - **Policy Settings** - toggle compliance packs per tenant, manage cost center allowlists, approved regions, and processing purpose constraints. Every save generates a new OPA bundle immediately.
 - **Audit Ledger** - paginated, searchable table of all agent decisions sourced live from ImmuDB, rendering `outcome_type`/`fault_class` and all four verification states distinctly; entries are reproducible offline via immuclient against the signed state.
@@ -203,10 +203,19 @@ OPENAI_API_KEY=sk-...
 IMMUDB_USER=immudb
 IMMUDB_PASSWORD=immudb
 
-# Required - the control plane rejects every request with a 503 if this is
-# empty. Used for PUT/POST /tenants and to authenticate GET /audit (see §3.5
-# for why the dashboard's own Audit Ledger view cannot supply it yet).
-CONTROL_PLANE_API_KEY=change-me
+# Required - two independent keys, not one shared key. The control plane
+# rejects every request the corresponding key gates with a 503 if it is
+# empty. READ authorizes GET /audit only; WRITE authorizes PUT/POST /tenants
+# and POST/DELETE /content.
+CONTROL_PLANE_READ_KEY=change-me-read
+CONTROL_PLANE_WRITE_KEY=change-me-write
+
+# Required - caller credentials for the dashboard's own routes (see §3.5).
+# Two independent pairs; the read pair never authorizes a write route.
+DASHBOARD_READ_USER=change-me
+DASHBOARD_READ_PASSWORD=change-me
+DASHBOARD_WRITE_USER=change-me
+DASHBOARD_WRITE_PASSWORD=change-me
 ```
 
 ### 4.2 Boot the Full Stack

@@ -1,17 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Server-side only (D4). CONTROL_PLANE_API_KEY never carries a NEXT_PUBLIC_
-// prefix and is never read from a client component - the browser only ever
-// talks to this same-origin route, never to the control plane directly.
+// Server-side only (D4). Neither key carries a NEXT_PUBLIC_ prefix and
+// neither is read from a client component - the browser only ever talks to
+// this same-origin route, never to the control plane directly. The caller
+// reaching this handler has already passed dashboard middleware.ts's own
+// auth check (D6); these are the control plane's own, independent
+// credentials - GET forwards the read key, PUT forwards the write key, so a
+// bug here can leak reads but cannot forward a write with only a read key
+// available in scope.
 const CONTROL_PLANE_URL = process.env.CONTROL_PLANE_URL ?? "http://ail-control-plane:8002";
 
 type RouteContext = { params: Promise<{ id: string }> };
 
-async function proxy(req: NextRequest, id: string, init?: RequestInit) {
-  const apiKey = process.env.CONTROL_PLANE_API_KEY;
+async function proxy(id: string, apiKey: string | undefined, missingKeyName: string, init?: RequestInit) {
   if (!apiKey) {
     return NextResponse.json(
-      { detail: "CONTROL_PLANE_API_KEY not configured on the dashboard server" },
+      { detail: `${missingKeyName} not configured on the dashboard server` },
       { status: 503 }
     );
   }
@@ -30,11 +34,11 @@ async function proxy(req: NextRequest, id: string, init?: RequestInit) {
 
 export async function GET(req: NextRequest, { params }: RouteContext) {
   const { id } = await params;
-  return proxy(req, id);
+  return proxy(id, process.env.CONTROL_PLANE_READ_KEY, "CONTROL_PLANE_READ_KEY");
 }
 
 export async function PUT(req: NextRequest, { params }: RouteContext) {
   const { id } = await params;
   const body = await req.text();
-  return proxy(req, id, { method: "PUT", body });
+  return proxy(id, process.env.CONTROL_PLANE_WRITE_KEY, "CONTROL_PLANE_WRITE_KEY", { method: "PUT", body });
 }

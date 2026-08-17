@@ -8,6 +8,7 @@ import socket
 import stat
 import tempfile
 import time
+import uuid
 import httpx
 from urllib.parse import urlparse
 from prometheus_client import Counter, start_http_server, REGISTRY
@@ -59,6 +60,11 @@ _OPA_REVISION_URL = _OPA_URL.replace(
 # revision in one round trip. See policy/core/main.rego's `evaluation` rule.
 _OPA_EVAL_URL = _OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/ail/main/evaluation")
 
+# Full bundle map (Phase 1.1, P11-7): who OPA currently has loaded, used only
+# to check that exactly one bundle claims the `ail` root at startup - see
+# _check_bundle_root_ownership. Not used per-call.
+_OPA_BUNDLES_URL = _OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/system/bundles")
+
 # Closed set of outcome types (D1). Never inferred from message text anywhere
 # downstream - this is the only vocabulary that exists.
 OUTCOME_POLICY_ALLOW = "policy_allow"
@@ -70,6 +76,20 @@ FAULT_OPA_UNREACHABLE = "opa_unreachable"
 FAULT_REVISION_UNAVAILABLE = "revision_unavailable"
 FAULT_VERIFIER_UNREACHABLE = "verifier_unreachable"
 FAULT_SPIFFE_UNAVAILABLE = "spiffe_unavailable"
+# Phase 1.1: OPA answered but the /evaluation body was missing or
+# mistyped allow/reasons/revision (P11-3) - a fault, never an implicit allow.
+FAULT_MALFORMED_POLICY_RESPONSE = "malformed_policy_response"
+# Phase 1.1: the content-store write (D7) failed before the ledger write was
+# attempted - the call denies and no ledger entry is written at all (there is
+# no entry to carry a wrong content_state).
+FAULT_CONTENT_STORE_UNREACHABLE = "content_store_unreachable"
+
+# Closed set of content states (D7, Phase 1.1). Written into the ledger entry
+# itself - never "erased", which is inferred at read time (control_plane/
+# main.py::get_audit) from content_state plus whether a CallContent row still
+# exists, the same pattern D2/D8 uses for verification.
+CONTENT_PRESENT = "present"
+CONTENT_UNAVAILABLE = "unavailable"
 
 
 def _outcome(outcome_type, fault_class=None, policy_revision=None, reasons=None):
@@ -93,13 +113,20 @@ def _outcome(outcome_type, fault_class=None, policy_revision=None, reasons=None)
 _SENSITIVE_KEYS = frozenset({"query", "approval_ticket", "commit_hash", "tags"})
 
 
-def _redact_args(args: dict) -> dict:
+def _redact_args(args) -> dict:
     """
     Return a shallow copy of args with sensitive field values replaced by [REDACTED].
     Recurses one level into nested dicts not themselves listed in _SENSITIVE_KEYS.
     Non-sensitive metadata with fixed, known key names (region, instance_type,
     environment, etc.) is preserved in the clear for ops visibility.
+
+    A non-dict top-level value (P11-2: an LLM can emit a list/string/null/int
+    for `arguments`) is not an error here - this is only ever used for a log
+    line, and classification of the malformed shape itself happens once, in
+    query_opa_policy. This must not raise ahead of that classification.
     """
+    if not isinstance(args, dict):
+        return {"_shape": type(args).__name__}
     redacted = {}
     for k, v in args.items():
         if k in _SENSITIVE_KEYS:
@@ -218,6 +245,80 @@ def _fetch_opa_bundle_revision(ssl_context) -> str | None:
     except Exception as e:
         logging.error(f"OPA bundle revision query failed: {e}")
         return None
+
+
+def _fetch_opa_bundles_map(ssl_context) -> dict | None:
+    """
+    Read back the full map of bundles OPA currently has loaded (P11-7).
+
+    The revision lookup in _fetch_opa_bundle_revision only proves that
+    _BUNDLE_NAME resolves to *some* loaded bundle - it says nothing about
+    whether a second bundle also claims the `ail` root and is contributing
+    deny rules that get attributed to the wrong revision (see
+    docs/reports/phase-1-redteam.md, S2). This checks that directly.
+
+    Returns None on any error or non-dict result. Callers must treat None as
+    the map being unobtainable, not as "no bundles loaded".
+    """
+    try:
+        with httpx.Client(verify=ssl_context) as client:
+            response = client.get(_OPA_BUNDLES_URL, timeout=5)
+        if response.status_code != 200:
+            return None
+        result = response.json().get("result")
+        return result if isinstance(result, dict) else None
+    except Exception as e:
+        logging.error(f"OPA bundles map query failed: {e}")
+        return None
+
+
+def _check_bundle_root_ownership(ssl_context) -> None:
+    """
+    Assert exactly one loaded bundle claims the `ail` root, and that its name
+    matches AIL_BUNDLE_NAME. Exits the process otherwise (P11-7) - this
+    extends verify_bundle_at_startup's existing check rather than adding a
+    second independent gate.
+    """
+    bundles = _fetch_opa_bundles_map(ssl_context)
+    if bundles is None:
+        logging.error(
+            "STARTUP FAILURE: could not read OPA's loaded bundle map (%s) to "
+            "verify root ownership of 'ail'. Check OPA is reachable and "
+            "responding to /v1/data/system/bundles.",
+            _OPA_BUNDLES_URL,
+        )
+        sys.exit(1)
+
+    claimants = sorted(
+        name for name, info in bundles.items()
+        if "ail" in ((info or {}).get("manifest", {}) or {}).get("roots", [])
+    )
+
+    if len(claimants) != 1:
+        logging.error(
+            "STARTUP FAILURE: expected exactly one loaded OPA bundle to claim "
+            "the 'ail' root, found %d: %s. A second bundle serving the same "
+            "root can supply deny rules that get attributed to this agent's "
+            "AIL_BUNDLE_NAME revision instead of its own (docs/reports/"
+            "phase-1-redteam.md, S2). Remove the extra bundle(s) from OPA's "
+            "bundle configuration.",
+            len(claimants), claimants,
+        )
+        sys.exit(1)
+
+    if claimants[0] != _BUNDLE_NAME:
+        logging.error(
+            "STARTUP FAILURE: the bundle claiming the 'ail' root is '%s', but "
+            "this agent's AIL_BUNDLE_NAME is '%s'. The revision read back at "
+            "data.system.bundles.%s.manifest.revision would then name a "
+            "bundle other than the one actually serving policy. Set "
+            "AIL_BUNDLE_NAME to '%s', or remove whichever of the two bundles "
+            "claiming 'ail' is unintended.",
+            claimants[0], _BUNDLE_NAME, _BUNDLE_NAME, claimants[0],
+        )
+        sys.exit(1)
+
+    logging.info("Startup check: bundle '%s' is the sole claimant of the 'ail' root.", _BUNDLE_NAME)
 
 
 def _get_spiffe_ssl_context() -> ssl.SSLContext | None:
@@ -380,6 +481,8 @@ def verify_bundle_at_startup(timeout_seconds: float = 30, poll_interval: float =
 
     logging.info("Startup check: OPA bundle '%s' loaded, revision=%s", _BUNDLE_NAME, revision)
 
+    _check_bundle_root_ownership(ssl_context)
+
 
 def query_opa_policy(tool_name, tool_args):
     """
@@ -398,6 +501,17 @@ def query_opa_policy(tool_name, tool_args):
     Returns:
         dict: see _outcome() - outcome_type, fault_class, policy_revision, reasons
     """
+    # P11-2 (Phase 1.1): validate the input shape before anything else
+    # touches it. json.loads happily parses a list/string/null/number for
+    # `arguments` - none of those are a dict, and everything downstream
+    # (schema validators' **tool_args, _redact_args' old .items()) assumed
+    # one. This is the single point that classifies a malformed shape, same
+    # as every other outcome_type in this function.
+    if not isinstance(tool_args, dict):
+        msg = f"tool_args must be a JSON object; got {type(tool_args).__name__}."
+        logging.warning(f"Pre-flight validation blocked malformed tool_args shape for {tool_name}: {type(tool_args).__name__}")
+        return _outcome(OUTCOME_SCHEMA_DENY, reasons=[msg])
+
     # Epic 2: Pre-Flight Input Validation
     # Catch LLM hallucinations before they are sent to OPA over the network.
     # Fail-closed: tools not present in TOOL_VALIDATORS are blocked here.
@@ -470,18 +584,35 @@ def query_opa_policy(tool_name, tool_args):
         )
         return _outcome(OUTCOME_FAULT, fault_class=FAULT_REVISION_UNAVAILABLE)
 
-    policy_revision = result.get("revision")
-    reasons = result.get("reasons") or []
+    # P11-3 (Phase 1.1): a 200 with a defined result is not enough - the body
+    # must actually carry all three fields evaluation always sets by
+    # construction. A version skew, a future Rego change, or a mocked
+    # response upstream that drops one of them must not be read as an
+    # implicit allow with a null revision (ADR-0005's own table requires
+    # policy_allow to always carry a set revision).
+    allow = result.get("allow")
+    reasons = result.get("reasons")
+    revision = result.get("revision")
+    if not isinstance(allow, bool) or not isinstance(reasons, list) or not isinstance(revision, str) or not revision:
+        logging.error(
+            "OPA /evaluation response missing or malformed field(s) - "
+            "allow=%r reasons=%r revision=%r. Refusing to record an outcome "
+            "from an incomplete response.",
+            allow, reasons, revision,
+        )
+        return _outcome(OUTCOME_FAULT, fault_class=FAULT_MALFORMED_POLICY_RESPONSE)
 
-    if result.get("allow") is True:
-        return _outcome(OUTCOME_POLICY_ALLOW, policy_revision=policy_revision)
-    return _outcome(OUTCOME_POLICY_DENY, policy_revision=policy_revision, reasons=list(reasons))
+    if allow is True:
+        return _outcome(OUTCOME_POLICY_ALLOW, policy_revision=revision)
+    return _outcome(OUTCOME_POLICY_DENY, policy_revision=revision, reasons=list(reasons))
 
 
-def _canonical_hash(tool_args: dict) -> str:
+def _canonical_hash(tool_args) -> str:
     """SHA-256 over the canonically serialized tool arguments (D5). Sorted
     keys and a fixed separator so the same logical payload always hashes
-    the same way regardless of dict construction order."""
+    the same way regardless of dict construction order. tool_args need not
+    be a dict (P11-2, Phase 1.1) - json.dumps(sort_keys=True) is well-defined
+    for any JSON-serializable value; sort_keys only affects dict ordering."""
     canonical = json.dumps(tool_args, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -534,32 +665,69 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
     reasons = outcome["reasons"]
 
     input_sha256 = _canonical_hash(tool_args)
+    # Minted here, independent of ImmuDB's own tx numbering (D7, Phase 1.1) -
+    # joins the ledger entry to its content-store row without exposing the
+    # ledger's transaction id as the join key.
+    call_id = uuid.uuid4().hex
+
+    # D7 (Phase 1.1): content is written first. A dict-shaped payload is
+    # attempted; the P11-2 shape guard above already turned anything else
+    # into schema_deny, so there is nothing storable to attempt for it.
+    if isinstance(tool_args, dict):
+        try:
+            from content_store import store_content
+            store_content(call_id, tool_args)
+            content_state = CONTENT_PRESENT
+        except Exception as e:
+            # Unlike the old best-effort write, a content-store failure now
+            # denies as a fault: the ledger entry that would have recorded
+            # this decision is never written, so there is no entry left
+            # around to carry a content_state that contradicts what actually
+            # happened (the incoherence the old best-effort write produced).
+            logging.error(f"Content store write failed for call_id={call_id}: {e}")
+            outcome_type = OUTCOME_FAULT
+            fault_class = FAULT_CONTENT_STORE_UNREACHABLE
+            policy_revision = None
+            reasons = []
+            content_state = None
+    else:
+        content_state = CONTENT_UNAVAILABLE
 
     # Fail-closed: log to ImmuDB ledger or the call denies. A fault here is
     # itself undocumentable (D1's boundary): the recording path is what just
     # failed, so no record exists and outcome_type is overwritten to fault -
-    # this is the one outcome that never produces a ledger_tx_id.
+    # this is one of two outcomes that never produce a ledger_tx_id (the
+    # other being the content-store fault above, which skips this block
+    # entirely via content_state is None).
     ledger_tx_id = None
-    try:
-        from immudb_ledger import get_ledger
-        ledger = get_ledger()
+    if content_state is not None:
+        try:
+            from immudb_ledger import get_ledger
+            ledger = get_ledger()
 
-        ledger_tx_id = ledger.log_tool_call(
-            agent_id=agent_id,
-            tool_name=tool_name,
-            input_sha256=input_sha256,
-            outcome_type=outcome_type,
-            fault_class=fault_class,
-            policy_revision=policy_revision,
-            reasons=reasons,
-        )
-        logging.info(f"Ledger tx_id: {ledger_tx_id}")
-    except Exception as e:
-        logging.error(f"ImmuDB ledger unavailable: {e}")
-        outcome_type = OUTCOME_FAULT
-        fault_class = FAULT_VERIFIER_UNREACHABLE
-        policy_revision = None
-        reasons = []
+            ledger_tx_id = ledger.log_tool_call(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                call_id=call_id,
+                input_sha256=input_sha256,
+                outcome_type=outcome_type,
+                fault_class=fault_class,
+                policy_revision=policy_revision,
+                reasons=reasons,
+                content_state=content_state,
+            )
+            logging.info(f"Ledger tx_id: {ledger_tx_id}")
+        except Exception as e:
+            logging.error(f"ImmuDB ledger unavailable: {e}")
+            outcome_type = OUTCOME_FAULT
+            fault_class = FAULT_VERIFIER_UNREACHABLE
+            policy_revision = None
+            reasons = []
+
+    # P11-6 (Phase 1.1): allowlist against the closed TOOL_VALIDATORS
+    # registry before using tool_name as a Prometheus label value - a
+    # hallucinated tool name must not grow the metric's cardinality.
+    metric_tool_name = tool_name if tool_name in TOOL_VALIDATORS else "_unregistered"
 
     # One increment per call, using the final recorded outcome - not the
     # OPA-only verdict - so a call OPA approved but never got written never
@@ -569,7 +737,7 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
         status=status,
         outcome_type=outcome_type,
         fault_class=fault_class or "",
-        tool_name=tool_name,
+        tool_name=metric_tool_name,
     ).inc()
 
     message = _render_message(outcome_type, fault_class, reasons)
@@ -585,12 +753,5 @@ def intercept_tool_call(tool_name, tool_args, agent_id="base_agent"):
 
     if ledger_tx_id is not None:
         response["ledger_tx_id"] = ledger_tx_id
-        try:
-            from content_store import store_content
-            store_content(ledger_tx_id, tool_args)
-        except Exception as e:
-            # Best-effort join convenience, not part of the integrity chain -
-            # the decision is already durably recorded with its hash (D5).
-            logging.error(f"Content store write failed for tx={ledger_tx_id}: {e}")
 
     return response

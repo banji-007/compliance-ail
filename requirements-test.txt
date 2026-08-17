@@ -7,9 +7,16 @@
 #   httpx             — OPA/immudb HTTP calls in middleware.py + test helpers
 #   pydantic          — schema validation in schemas.py
 #   prometheus-client — Counter/REGISTRY imported at module load in middleware.py
+#   fastapi/sqlalchemy — control_plane/main.py is imported directly (not just
+#                        over HTTP) by tests/test_verification.py, to unit-test
+#                        _verification_from_200/_payload_state (P11-8) without
+#                        needing a fabricated key that is both scanned by
+#                        ImmuDB and never written
 pytest==8.3.5
 httpx==0.28.1
 pydantic==2.12.5
 prometheus-client==0.21.1
 openai==2.26.0
 python-dotenv==1.2.2
+fastapi==0.115.6
+sqlalchemy==2.0.36

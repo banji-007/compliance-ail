@@ -107,6 +107,22 @@ def test_schema_deny_invalid_payload():
 
 
 # ---------------------------------------------------------------------------
+# P11-2 (Phase 1.1): non-dict tool_args must still produce a record, not an
+# uncaught crash before classification. Red-team S3 attack 1: an LLM emitting
+# a list/string/null/number for `arguments` is valid JSON that isn't a dict.
+# ---------------------------------------------------------------------------
+
+@requires_stack
+@pytest.mark.parametrize("bad_args", [[], None, "not-a-dict", 42], ids=["list", "null", "str", "int"])
+def test_malformed_tool_args_shape_still_produces_a_record(bad_args):
+    r = middleware.intercept_tool_call("provision_cloud_server", bad_args, "outcome_test")
+    assert r["outcome_type"] == "schema_deny", f"Expected schema_deny for shape {type(bad_args).__name__}, got: {r}"
+    assert r["fault_class"] is None
+    assert r["policy_revision"] is None
+    assert "ledger_tx_id" in r, f"Expected a ledger record for shape {type(bad_args).__name__}, got: {r}"
+
+
+# ---------------------------------------------------------------------------
 # Fault outcomes - each fault_class produced at the exact point
 # query_opa_policy / intercept_tool_call would observe it
 # ---------------------------------------------------------------------------
@@ -166,3 +182,60 @@ def test_fault_verifier_unreachable_writes_no_record(monkeypatch):
     assert r["fault_class"] == "verifier_unreachable"
     assert r["policy_revision"] is None
     assert "ledger_tx_id" not in r
+
+
+# ---------------------------------------------------------------------------
+# P11-6 / P11-8 (Phase 1.1): metric labels are bounded. tool_name is
+# allowlisted against TOOL_VALIDATORS before use as a Prometheus label -
+# a hallucinated tool name must not grow the metric's cardinality.
+# ---------------------------------------------------------------------------
+
+def _series_count() -> int:
+    """Count of distinct label-combinations currently registered for
+    ail_policy_decisions_total, via the public .collect() API (not the
+    prometheus_client-internal _metrics dict)."""
+    for metric in middleware._POLICY_DECISIONS.collect():
+        return sum(1 for s in metric.samples if s.name.endswith("_total"))
+    return 0
+
+
+@requires_stack
+def test_hallucinated_tool_names_do_not_grow_metric_cardinality():
+    before = _series_count()
+    for i in range(50):
+        middleware.intercept_tool_call(f"hallucinated_tool_variant_{i}", {"anything": "goes"}, "cardinality_test")
+    after = _series_count()
+    # All 50 calls share one outcome_type/fault_class/status combination
+    # (schema_deny), so they must collapse into exactly one new series
+    # (tool_name="_unregistered"), not 50.
+    assert after - before <= 1, (
+        f"Expected at most 1 new series for 50 distinct hallucinated tool names, "
+        f"got {after - before} (before={before}, after={after})"
+    )
+
+
+@requires_stack
+def test_metric_label_set_matches_closed_collection():
+    middleware.intercept_tool_call("some_other_hallucinated_name", {"anything": "goes"}, "cardinality_test")
+    middleware.intercept_tool_call("provision_cloud_server", _APPROVED_ARGS, "cardinality_test")
+
+    allowed_tool_names = set(middleware.TOOL_VALIDATORS) | {"_unregistered"}
+    allowed_outcome_types = {
+        middleware.OUTCOME_POLICY_ALLOW, middleware.OUTCOME_POLICY_DENY,
+        middleware.OUTCOME_SCHEMA_DENY, middleware.OUTCOME_FAULT,
+    }
+    allowed_fault_classes = {
+        "", middleware.FAULT_OPA_UNREACHABLE, middleware.FAULT_REVISION_UNAVAILABLE,
+        middleware.FAULT_VERIFIER_UNREACHABLE, middleware.FAULT_SPIFFE_UNAVAILABLE,
+        middleware.FAULT_MALFORMED_POLICY_RESPONSE, middleware.FAULT_CONTENT_STORE_UNREACHABLE,
+    }
+    allowed_statuses = {"APPROVED", "DENIED"}
+
+    for metric in middleware._POLICY_DECISIONS.collect():
+        for sample in metric.samples:
+            if not sample.name.endswith("_total"):
+                continue
+            assert sample.labels["tool_name"] in allowed_tool_names, sample.labels
+            assert sample.labels["outcome_type"] in allowed_outcome_types, sample.labels
+            assert sample.labels["fault_class"] in allowed_fault_classes, sample.labels
+            assert sample.labels["status"] in allowed_statuses, sample.labels

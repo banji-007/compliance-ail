@@ -12,9 +12,12 @@ services:
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
       # Verifier service — /audit calls this for per-entry proof verification.
       - VERIFIER_URL=http://verifier:8003
-      # API key for mutating control-plane endpoints (PUT/POST /tenants).
-      # Must be set in .env — absent key disables auth with a 503 response.
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
+      # Two independent keys, not one shared key (D6). READ authorizes only
+      # GET /audit; WRITE authorizes PUT/POST /tenants and POST/DELETE
+      # /content. Must be set in .env — an absent key disables the routes it
+      # gates with a 503 response.
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
     volumes:
       # policy/ mounted at runtime — changes on tenant config updates.
       - ./policy:/policy:ro
@@ -251,10 +254,10 @@ services:
       - OPA_URL=https://envoy:8443/v1/data/ail/main/allow
       - SPIRE_DISABLED=false
       - CONTROL_PLANE_URL=http://ail-control-plane:8002
-      # Content-store writes (D5) go straight to the control plane, not
-      # through the verifier - same key the control plane itself enforces
-      # on POST/DELETE /content.
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
+      # Content-store writes (D5, D7) go straight to the control plane, not
+      # through the verifier - POST /content is a mutating route, so this
+      # uses the write-scoped key, never the read key (D6).
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
       - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
     volumes:
@@ -426,9 +429,19 @@ services:
       - "3001:3001"
     environment:
       # Server-side only (Route Handlers under app/api/) - never reaches
-      # the browser bundle.
+      # the browser bundle. Two independent control-plane keys (D6): the
+      # audit route forwards READ, the tenants PUT route forwards WRITE.
       - CONTROL_PLANE_URL=http://ail-control-plane:8002
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
+      # Caller-facing credentials for the dashboard's own routes (D6) -
+      # checked in dashboard/middleware.ts before any control-plane key is
+      # ever attached. Two independent pairs, not a hierarchy - the read
+      # pair never authorizes a write route.
+      - DASHBOARD_READ_USER=${DASHBOARD_READ_USER}
+      - DASHBOARD_READ_PASSWORD=${DASHBOARD_READ_PASSWORD}
+      - DASHBOARD_WRITE_USER=${DASHBOARD_WRITE_USER}
+      - DASHBOARD_WRITE_PASSWORD=${DASHBOARD_WRITE_PASSWORD}
     depends_on:
       ail-control-plane:
         condition: service_healthy

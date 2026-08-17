@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useMemo } from "react";
-import { Search, ShieldCheck, ShieldAlert, ShieldQuestion, CircleDashed } from "lucide-react";
+import { Search, ShieldCheck, ShieldAlert, ShieldQuestion, CircleDashed, HelpCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import type { BadgeProps } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -104,6 +104,26 @@ function VerificationCell({ entry }: { entry: AuditEntry }) {
         <div className="flex flex-col gap-0.5">
           <Badge variant="warning" className="w-fit">
             UNVERIFIABLE
+          </Badge>
+          {v.detail && (
+            <span className="text-[10px] text-muted-foreground break-words leading-tight">
+              {v.detail}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (v.state === "not_found") {
+    // Distinct from "failed" (D8): no proof was ever rejected because there
+    // was never a proof to check — a bug/race signal, not a tamper signal.
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <HelpCircle className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+        <div className="flex flex-col gap-0.5">
+          <Badge variant="warning" className="w-fit">
+            NO RECORD
           </Badge>
           {v.detail && (
             <span className="text-[10px] text-muted-foreground break-words leading-tight">

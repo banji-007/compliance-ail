@@ -38,8 +38,9 @@ keygen:
 ## The 15-second sleep ensures OPA has loaded the policy before pytest runs.
 ##
 ## docker compose auto-loads a root .env regardless of -f, so the control
-## plane and immudb containers enforce whatever IMMUDB_USER, IMMUDB_PASSWORD,
-## and CONTROL_PLANE_API_KEY are in .env if one exists. pytest must
+## plane, dashboard, and immudb containers enforce whatever IMMUDB_USER,
+## IMMUDB_PASSWORD, CONTROL_PLANE_READ_KEY/WRITE_KEY, and
+## DASHBOARD_READ/WRITE_USER/PASSWORD are in .env if one exists. pytest must
 ## authenticate with those same values, so each is read from .env in its own
 ## isolated subshell if present, falling back to the prior default otherwise.
 ## Isolated per-variable subshells, not a blanket ". .env", so an unrelated
@@ -55,7 +56,12 @@ test-integration:
 	sleep 15
 	IMMUDB_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_USER" ) ); \
 	IMMUDB_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_PASSWORD" ) ); \
-	CONTROL_PLANE_API_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_API_KEY" ) ); \
+	CONTROL_PLANE_READ_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_READ_KEY" ) ); \
+	CONTROL_PLANE_WRITE_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_WRITE_KEY" ) ); \
+	DASHBOARD_READ_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_READ_USER" ) ); \
+	DASHBOARD_READ_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_READ_PASSWORD" ) ); \
+	DASHBOARD_WRITE_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_WRITE_USER" ) ); \
+	DASHBOARD_WRITE_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_WRITE_PASSWORD" ) ); \
 	SPIRE_DISABLED=true \
 	  OPA_URL=http://localhost:8181/v1/data/ail/main/allow \
 	  AIL_BUNDLE_NAME=$${AIL_BUNDLE_NAME:-ail-policies} \
@@ -64,7 +70,13 @@ test-integration:
 	  IMMUDB_USER=$${IMMUDB_USER_ENV:-$${IMMUDB_USER:-immudb}} \
 	  IMMUDB_PASSWORD=$${IMMUDB_PASSWORD_ENV:-$${IMMUDB_PASSWORD:-immudb}} \
 	  VERIFIER_URL=http://localhost:8003 \
-	  CONTROL_PLANE_API_KEY=$${CONTROL_PLANE_API_KEY_ENV:-$${CONTROL_PLANE_API_KEY:-test-api-key}} \
+	  CONTROL_PLANE_READ_KEY=$${CONTROL_PLANE_READ_KEY_ENV:-$${CONTROL_PLANE_READ_KEY:-test-read-key}} \
+	  CONTROL_PLANE_WRITE_KEY=$${CONTROL_PLANE_WRITE_KEY_ENV:-$${CONTROL_PLANE_WRITE_KEY:-test-write-key}} \
+	  DASHBOARD_URL=http://localhost:3001 \
+	  DASHBOARD_READ_USER=$${DASHBOARD_READ_USER_ENV:-$${DASHBOARD_READ_USER:-test-dashboard-reader}} \
+	  DASHBOARD_READ_PASSWORD=$${DASHBOARD_READ_PASSWORD_ENV:-$${DASHBOARD_READ_PASSWORD:-test-dashboard-read-pw}} \
+	  DASHBOARD_WRITE_USER=$${DASHBOARD_WRITE_USER_ENV:-$${DASHBOARD_WRITE_USER:-test-dashboard-writer}} \
+	  DASHBOARD_WRITE_PASSWORD=$${DASHBOARD_WRITE_PASSWORD_ENV:-$${DASHBOARD_WRITE_PASSWORD:-test-dashboard-write-pw}} \
 	  python -m pytest tests/ -v
 	docker compose -f docker-compose.test.yml down -v
 

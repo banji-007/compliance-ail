@@ -13,9 +13,11 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/package-lock.json ./package-lock.json
 COPY . .
 # NEXT_PUBLIC_* vars are baked into the JS bundle at build time - only a UI
-# default belongs here. CONTROL_PLANE_API_KEY is never a build ARG; it is
-# read from a runtime environment variable by app/api/*/route.ts, which run
-# server-side in the standalone Node server (see docker-compose.yml).
+# default belongs here. CONTROL_PLANE_READ_KEY/WRITE_KEY and
+# DASHBOARD_READ/WRITE_USER/PASSWORD are never build ARGs; they are read
+# from runtime environment variables by app/api/*/route.ts and
+# middleware.ts, which run server-side in the standalone Node server (see
+# docker-compose.yml).
 ARG NEXT_PUBLIC_TENANT_ID=tenant_default
 ENV NEXT_PUBLIC_TENANT_ID=$NEXT_PUBLIC_TENANT_ID
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -27,6 +29,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3001
+# Docker sets HOSTNAME to the container ID by default; the standalone
+# server.js binds to process.env.HOSTNAME if set, which would otherwise make
+# it listen only on the container's own network IP - unreachable via
+# localhost from inside the container (breaks the healthcheck) even though
+# the published port would still work from the host.
+ENV HOSTNAME=0.0.0.0
 
 # next.config.ts sets output: "standalone" — copy the minimal self-contained bundle
 COPY --from=builder /app/.next/standalone ./

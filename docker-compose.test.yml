@@ -1,12 +1,16 @@
 # docker-compose.test.yml — Minimal CI infrastructure for integration tests.
 #
-# Spins up only the three services pytest needs:
+# Spins up the services pytest needs:
 #   ail-control-plane  — serves OPA policy bundles; seeds default tenant
 #   opa                — policy engine; polls bundle from control plane
 #   immudb             — tamper-evident audit ledger
+#   verifier           — isolated immudb-py (gRPC) wrapper
+#   dashboard          — Next.js dashboard, for D6's caller-auth tests only
+#                         (tests/test_dashboard_auth.py); no other test
+#                         exercises it.
 #
-# SPIRE, Envoy, Grafana, Prometheus, and the dashboard are NOT included.
-# Tests run with SPIRE_DISABLED=true so mTLS is bypassed.
+# SPIRE, Envoy, Grafana, and Prometheus are NOT included. Tests run with
+# SPIRE_DISABLED=true so mTLS is bypassed.
 #
 # Usage:  make test-integration
 # Requires: Docker Compose v2 (docker compose, not docker-compose)
@@ -24,7 +28,8 @@ services:
       - IMMUDB_USER=${IMMUDB_USER:-immudb}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
       - VERIFIER_URL=http://verifier:8003
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-test-api-key}
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY:-test-read-key}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY:-test-write-key}
     volumes:
       - ./policy:/policy:ro
       - test-control-plane-data:/data
@@ -112,6 +117,35 @@ services:
       timeout: 3s
       retries: 6
       start_period: 20s
+
+  # D6 (Phase 1.1) only - dashboard/middleware.ts's own caller auth, tested
+  # by tests/test_dashboard_auth.py. No other test in this suite depends on
+  # this service being up.
+  dashboard:
+    build:
+      context: ./dashboard
+    ports:
+      - "3001:3001"
+    environment:
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY:-test-read-key}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY:-test-write-key}
+      - DASHBOARD_READ_USER=${DASHBOARD_READ_USER:-test-dashboard-reader}
+      - DASHBOARD_READ_PASSWORD=${DASHBOARD_READ_PASSWORD:-test-dashboard-read-pw}
+      - DASHBOARD_WRITE_USER=${DASHBOARD_WRITE_USER:-test-dashboard-writer}
+      - DASHBOARD_WRITE_PASSWORD=${DASHBOARD_WRITE_PASSWORD:-test-dashboard-write-pw}
+    depends_on:
+      ail-control-plane:
+        condition: service_healthy
+    # No custom /health route exists in this Next.js app; /audit always
+    # renders 200 without auth (only /api/* is gated by middleware.ts), so
+    # it doubles as a liveness probe here.
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/audit',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 25s
 
 volumes:
   test-control-plane-data:

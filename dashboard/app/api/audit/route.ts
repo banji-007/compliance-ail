@@ -1,15 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Server-side only (D4). CONTROL_PLANE_API_KEY never carries a NEXT_PUBLIC_
+// Server-side only (D4). CONTROL_PLANE_READ_KEY never carries a NEXT_PUBLIC_
 // prefix and is never read from a client component - the browser only ever
-// talks to this same-origin route, never to the control plane directly.
+// talks to this same-origin route, never to the control plane directly. The
+// caller reaching this handler at all has already passed dashboard
+// middleware.ts's own auth check (D6) - this key is a second, independent
+// credential the control plane itself enforces.
 const CONTROL_PLANE_URL = process.env.CONTROL_PLANE_URL ?? "http://ail-control-plane:8002";
 
 export async function GET(req: NextRequest) {
-  const apiKey = process.env.CONTROL_PLANE_API_KEY;
+  const apiKey = process.env.CONTROL_PLANE_READ_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { detail: "CONTROL_PLANE_API_KEY not configured on the dashboard server" },
+      { detail: "CONTROL_PLANE_READ_KEY not configured on the dashboard server" },
       { status: 503 }
     );
   }

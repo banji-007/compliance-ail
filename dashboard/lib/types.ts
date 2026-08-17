@@ -35,9 +35,10 @@ export type FaultClass =
   | null;
 
 /**
- * The four read-time verification states (D2). A ledger entry cannot assert
- * its own verification status — this is computed by /audit at request time,
- * never stored in the entry. See docs/adr/0006-verification-states.md.
+ * The five read-time verification states (D2, D8). A ledger entry cannot
+ * assert its own verification status — this is computed by /audit at
+ * request time, never stored in the entry. See
+ * docs/adr/0006-verification-states.md.
  *
  *   verified     - a verifiedGet ran and every proof passed.
  *   failed       - a verifiedGet ran and a proof/signature was rejected
@@ -46,8 +47,13 @@ export type FaultClass =
  *                  (verifier unreachable, timeout, transport error).
  *   asserted     - no verifiedGet was attempted for this entry at all.
  *                  Not a problem by itself — it means "we did not look".
+ *   not_found    - a verifiedGet was attempted and the underlying gRPC call
+ *                  returned NOT_FOUND: no entry was ever written for this
+ *                  key. Not a tamper signal (no proof was ever rejected —
+ *                  there was never a proof to check) and not "failed" — a
+ *                  bug/race signal, distinct from both.
  */
-export type VerificationState = "verified" | "failed" | "unverifiable" | "asserted";
+export type VerificationState = "verified" | "failed" | "unverifiable" | "asserted" | "not_found";
 
 export interface Verification {
   state: VerificationState;
@@ -61,6 +67,9 @@ export interface Verification {
 
 export interface AuditEntry {
   tx_id: number;
+  /** Minted at intercept, independent of ImmuDB's tx numbering (D7). The key
+   *  GDPR erasure targets: DELETE /content/{call_id}. */
+  call_id: string | null;
   agent_id: string | null;
   timestamp: string | null;
   tool_name: string | null;
@@ -74,10 +83,23 @@ export interface AuditEntry {
   input_sha256: string | null;
   /**
    * Original tool arguments, joined from the control plane's erasable
-   * content store by tx_id (D5). Null if never stored or erased — the
-   * ledger entry's hash and verification state are unaffected either way.
+   * content store by call_id (D5, D7). Null unless payload_state is
+   * "present" — the ledger entry's hash and verification state are
+   * unaffected either way.
    */
   payload: Record<string, unknown> | null;
+  /**
+   * Read-time inference (D7, Phase 1.1), same pattern as `verification`:
+   *   present     - content_state was "present" at write time and the
+   *                 content-store row still exists.
+   *   erased      - content_state was "present" at write time but the row
+   *                 is gone now (GDPR Article 17 erasure via
+   *                 DELETE /content/{call_id}).
+   *   unavailable - content_state was already "unavailable" at write time
+   *                 (nothing dict-shaped to store, e.g. malformed
+   *                 tool_args) — never rendered as erased.
+   */
+  payload_state: "present" | "erased" | "unavailable";
   verification: Verification;
 }
 

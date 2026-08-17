@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, String, Text
 from sqlalchemy.sql import func
 
 from database import Base
@@ -44,15 +44,16 @@ class CallContent(Base):
     """
     Erasable store for raw tool-call arguments (D5, Phase 1). The immutable
     ImmuDB ledger holds only input_sha256; the full arguments live here,
-    keyed by the ImmuDB transaction id, so a GDPR Article 17 erasure request
-    can delete this row without touching the ledger. Deleting a row does not
-    invalidate the ledger's proof of what was decided or that the input
-    hashed to the value the ledger recorded.
+    keyed by call_id (D7, Phase 1.1 - minted by the interceptor at intercept
+    time, independent of ImmuDB's own transaction numbering), so a GDPR
+    Article 17 erasure request can delete this row without touching the
+    ledger. Deleting a row does not invalidate the ledger's proof of what
+    was decided or that the input hashed to the value the ledger recorded.
     """
 
     __tablename__ = "call_content"
 
-    tx_id = Column(Integer, primary_key=True)
+    call_id = Column(String, primary_key=True)
     payload_json = Column(Text, nullable=False)
 
     created_at = Column(DateTime, server_default=func.now(), nullable=False)

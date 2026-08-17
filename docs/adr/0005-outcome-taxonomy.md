@@ -32,22 +32,42 @@ finalized in `intercept_tool_call`):
 | `fault` | The call could not be evaluated | one of four below | `null` |
 
 `fault_class` is one of: `opa_unreachable`, `revision_unavailable`,
-`verifier_unreachable`, `spiffe_unavailable`. Nothing downstream re-derives
-`outcome_type` or `fault_class` from message text - `_render_message` in
-`interceptor/middleware.py` goes the other direction, from the already-decided
-type to presentational text.
+`verifier_unreachable`, `spiffe_unavailable`, `malformed_policy_response`
+(Phase 1.1, P11-3), `content_store_unreachable` (Phase 1.1, D7). Nothing
+downstream re-derives `outcome_type` or `fault_class` from message text -
+`_render_message` in `interceptor/middleware.py` goes the other direction,
+from the already-decided type to presentational text.
+
+`malformed_policy_response` covers a 200 response from OPA's `/evaluation`
+whose body is missing or mistyping `allow`, `reasons`, or `revision` - red-
+team S3 found a body with only `allow` present was read as `policy_allow`
+with a null revision, contradicting this ADR's own table. Validated in
+`query_opa_policy` immediately after the existing `result is None` check
+(which stays `revision_unavailable` - that is a *structurally* undefined
+result, not a malformed one).
+
+`content_store_unreachable` covers a failed content-store write (D7,
+`docs/adr/0005-outcome-taxonomy.md` continues to apply here: this fault
+still follows the same closed-set discipline). Unlike the other four fault
+classes, this one is checked for *before* the ledger write is attempted -
+see the Documented boundary section below, which this phase extends.
 
 The ledger entry itself carries this taxonomy directly - no free-text
-`decision` string:
+`decision` string. `call_id` and `content_state` (D7, Phase 1.1) join the
+entry to its erasable content-store row - see `docs/adr/0006-verification-
+states.md` for the read-time inference this enables (`payload_state`),
+which follows the same pattern D2 uses for verification:
 
 ```json
 {
   "agent_id": "...", "timestamp": "...", "tool_name": "...",
+  "call_id": "<uuid4 hex, minted at intercept>",
   "input_sha256": "...",
   "outcome_type": "policy_deny",
   "fault_class": null,
   "policy_revision": "<bundle revision>",
-  "reasons": ["..."]
+  "reasons": ["..."],
+  "content_state": "present"
 }
 ```
 
@@ -58,16 +78,24 @@ cardinality.
 
 ## Documented boundary
 
-Three of the four fault classes (`opa_unreachable`, `revision_unavailable`,
-`spiffe_unavailable`) still produce a ledger record - the call could not be
-evaluated, but the fact of that failure can still be durably recorded. The
-fourth, `verifier_unreachable`, cannot: it is discovered only when the
-ledger write itself fails, and a fault in the recording path cannot be
-recorded through that same path. `intercept_tool_call` denies and returns
-`outcome_type: fault, fault_class: verifier_unreachable` to the caller and to
-Prometheus, but omits `ledger_tx_id` entirely - there is no ledger entry to
-point to. This is a structural limit, not an oversight: nothing can write a
-durable record of "the durable-record writer is down."
+Four of the six fault classes (`opa_unreachable`, `revision_unavailable`,
+`spiffe_unavailable`, `malformed_policy_response`) still produce a ledger
+record - the call could not be evaluated, but the fact of that failure can
+still be durably recorded. The other two cannot, for the same underlying
+reason: each is discovered in a path that itself precedes, or is, the write
+that would record it, and a fault in the recording path cannot be recorded
+through that same path.
+
+`verifier_unreachable` is discovered when the ledger write itself fails.
+`content_store_unreachable` (D7, Phase 1.1) is discovered one step earlier -
+the content write, which now happens *before* the ledger write, fails - and
+`intercept_tool_call` skips the ledger write entirely rather than record an
+entry whose `content_state` it cannot yet describe. Both cases: `outcome_type:
+fault` and the fault class are returned to the caller and to Prometheus, but
+`ledger_tx_id` is omitted entirely - there is no ledger entry to point to, in
+either case. This is a structural limit, not an oversight: nothing can write
+a durable record of "the durable-record writer is down," or of "the store
+this record's content_state would name is itself down."
 
 This is the one place in the whole system where "the record tells the
 truth" cannot mean "there is always a record." It means the caller and the
@@ -100,5 +128,9 @@ written down.
 - `interceptor/middleware.py::_outcome`, `query_opa_policy`, `intercept_tool_call`
 - `ledger/immudb_ledger.py::log_tool_call`
 - `docs/reports/phase-0-1-redteam.md`, R4 - the conflation this closes
+- `docs/reports/phase-1-redteam.md`, S1 #2/#4, S3, S4/S5 - the gaps Phase 1.1 closes
 - `tests/test_outcome_types.py` - automated coverage of every type and fault class
 - `tests/test_response_contract.py` - the contract test this taxonomy's key set feeds
+- `tests/test_policy_response_shape.py` - `malformed_policy_response` (P11-3)
+- `tests/test_content_states.py` - `content_state`/`content_store_unreachable` (D7)
+- `tests/test_raw_ledger_fields.py` - the raw-stored-value checks S1 #2/#4 named
