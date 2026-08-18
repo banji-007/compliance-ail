@@ -1,0 +1,14 @@
+{
+  "_comment": "The agent's own MCP client configuration. This is the only thing that points the client at the proxy. It is a file inside the agent's container, owned by the agent.",
+  "mcpServers": {
+    "everything": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["/opt/ail/proxy/proxy-stdio.mjs"]
+    },
+    "everything-http": {
+      "transport": "http",
+      "url": "http://proxy:8080/mcp"
+    }
+  }
+}
