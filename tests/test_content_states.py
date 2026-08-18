@@ -13,11 +13,15 @@ Requires the docker-compose.test.yml stack. SPIRE_DISABLED=true bypasses
 mTLS, matching Makefile:45-53.
 """
 
+import base64
+import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -34,7 +38,8 @@ import content_store  # noqa: E402 - importable once middleware's sys.path.appen
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
 READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 WRITE_API_KEY = os.getenv("CONTROL_PLANE_WRITE_KEY", "test-write-key")
-VERIFIER_HEALTH_URL = os.getenv("VERIFIER_URL", "http://localhost:8003") + "/health"
+VERIFIER_URL = os.getenv("VERIFIER_URL", "http://localhost:8003")
+VERIFIER_HEALTH_URL = VERIFIER_URL + "/health"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = "docker-compose.test.yml"
 
@@ -66,6 +71,21 @@ def _immudb_reachable() -> bool:
 requires_stack = pytest.mark.skipif(
     not (_opa_reachable() and _immudb_reachable()),
     reason="OPA and/or ImmuDB not reachable",
+)
+
+# P13-5 (Phase 1.3, red-team U7): test_direct_sqlite_delete_produces_lost_not_erased
+# and test_erasure_refused_when_tombstone_write_fails both shell out to the
+# docker CLI directly (subprocess.run(["docker", "compose", ...])).
+# requires_stack only checks HTTP reachability, which stays true even with
+# the CLI binary itself absent from PATH (the containers were still up) -
+# with docker removed, both tests raised a raw FileNotFoundError deep inside
+# subprocess.Popen, reported by pytest as a plain failure, indistinguishable
+# from a real regression in the erasure/tombstone logic they exist to guard.
+# Project convention (P01-1, docs/reports/phase-0-1.md): an
+# environment-dependent test gets a clean skipif, not a crash.
+requires_docker_cli = pytest.mark.skipif(
+    shutil.which("docker") is None,
+    reason="docker CLI not on PATH",
 )
 
 
@@ -185,6 +205,7 @@ def _metric_total() -> float:
 
 
 @requires_stack
+@requires_docker_cli
 def test_direct_sqlite_delete_produces_lost_not_erased():
     """
     Attack to reproduce (docs/reports/phase-1-1-redteam.md, T5, verbatim):
@@ -232,6 +253,7 @@ def test_direct_sqlite_delete_produces_lost_not_erased():
 
 
 @requires_stack
+@requires_docker_cli
 def test_erasure_refused_when_tombstone_write_fails():
     """
     D11: if the tombstone write fails, the erasure is refused and the row
@@ -337,3 +359,126 @@ def test_erasure_tombstone_not_a_second_decision_entry():
         f"Erasure must not be counted in any decision metric: "
         f"before={before_metric_total} after={after_metric_total}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P13-4 (Phase 1.3, red-team U4): a tombstone must never be silently
+# discarded, and an erasure must never be undoable through the ordinary
+# write key.
+# ---------------------------------------------------------------------------
+
+def _write_tombstone_directly(call_id: str) -> None:
+    """
+    Forge a content_erasure tombstone via the verifier's own /write, the
+    same way red-team U4/U5 did - bypassing DELETE /content/{call_id}, the
+    control plane, and any auth entirely. Used here to construct
+    combination 1 (a tombstone with the row still present), which the real
+    endpoint's own ordering (tombstone, then delete) cannot produce on its
+    own.
+    """
+    tombstone = {
+        "record_type": "content_erasure",
+        "call_id": call_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "actor": "test-forged-tombstone",
+    }
+    serialized = json.dumps(tombstone, separators=(",", ":"))
+    key = f"content_erasure:{call_id}"
+    resp = httpx.post(
+        f"{VERIFIER_URL}/write",
+        json={
+            "key": base64.b64encode(key.encode()).decode(),
+            "value": base64.b64encode(serialized.encode()).decode(),
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    assert resp.json().get("verified"), f"Tombstone write not verified: {resp.json()}"
+
+
+@requires_stack
+def test_tombstone_coexisting_with_present_row_renders_erasure_conflict():
+    """
+    Attack to reproduce (docs/reports/phase-1-2-redteam.md, U4 combination
+    1, verbatim): a content_erasure tombstone written for a call_id whose
+    content-store row was never deleted used to render as plain "present",
+    discarding the tombstone silently. Must now render "erasure_conflict" -
+    distinct from both "present" (would hide that an erasure was ever
+    recorded) and "erased" (would hide that the row is still there) - with
+    payload withheld either way.
+    """
+    marker = f"CONFLICT-MARKER-PHASE1-3-{uuid.uuid4().hex}"
+    args = {
+        "target_table": "pii_records",
+        "query": f"SELECT * FROM pii_records WHERE marker='{marker}'",
+        "processing_purpose": "customer_support",
+        "masking_enabled": True,
+    }
+    r = middleware.intercept_tool_call("query_database", args, "content_state_test")
+    assert "ledger_tx_id" in r, f"Expected a recorded call, got: {r}"
+    tx_id = r["ledger_tx_id"]
+
+    entry = _audit_entry_for_tx(tx_id)
+    assert entry["payload_state"] == "present", entry
+    call_id = entry["call_id"]
+    assert call_id, f"Expected a call_id on the entry, got: {entry}"
+
+    _write_tombstone_directly(call_id)
+
+    entry_after = _audit_entry_for_tx(tx_id)
+    assert entry_after["payload_state"] == "erasure_conflict", entry_after
+    assert entry_after["payload"] is None, (
+        "A tombstoned call_id must never return its payload, even if the row "
+        "backing it still exists"
+    )
+
+
+@requires_stack
+def test_resurrection_after_erasure_refused():
+    """
+    Attack to reproduce (docs/reports/phase-1-2-redteam.md, U4 combination
+    2, verbatim): erase a call through the real endpoint, then POST
+    /content again for the same call_id using nothing but the ordinary
+    write key - no escalation. Before P13-4 this silently resurrected the
+    row with attacker-chosen content and /audit showed no trace an erasure
+    had ever happened. The write must now be refused and /audit must
+    continue to report "erased".
+    """
+    marker = f"RESURRECT-MARKER-PHASE1-3-{uuid.uuid4().hex}"
+    args = {
+        "target_table": "pii_records",
+        "query": f"SELECT * FROM pii_records WHERE marker='{marker}'",
+        "processing_purpose": "customer_support",
+        "masking_enabled": True,
+    }
+    r = middleware.intercept_tool_call("query_database", args, "content_state_test")
+    assert "ledger_tx_id" in r, f"Expected a recorded call, got: {r}"
+    tx_id = r["ledger_tx_id"]
+    entry = _audit_entry_for_tx(tx_id)
+    call_id = entry["call_id"]
+    assert call_id, f"Expected a call_id on the entry, got: {entry}"
+
+    del_resp = httpx.delete(
+        f"{CONTROL_PLANE_URL}/content/{call_id}",
+        headers={"X-API-Key": WRITE_API_KEY},
+        timeout=10,
+    )
+    assert del_resp.status_code == 204, del_resp.text
+    assert _audit_entry_for_tx(tx_id)["payload_state"] == "erased"
+
+    resurrect_resp = httpx.post(
+        f"{CONTROL_PLANE_URL}/content",
+        json={"call_id": call_id, "payload": {"resurrected": "content that should be permanently gone"}},
+        headers={"X-API-Key": WRITE_API_KEY},
+        timeout=10,
+    )
+    assert resurrect_resp.status_code == 409, (
+        f"Expected the ordinary write key to be refused on an erased call_id, "
+        f"got {resurrect_resp.status_code}: {resurrect_resp.text}"
+    )
+
+    entry_after = _audit_entry_for_tx(tx_id)
+    assert entry_after["payload_state"] == "erased", (
+        f"An erasure must remain final after a refused resurrection attempt: {entry_after}"
+    )
+    assert entry_after["payload"] is None

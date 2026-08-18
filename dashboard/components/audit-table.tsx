@@ -59,6 +59,13 @@ function DecisionCell({ entry }: { entry: AuditEntry }) {
           policy: {entry.policy_revision}
         </span>
       )}
+      {/* P13-8: every record declares the conformance profile it was
+          produced under - "observed" today. Not a per-entry variable in
+          this codebase, but shown per-entry because the field lives on the
+          record, not on a global setting. */}
+      <span className="text-[10px] text-muted-foreground/70 font-mono uppercase">
+        profile: {entry.profile}
+      </span>
     </div>
   );
 }

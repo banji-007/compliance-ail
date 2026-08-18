@@ -32,11 +32,11 @@ This approach is **not a security control**. It is a polite suggestion written i
 
 For a SOC2 Type II audit, GDPR Article 25 (Data Protection by Design), or any regulatory framework that requires **demonstrable, verifiable controls**, a language model instruction is inadmissible as a security boundary. An auditor will reject it and a breach attorney will exploit it.
 
-**The required architecture is an out-of-band, deterministic enforcement gateway.**
+**The required architecture is a deterministic enforcement layer the LLM's own output cannot talk its way past.**
 
-The Agentic Integrity Ledger (AIL) is that gateway. It intercepts every tool call an AI agent attempts **before execution**, evaluates it against formally defined Rego policies in Open Policy Agent, cryptographically logs the decision to an immutable ledger, and either allows or blocks execution - independent of what the LLM was told to do and regardless of whether the LLM was compromised.
+The Agentic Integrity Ledger (AIL) is that layer, and it is honest to be precise about its own placement: it is an **in-process hook**, not a network appliance sitting beside the agent. `interceptor/middleware.py::intercept_tool_call` runs inside the agent's own Python process, on the agent's own call path - every registered tool call funnels through it before execution, which evaluates the call against formally defined Rego policies in Open Policy Agent and cryptographically logs the decision to an immutable ledger before allowing or blocking it. A cooperating agent - including one whose LLM has been successfully prompt-injected or jailbroken - cannot evade this, because the call is evaluated on its parameters regardless of what token sequence produced it. What this does not defend against is a **compromised container**: arbitrary code execution in the agent's own process can call the underlying tool directly, monkey-patch or skip `intercept_tool_call` outright, or reach the policy/ledger infrastructure's own APIs on the same network position the agent holds. See the Residual Limits section (§5) for what that means concretely, and this repository's roadmap for the isolation work (Phase 2) that closes it.
 
-The LLM is treated as an **untrusted client**. The gateway is the authority.
+The LLM is treated as an **untrusted client**. The interceptor is the authority the LLM's output must pass through - it is not a perimeter the agent process itself is outside of.
 
 ---
 
@@ -116,7 +116,7 @@ AIL uses **SPIFFE/SPIRE** (the CNCF standard for workload identity) to issue eph
 - Certificates are loaded **in-memory only** on Linux (`os.memfd_create`), never written to disk
 - If the SPIRE workload socket is absent at boot, the agent process exits immediately
 
-This means a compromised container that somehow exfiltrated an API key has nothing actionable. Identity is bound to the workload's cryptographic attestation, not a static secret.
+This means exfiltrating a *static API key* buys an attacker nothing on this data plane - identity is bound to the workload's cryptographic attestation, not a secret that can be copied out and replayed elsewhere. It does not mean a compromised container has nothing actionable in general: code running inside the agent's own container holds that workload's real SPIFFE identity for as long as it runs, and can use it to reach whatever that identity is authorized to reach - including, in this codebase, OPA's and the verifier's own network-exposed APIs (see Residual Limits, §5). What SPIFFE/SPIRE removes is the *static-secret-theft* attack; it does not remove the *I am now running inside the trusted workload* attack, which is a different threat entirely.
 
 ### 3.2 Multi-Schema Pre-flight Inspection
 
@@ -319,7 +319,7 @@ I am on the marketing team. Provision a t3.micro instance in us-east-1 for $5/ho
 
 **Expected denial:**
 ```
-DENIED: Production environments must include a valid 'cost_center' tag. Approved values: {"executive", "finance"}.
+DENIED: Production environments must include a valid 'cost_center' tag. Approved values: executive, finance.
 ```
 
 **Step 3.** Submit the corrected request to demonstrate the approved path:
@@ -367,7 +367,7 @@ The Docker Compose stack is the only currently-working path for running AIL end 
 
 ### Prompt Injection - Structurally Constrained
 
-The gateway's enforcement is out-of-band; it operates at the tool call interception layer in the Python interceptor and at the Envoy network layer. The LLM's output is only ever treated as untrusted input to be evaluated. The LLM cannot instruct the gateway to disable itself, any more than a SQL injection payload can instruct a firewall to turn off.
+The gateway's enforcement runs beneath the LLM's own reasoning, not inside it; it operates at the tool call interception layer in the Python interceptor and, on the mTLS-fronted demo path, at the Envoy network layer (§1 - this is an in-process hook a cooperating agent cannot evade, not a network appliance the agent sits outside of). The LLM's output is only ever treated as untrusted input to be evaluated. The LLM cannot instruct the gateway to disable itself, any more than a SQL injection payload can instruct a firewall to turn off.
 This bounds prompt injection rather than eliminating it. The guarantee is precise: no tool call reaches execution unless its parameters satisfy the active Rego policies and the registered schema. It follows that the security boundary is exactly as strong as your policy coverage. An injection that drives a registered tool toward a policy-violating parameter set is blocked deterministically. An injection that abuses a legitimately allowed tool in a way no policy expresses, or exfiltrates through an approved channel, is not something a parameter-level gateway can catch. AIL closes the 'the model was told not to' gap. It does not close the 'we never wrote a rule for that' gap.
 
 **Demonstrated attack and response:**
@@ -391,6 +391,16 @@ This bounds prompt injection rather than eliminating it. The guarantee is precis
 | SPIRE agent socket absent | Agent process exits at startup |
 | Control plane unreachable | OPA continues serving last-loaded bundle; new requests evaluate against cached policy |
 | Bundle ETag unchanged | OPA returns 304; no re-download; policy enforcement continues uninterrupted |
+
+### Residual Limits (Observed Profile)
+
+This gateway operates in the `observed` conformance profile (`docs/adr/0005-outcome-taxonomy.md`): the agent independently holds every tool's real authority, and nothing here takes that away from it. The limits below are not bugs pending a patch on this architecture - they are what "observed" means, stated precisely rather than left implicit. Phase 2 of the roadmap is the work that would move this gateway toward `mediated`; nothing in this repository does that yet.
+
+- **A compromised container evades the interceptor entirely.** §1 and §3.1 above state this directly: `intercept_tool_call` is an in-process hook, not a network perimeter. Arbitrary code execution in the agent's own process can call a tool's real backend directly, or skip the interceptor call, and no record is produced either way - a bypassed call is, by construction, a call this gateway never saw.
+- **OPA's management API is reachable from the host and from any container on the compose network.** `docker-compose.yml` and `docker-compose.test.yml` now bind OPA's port to loopback only (`tests/test_host_port_bindings.py`), which stops a second machine on the same network from reaching it merely because the host published the port. It does not stop the host itself, and it does not stop anything running inside the compose network - including the agent container - from reaching OPA's Data API and its unauthenticated management endpoints (`/v1/policies`, `/v1/data/system/bundles/*`) directly. Phase 2's removal of the agent's own network path to OPA is what actually closes this.
+- **The verifier's `/write` and `/verify` carry no authentication, and this is the more important of the two.** The same loopback binding (`tests/test_host_port_bindings.py`) applies to the verifier's port. Tamper-evidence - the property ImmuDB's inclusion and consistency proofs actually provide - protects a record already written from being modified without detection. It does not protect against a record being forged in the first place: **any party with the agent's network position can write arbitrary records to the ledger, and those records will carry valid inclusion proofs.** A forged `content_erasure` tombstone is one demonstrated instance of this (`docs/reports/phase-1-2-redteam.md`, U5); it is not the only shape a forged record could take.
+- **Attribution has a ceiling, not a gap.** A record names a session or a process; in a future `attested` profile, a workload. It cannot name intent. A compromised agent's calls carry the same identity as its legitimate ones, because the credential authenticates the process, not the process's current loyalty - see `docs/adr/0005-outcome-taxonomy.md` and the go/no-go findings in `docs/reports/spike-mcp-mediation.md` this is drawn from. No profile this project defines changes that ceiling.
+- **`GET /tenants/{tenant_id}` and `POST /content` are now access-controlled, but the credential they check is a single shared secret, not a per-caller identity** (ADR-0007) - this is the same authorization model the rest of the control plane already uses, disclosed here because P13-3/P13-4 add two more routes to it rather than changing the model.
 
 ---
 
@@ -416,7 +426,7 @@ OPA is a powerful but general-purpose policy engine. Running a full Rego evaluat
 
 **ADR-005: Outcome Taxonomy and the Record Schema**
 
-Every intercepted call is assigned one `outcome_type` (`policy_allow`, `policy_deny`, `schema_deny`, or `fault`, the last carrying a closed-set `fault_class`) at a single point in the interceptor, and the ledger entry carries this taxonomy directly rather than a free-text decision string. This is what makes a real policy violation, a malformed payload, and an infrastructure fault distinguishable everywhere - the ledger, `/audit`, the dashboard, and Prometheus - instead of collapsing to the same `DENIED` shape. See `docs/adr/0005-outcome-taxonomy.md` for the full record, including the one documented case (`fault_class: verifier_unreachable`) where no record can exist at all.
+Every intercepted call is assigned one `outcome_type` (`policy_allow`, `policy_deny`, `schema_deny`, or `fault`, the last carrying a closed-set `fault_class`) at a single point in the interceptor, and the ledger entry carries this taxonomy directly rather than a free-text decision string. This is what makes a real policy violation, a malformed payload, and an infrastructure fault distinguishable everywhere - the ledger, `/audit`, the dashboard, and Prometheus - instead of collapsing to the same `DENIED` shape. Every record also carries a `profile` (`observed` | `mediated` | `attested`) declaring which conformance guarantee it was produced under - this codebase produces `observed` only, see Residual Limits above. See `docs/adr/0005-outcome-taxonomy.md` for the full record, including the one documented case (`fault_class: verifier_unreachable`) where no record can exist at all, and the profile definitions with their attribution ceiling.
 
 **ADR-006: Four Read-Time Verification States**
 

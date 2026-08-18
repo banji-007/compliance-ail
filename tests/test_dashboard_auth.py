@@ -145,6 +145,52 @@ def test_control_plane_read_key_rejected_on_delete_content():
 
 
 @requires_dashboard
+def test_control_plane_get_tenant_rejected_with_no_key():
+    """
+    P13-3, Phase 1.3: named by Phase 1.1's red-team (finding #2) and
+    reconfirmed still open by Phase 1.2's red-team (finding 6.2) - GET
+    /tenants/{tenant_id} had no auth dependency at all. Full tenant
+    configuration (enabled frameworks, cost-center/region allowlists) was
+    readable with zero credentials, direct against the control plane,
+    bypassing the dashboard entirely.
+
+    422, not 401/403, is what a FastAPI required Header(...) dependency
+    returns when the header is missing outright (as opposed to present but
+    wrong) - the same convention already established for every other route
+    this dependency gates (docs/reports/phase-1-1-redteam.md, T3: "422 =
+    FastAPI rejecting the request for a missing required header,
+    functionally equivalent to a rejection"). The wrong-key case below
+    (test_control_plane_get_tenant_rejected_with_wrong_key) is what
+    exercises the dependency's own comparison logic and gets a real 403.
+    """
+    resp = httpx.get(f"{CONTROL_PLANE_URL}/tenants/{_TENANT_ID}", timeout=10)
+    assert resp.status_code == 422, f"Expected 422 (missing header), got {resp.status_code}: {resp.text}"
+
+
+@requires_dashboard
+def test_control_plane_get_tenant_rejected_with_wrong_key():
+    resp = httpx.get(
+        f"{CONTROL_PLANE_URL}/tenants/{_TENANT_ID}",
+        headers={"X-API-Key": "definitely-not-the-real-key"},
+        timeout=10,
+    )
+    assert resp.status_code == 403, f"Expected 403, got {resp.status_code}: {resp.text}"
+
+
+@requires_dashboard
+def test_control_plane_get_tenant_accepted_with_read_key():
+    """The read-scoped key must still work - this is a GET, same tier as
+    /audit, not a write route."""
+    resp = httpx.get(
+        f"{CONTROL_PLANE_URL}/tenants/{_TENANT_ID}",
+        headers={"X-API-Key": CONTROL_PLANE_READ_KEY},
+        timeout=10,
+    )
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    assert resp.json()["id"] == _TENANT_ID
+
+
+@requires_dashboard
 def test_control_plane_write_key_succeeds_on_mutating_routes():
     call_id = f"test-auth-probe-{uuid.uuid4().hex}"
 

@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TENANT_ID = "tenant_default"
 
+# P13-8 (Phase 1.3): see ledger/immudb_ledger.py's RECORD_PROFILE - same
+# value, same reason, defined independently here because the control plane
+# writes its own record (the erasure tombstone) rather than importing the
+# interceptor's ledger module.
+RECORD_PROFILE = "observed"
+
 # Two scoped keys, not one shared key (D6, Phase 1.1). CONTROL_PLANE_READ_KEY
 # authorizes GET /audit only; CONTROL_PLANE_WRITE_KEY authorizes every
 # mutating route (PUT/POST /tenants, POST /content, DELETE /content). A
@@ -191,7 +197,18 @@ def health():
 
 
 @app.get("/tenants/{tenant_id}", response_model=TenantRead)
-def get_tenant(tenant_id: str, db: Session = Depends(get_db)):
+def get_tenant(
+    tenant_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_read_key),
+):
+    """
+    P13-3: named by Phase 1.1's red-team (finding #2) and reconfirmed
+    unfixed by Phase 1.2's red-team - this route had no auth dependency at
+    all, so full tenant configuration (enabled frameworks, cost-center and
+    region allowlists) was readable with zero credentials. Read-scoped, not
+    write-scoped: this is a GET, same tier as /audit.
+    """
     tenant = db.query(Tenant).filter_by(id=tenant_id).first()
     if not tenant:
         raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
@@ -261,6 +278,35 @@ def get_bundle(tenant_id: str, request: Request, db: Session = Depends(get_db)):
     )
 
 
+def _has_tombstone(call_id: str) -> bool:
+    """
+    P13-4: check the verifier directly (the same source of truth /audit
+    reads) for a content_erasure tombstone before allowing a write to
+    call_id. Checking the verifier rather than local SQL means a tombstone
+    written directly to the verifier - bypassing this control plane
+    entirely - still blocks a resurrection attempt through this route.
+
+    Fails closed: only a clean, positively-identified error_class ==
+    "not_found" is treated as "no tombstone exists". Any other outcome
+    (verifier unreachable, a malformed response, any other error_class)
+    is treated as "tombstone present" - an erasure must never be undoable
+    merely because the check that would have caught it could not run.
+    """
+    key = f"content_erasure:{call_id}"
+    encoded_key = base64.b64encode(key.encode()).decode()
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(f"{VERIFIER_URL}/verify", json={"key": encoded_key})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.error("Tombstone check failed for call_id=%s: %s", call_id, exc)
+        return True
+    if data.get("verified"):
+        return True
+    return data.get("error_class") != "not_found"
+
+
 @app.post("/content", status_code=204)
 def write_content(
     payload: ContentWrite,
@@ -274,7 +320,19 @@ def write_content(
     failure here is fail-closed at the caller: the interceptor denies the
     call as a fault rather than writing a ledger entry it cannot yet
     describe.
+
+    P13-4: refuses the write outright if call_id already carries a
+    content_erasure tombstone. Before this check, the ordinary write key -
+    no escalation, the same credential used for any normal content write -
+    could resurrect an erased call_id with arbitrary attacker-chosen
+    content and /audit would show no trace an erasure had ever happened
+    (red-team U4, combination 2).
     """
+    if _has_tombstone(payload.call_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"call_id '{payload.call_id}' has been erased; content writes are refused",
+        )
     existing = db.query(CallContent).filter_by(call_id=payload.call_id).first()
     payload_json = json.dumps(payload.payload)
     if existing:
@@ -307,6 +365,7 @@ def _write_tombstone(call_id: str) -> None:
         "call_id": call_id,
         "timestamp": datetime.utcnow().isoformat(),
         "actor": "control-plane-write-key",
+        "profile": RECORD_PROFILE,
     }
     serialized = json.dumps(tombstone, separators=(",", ":"))
     key = f"content_erasure:{call_id}"
@@ -427,26 +486,45 @@ def _payload_state(content_state: str | None, content_row, has_tombstone: bool) 
     """
     Map a ledger entry's content_state (D7), whether its CallContent row
     still exists, and whether a content_erasure tombstone exists for its
-    call_id, to the read-time payload_state (D7, D11 - Phase 1.2): present |
-    unavailable | erased | lost. Pure function, unit-testable independent of
-    the ImmuDB/SQL join.
+    call_id, to the read-time payload_state (D7, D11, P13-4): present |
+    unavailable | erased | lost | erasure_conflict. Pure function,
+    unit-testable independent of the ImmuDB/SQL join.
 
     content_state == "unavailable" always wins - it was never attempted, so
-    there is nothing to erase or lose. Otherwise, a present row is
-    "present"; an absent row is "erased" only if the real erasure endpoint's
-    tombstone exists for this call_id (erase_content always writes it before
-    deleting), and "lost" otherwise - the row disappeared some other way
-    (red-team T5: a direct SQL delete bypassing the endpoint entirely).
-    "lost" and "erased" must never render identically: one is a GDPR
-    Article 17 request honored through the real endpoint, the other is an
-    operational incident with no erasure semantics behind it at all.
+    there is nothing to erase or lose.
+
+    A tombstone now wins over a present row (P13-4, red-team U4 combination
+    1): before this, a content_erasure tombstone coexisting with a row that
+    was never actually deleted rendered as plain "present", discarding the
+    tombstone silently - a durable record nobody read. write_content's own
+    tombstone check (see _has_tombstone) means this combination should not
+    arise through this control plane's own routes going forward; it can
+    still arise from a tombstone forged directly against the verifier (P13-2's
+    residual: any party with the agent's network position can write ledger
+    records the verifier will treat as authentic) or from an operational
+    failure between a real tombstone write and the row delete that should
+    follow it. Either way the payload is never returned once a tombstone
+    exists - erasure_conflict, not "present", flags that this call_id needs
+    investigation: the ledger says the content was erased and the row that
+    should have been deleted still exists.
+
+    Otherwise, a present row is "present"; an absent row is "erased" only if
+    the real erasure endpoint's tombstone exists for this call_id
+    (erase_content always writes it before deleting), and "lost" otherwise -
+    the row disappeared some other way (red-team T5: a direct SQL delete
+    bypassing the endpoint entirely). "lost" and "erased" must never render
+    identically: one is a GDPR Article 17 request honored through the real
+    endpoint, the other is an operational incident with no erasure
+    semantics behind it at all.
     """
     if content_state == "unavailable":
         return "unavailable", None
+    if has_tombstone:
+        if content_row is not None:
+            return "erasure_conflict", None
+        return "erased", None
     if content_row is not None:
         return "present", json.loads(content_row.payload_json)
-    if has_tombstone:
-        return "erased", None
     return "lost", None
 
 
@@ -476,20 +554,28 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
         input_sha256   - hash of the original tool arguments
         payload        - joined from the content store by call_id; null unless
                           payload_state is "present"
-        payload_state  - present | unavailable | erased | lost (D7, D11):
-                          "unavailable" means content_state was already
-                          "unavailable" at write time (nothing dict-shaped
-                          to store) and always wins over the other three;
-                          "erased" and "lost" both mean content_state was
-                          "present" but no CallContent row exists now -
-                          "erased" additionally requires a content_erasure
-                          tombstone for this call_id (the real DELETE
-                          /content/{call_id} endpoint always writes one
-                          first); "lost" is every other way the row could
-                          be gone (e.g. a direct SQL delete bypassing the
-                          endpoint)
+        payload_state  - present | unavailable | erased | lost | erasure_conflict
+                          (D7, D11, P13-4): "unavailable" means content_state
+                          was already "unavailable" at write time (nothing
+                          dict-shaped to store) and always wins over the
+                          rest; a content_erasure tombstone for this call_id
+                          then wins over everything except "unavailable" -
+                          "erased" if the row is also gone (the normal case:
+                          the real DELETE /content/{call_id} endpoint always
+                          writes the tombstone before deleting the row), or
+                          "erasure_conflict" if the row still exists despite
+                          the tombstone (P13-4: a tombstone must never be
+                          silently discarded just because a row outlived it -
+                          this needs investigation, and payload is withheld
+                          either way); with no tombstone, a present row is
+                          "present" and an absent one is "lost" - some other
+                          way the row disappeared (e.g. a direct SQL delete
+                          bypassing the endpoint)
         verification   - {state, state_id, detail, error_class}; state is one
                           of verified | failed | unverifiable | asserted | not_found
+        profile        - conformance profile this record was produced under
+                          (P13-8); "observed" is the only value that exists
+                          today. See docs/adr/0005-outcome-taxonomy.md.
     """
     if not IMMUDB_USER or not IMMUDB_PASSWORD:
         raise HTTPException(
@@ -625,6 +711,11 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
                 "payload":         payload,
                 "payload_state":   payload_state,
                 "verification":    verification,
+                # P13-8: every record ever written by this codebase carries
+                # this same value (RECORD_PROFILE) - defaulted here, not
+                # trusted from a caller-suppliable field, for the rare
+                # pre-P13-8 entry that predates the key existing at all.
+                "profile":         log_entry.get("profile", RECORD_PROFILE),
             })
         except Exception as exc:
             logger.warning("Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc)

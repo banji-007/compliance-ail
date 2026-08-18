@@ -39,14 +39,19 @@ or wrongly-scoped request never reaches a route handler, so it never causes
 a control-plane key to be attached at all.
 
 **Control-plane layer** (`control_plane/main.py`): the single
-`CONTROL_PLANE_API_KEY` splits into `CONTROL_PLANE_READ_KEY` (authorizes
-`GET /audit` only) and `CONTROL_PLANE_WRITE_KEY` (authorizes
-`PUT`/`POST /tenants`, `POST /content`, `DELETE /content/{call_id}`). These
-are independent secrets, not a hierarchy - the read key structurally cannot
-authorize a write route, checked by `_require_read_key`/`_require_write_key`,
-two separate FastAPI dependencies replacing the single `_require_api_key`.
-Either key being unset returns 503 on the routes it gates, matching the
-prior fail-closed behavior for a missing key.
+`CONTROL_PLANE_API_KEY` splits into `CONTROL_PLANE_READ_KEY` (authorizes the
+two read routes, `GET /audit` and `GET /tenants/{tenant_id}`) and
+`CONTROL_PLANE_WRITE_KEY` (authorizes `PUT`/`POST /tenants`, `POST /content`,
+`DELETE /content/{call_id}`). `GET /tenants/{tenant_id}` had no dependency at
+all until P13-3 (Phase 1.3) added one - named by Phase 1.1's red-team
+(finding #2) and reconfirmed still open by Phase 1.2's red-team (finding
+6.2) in the interim; full tenant configuration was readable with zero
+credentials until then. These are independent secrets, not a hierarchy -
+the read key structurally cannot authorize a write route, checked by
+`_require_read_key`/`_require_write_key`, two separate FastAPI dependencies
+replacing the single `_require_api_key`. Either key being unset returns 503
+on the routes it gates, matching the prior fail-closed behavior for a
+missing key.
 
 The dashboard's own route handlers hold both control-plane keys and forward
 the one that matches the route: `GET /api/audit` and `GET /api/tenants/{id}`
@@ -110,7 +115,11 @@ just the layer where the regression happened to land.
 - `control_plane/main.py::_require_read_key`, `_require_write_key`
 - `dashboard/app/api/audit/route.ts`, `dashboard/app/api/tenants/[id]/route.ts`
 - `docs/reports/phase-1-redteam.md`, S6 - the open-relay finding this closes
+- `docs/reports/phase-1-1-redteam.md` and `docs/reports/phase-1-2-redteam.md` - `GET /tenants/{tenant_id}`'s missing dependency, closed by P13-3 (Phase 1.3)
 - D4 (Phase 3) - the server-side-only credential handling this ADR extends
   rather than replaces; referenced in `dashboard/lib/api.ts` and
   `dashboard/app/api/*/route.ts` comments, no dedicated ADR of its own
-- `tests/test_dashboard_auth.py`
+- `tests/test_dashboard_auth.py`, including
+  `test_control_plane_get_tenant_rejected_with_no_key`,
+  `::test_control_plane_get_tenant_rejected_with_wrong_key`,
+  `::test_control_plane_get_tenant_accepted_with_read_key` (P13-3)

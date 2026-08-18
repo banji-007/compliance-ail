@@ -114,8 +114,21 @@ export interface AuditEntry {
    *                 (nothing dict-shaped to store, e.g. malformed
    *                 tool_args) — never rendered as erased or lost.
    */
-  payload_state: "present" | "erased" | "lost" | "unavailable";
+  /**
+   * P13-4: a content_erasure tombstone now wins over a present row. A row
+   * that outlived its own tombstone renders as "erasure_conflict", not
+   * "present" — the payload is withheld either way and this needs
+   * investigation, not silent display.
+   */
+  payload_state: "present" | "erased" | "lost" | "unavailable" | "erasure_conflict";
   verification: Verification;
+  /**
+   * Conformance profile this record was produced under (P13-8). "observed"
+   * is the only value that exists today — the agent independently holds
+   * every tool's authority, so a bypass of this gateway is possible and
+   * would leave no record at all. See docs/adr/0005-outcome-taxonomy.md.
+   */
+  profile: "observed" | "mediated" | "attested";
 }
 
 export interface AuditResponse {

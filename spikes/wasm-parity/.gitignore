@@ -1,0 +1,14 @@
+# Regenerable / large — not part of the evidentiary record.
+# See REPRODUCE.md (P13-6, Phase 1.3) for how to reproduce.
+node_modules/
+tools/
+build/
+build2/
+build3/
+build_embed/
+build_probe/
+build_eval/
+worker/.wrangler/
+worker/policy.wasm
+scratch/.opa_eval_tmp/
+scratch/parity_results.json

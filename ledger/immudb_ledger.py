@@ -24,6 +24,12 @@ load_dotenv()
 
 _VERIFIER_URL = os.getenv("VERIFIER_URL", "http://verifier:8003")
 
+# P13-8 (Phase 1.3): the only conformance profile this codebase can produce.
+# The agent independently holds every tool's authority - nothing here takes
+# that away from it - so "observed" is not a deployment choice, it is what
+# this architecture is. See docs/adr/0005-outcome-taxonomy.md.
+RECORD_PROFILE = "observed"
+
 
 class ImmuDBLedger:
     def __init__(self, verifier_url: str | None = None):
@@ -92,6 +98,7 @@ class ImmuDBLedger:
             "policy_revision": policy_revision,
             "reasons": reasons,
             "content_state": content_state,
+            "profile": RECORD_PROFILE,
         }
         serialized  = json.dumps(log_entry, separators=(",", ":"))
         key         = f"tool_call:{agent_id}:{uuid.uuid4().hex}:{tool_name}"

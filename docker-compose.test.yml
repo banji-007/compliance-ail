@@ -44,7 +44,9 @@ services:
   opa:
     image: openpolicyagent/opa:1.14.1
     ports:
-      - "8181:8181"
+      # Loopback-only (P13-1) - see docker-compose.yml's opa service for why.
+      # tests/ run on the host (localhost), which this still reaches.
+      - "127.0.0.1:8181:8181"
     environment:
       - AIL_TENANT_ID=tenant_default
       - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
@@ -98,7 +100,9 @@ services:
     build:
       context: ./verifier
     ports:
-      - "8003:8003"
+      # Loopback-only (P13-2) - see docker-compose.yml's verifier service for
+      # why. tests/ run on the host (localhost), which this still reaches.
+      - "127.0.0.1:8003:8003"
     environment:
       - IMMUDB_ADDR=immudb:3322
       - IMMUDB_USER=${IMMUDB_USER:-immudb}
