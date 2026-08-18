@@ -167,12 +167,20 @@ The resurrection POST returned 204 again, matching the exact pre-fix U4 combinat
 
 ```
 $ PATH="$(echo "$PATH" | tr ':' '\n' | grep -vi docker | tr '\n' ':')" which docker
-docker: command not found
+which: no docker in (...)
 $ PATH=<same> python -m pytest tests/test_content_states.py -v
-... SKIPPED (docker CLI not on PATH) ... 2 skipped, 6 passed
+tests/test_content_states.py::test_present_then_erased_via_delete_content PASSED
+tests/test_content_states.py::test_unavailable_for_non_dict_args PASSED
+tests/test_content_states.py::test_content_store_down_denies_as_fault_and_writes_no_record PASSED
+tests/test_content_states.py::test_direct_sqlite_delete_produces_lost_not_erased SKIPPED
+tests/test_content_states.py::test_erasure_refused_when_tombstone_write_fails SKIPPED
+tests/test_content_states.py::test_erasure_tombstone_not_a_second_decision_entry PASSED
+tests/test_content_states.py::test_tombstone_coexisting_with_present_row_renders_erasure_conflict PASSED
+tests/test_content_states.py::test_resurrection_after_erasure_refused PASSED
+6 passed, 2 skipped in 262.39s (0:04:22)
 ```
 
-Clean skip, not a `FileNotFoundError` - matching the P01-1 convention.
+Clean skip, not a `FileNotFoundError` - matching the P01-1 convention. The containers themselves remained fully reachable throughout (only the CLI binary was hidden from this host-side process), matching U7's own original scoping.
 
 **Enforce:** the guard itself, per the instruction (no separate enforcing test specified beyond the demonstration above).
 
@@ -262,7 +270,9 @@ Full suite, `docker-compose.test.yml`, fresh volumes (`down -v` / `up -d --wait`
 
 96 = 95 (Phase 1.2's own baseline of 84, plus P13-1's 4 parametrized `test_host_port_bindings.py` cases, plus P13-3's 2 new dashboard-auth tests, plus P13-4's 2 new content-state tests, plus P13-8's 3 new record-profile tests = 84 + 4 + 2 + 2 + 3 = 95) + 1 (a `test_control_plane_get_tenant_rejected_with_wrong_key` test added after the first attempt's own test-side bug was found and fixed, §3 P13-3). No test skipped in this run (the docker-CLI skip guard, P13-5, only activates with `docker` removed from PATH - demonstrated separately below, not in this run).
 
-**End SHA for audit purposes:** this phase's work is committed on `phase-1-3-work`, pushed to `origin/phase-1-1-remediation` (updating PR #2) at commit `<FILLED IN AT PUSH TIME>`. CI run: `<FILLED IN AFTER PUSH>`.
+Individually, each item's own mutation was applied live against the running stack, confirmed to fail its named test(s), reverted, and reconfirmed passing (§3) - not re-run as one combined batch, per the mutation-testing convention (one mutation at a time).
+
+**End SHA for audit purposes:** `70a8581cf70ebdfed887479c6bfcd37c613d5316`, pushed to `origin/phase-1-1-remediation` (updating PR #2 - `gh pr view 2` confirms `headRefOid: 70a8581...`, `state: OPEN`). **CI run:** `32182167165` (`Integration Tests`, `success`, created `2026-08-18T20:25:31Z`, completed `2026-08-18T20:27:58Z`, ~2m27s) - `https://github.com/banji-007/compliance-ail/actions/runs/32182167165`.
 
 ---
 
