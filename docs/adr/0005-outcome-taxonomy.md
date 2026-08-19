@@ -149,8 +149,8 @@ tool's authority sits relative to the gateway, not by which components are
 wired into the topology - a proxy sitting on the path between an agent and
 a tool does not, by itself, change which profile applies to the calls that
 cross it. This distinction exists because it is the one the go/no-go spike
-at `docs/reports/spike-mcp-mediation.md` found the roadmap's own topology-
-based framing failed to preserve: adding a mediation proxy is a
+at `docs/reports/spike-mcp-mediation.md` found `docs/plan/ail-roadmap.md`'s
+own topology-based framing failed to preserve: adding a mediation proxy is a
 configuration change; taking the tool's authority away from the agent is
 not.
 
