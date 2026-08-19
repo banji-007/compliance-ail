@@ -404,7 +404,19 @@ The single failure is `cleanup-p13-b`'s own dangling-reference test, working exa
 
 ## 12. CI
 
-CI_RUN_ID_PLACEHOLDER
+Pushed `ce38cd0` to `origin/phase-1-3-complete`, opened PR #5 against `phase-1-1-remediation` to trigger the `pull_request` CI trigger (the workflow only runs on push to `main` or on a pull request; a plain branch push does not trigger it).
+
+```
+$ git push -u origin phase-1-3-complete
+$ gh pr create --base phase-1-1-remediation --head phase-1-3-complete ...
+https://github.com/banji-007/compliance-ail/pull/5
+$ gh run view 32271095759 --json databaseId,headSha,status,conclusion,workflowName,url
+{"conclusion":"success","databaseId":32271095759,"headSha":"ce38cd0fc9756693060250291179792c03d9b6f6","status":"completed","workflowName":"Integration Tests","url":"https://github.com/banji-007/compliance-ail/actions/runs/32271095759"}
+```
+
+CI run id: **32271095759**, conclusion: **success**.
+
+**End SHA:** `ce38cd0fc9756693060250291179792c03d9b6f6`.
 
 ---
 
