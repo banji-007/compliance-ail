@@ -11,11 +11,23 @@ writes no ledger entry at all, closing the incoherence red-team S4/S5 found
 
 Requires the docker-compose.test.yml stack. SPIRE_DISABLED=true bypasses
 mTLS, matching Makefile:45-53.
+
+roadmap-commit, item 6: every `docker compose` invocation below passes
+`-p COMPOSE_PROJECT` explicitly (see _compose_project_name()). Without it,
+Compose falls back to the lowercased basename of the directory the command
+runs from, and that guess silently diverges from the project name the
+already-running stack actually has whenever the two are invoked from
+directories with different basenames (e.g. a worktree) or the stack was
+started under an explicit COMPOSE_PROJECT_NAME. `stop`/`start verifier`
+then either no-op against a project with no such container, or - worse -
+address a same-named container in an unrelated project, which is what
+produced two false failures in p13-merge.
 """
 
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +54,42 @@ VERIFIER_URL = os.getenv("VERIFIER_URL", "http://localhost:8003")
 VERIFIER_HEALTH_URL = VERIFIER_URL + "/health"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = "docker-compose.test.yml"
+
+
+def _default_compose_project_name() -> str:
+    """Compose's own default when COMPOSE_PROJECT_NAME is not set: the
+    lowercased basename of the project directory (here, REPO_ROOT, since
+    that is the cwd every docker compose invocation in this project -
+    Makefile included - runs from), with anything outside [a-z0-9_-]
+    stripped and leading separators removed. This is exactly what an
+    unmodified `docker compose -f docker-compose.test.yml ...` run from
+    REPO_ROOT resolves to on its own, so it matches a stack started the
+    ordinary way (e.g. `make test-integration`)."""
+    name = re.sub(r"[^a-z0-9_-]", "", REPO_ROOT.name.lower())
+    return name.lstrip("_-") or "default"
+
+
+def _compose_project_name() -> str:
+    """The Compose project name of the already-running stack this test file
+    talks to. Prefers COMPOSE_PROJECT_NAME (set explicitly, or by a root
+    .env - which `docker compose` itself auto-loads regardless of -f, per
+    the Makefile's own comment) over Compose's directory-basename default,
+    so a stack started under a non-default project name (a differently
+    named worktree, an explicit override) is targeted correctly instead of
+    silently talking to a project this test process guesses the name of."""
+    env_name = os.getenv("COMPOSE_PROJECT_NAME")
+    if env_name:
+        return env_name
+    dotenv_path = REPO_ROOT / ".env"
+    if dotenv_path.exists():
+        for line in dotenv_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("COMPOSE_PROJECT_NAME="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return _default_compose_project_name()
+
+
+COMPOSE_PROJECT = _compose_project_name()
 
 _APPROVED_ARGS = {
     "instance_type": "t3.micro",
@@ -255,7 +303,7 @@ def test_direct_sqlite_delete_produces_lost_not_erased():
         "c.commit()"
     )
     result = subprocess.run(
-        ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+        ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE, "exec", "-T",
          "ail-control-plane", "python", "-c", delete_script],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
     )
@@ -294,7 +342,7 @@ def test_erasure_refused_when_tombstone_write_fails():
     call_id = entry["call_id"]
 
     stop = subprocess.run(
-        ["docker", "compose", "-f", COMPOSE_FILE, "stop", "verifier"],
+        ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE, "stop", "verifier"],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
     )
     assert stop.returncode == 0, f"Failed to stop verifier: {stop.stdout}\n{stop.stderr}"
@@ -307,7 +355,7 @@ def test_erasure_refused_when_tombstone_write_fails():
         assert del_resp.status_code == 503, del_resp.text
     finally:
         start = subprocess.run(
-            ["docker", "compose", "-f", COMPOSE_FILE, "start", "verifier"],
+            ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE, "start", "verifier"],
             cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
         )
         assert start.returncode == 0, f"Failed to restart verifier: {start.stdout}\n{start.stderr}"
