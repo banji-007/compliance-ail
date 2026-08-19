@@ -49,6 +49,9 @@ The `workload-registrar` script currently runs exactly once at startup. If it ex
 
 ## Structural Expansions (v1.1.0+)
 
+### Phase 3: `/audit` O(n) Verification Cost
+Per-entry synchronous verifier round trip on `GET /audit` is O(n) against ledger size; confirmed to time out tests at ~200 ledger entries (`docs/reports/phase-1-3-redteam.md`).
+
 ### Framework Expansion (PCI-DSS, ISO 27001)
 The current gateway ships with 4 baseline policy frameworks (GDPR, SOC2, FinOps, HIPAA). To expand enterprise commercial viability, the Rego policy library needs to cover additional major compliance standards.
 

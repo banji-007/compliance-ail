@@ -14,7 +14,7 @@ The FastAPI control plane exposes `GET /audit`, which:
 
 1. Scans ImmuDB via its REST API for `tool_call:` key listing (a plain scan needs no SDK-level proof).
 2. For each entry found, calls the verifier service's `POST /verify` (which performs `verifiedGet` - see ADR-0001) to get a real, per-entry proof result.
-3. Returns each entry with `verified: true|false` and the `state_id` it was checked against, appended to the response regardless of the verification outcome - an entry that fails verification is surfaced as an integrity warning, not dropped from the response. Only entries whose stored payload itself fails to decode are skipped, which is a malformed-record guard, not a verification-outcome filter.
+3. Returns each entry with a `verification` object (`state`, `state_id`, `detail`, `error_class`); `state` is one of five values - `verified`, `failed`, `unverifiable`, `asserted`, `not_found` (see `docs/adr/0006-verification-states.md`) - appended to the response regardless of the verification outcome: an entry that fails verification is surfaced as an integrity warning, not dropped from the response. Each entry also carries `payload_state` (`present`, `unavailable`, `erased`, `lost`, `erasure_conflict`; D7, D11, P13-4) and `profile`, the conformance profile the record was produced under, `"unknown"` if the field is absent from the stored record (R3, Phase 1.3 completion pass). Only entries whose stored payload itself fails to decode are skipped, which is a malformed-record guard, not a verification-outcome filter. A separate scan over `content_erasure:` keys identifies tombstones by `record_type` and keeps them structurally out of the decision entries returned here (D11).
 
 CORS is restricted to `http://localhost:3001` (the dashboard's own origin) via `CORSMiddleware` in `control_plane/main.py`.
 
@@ -28,7 +28,7 @@ CORS is restricted to `http://localhost:3001` (the dashboard's own origin) via `
 **Constraints:**
 
 - Per-entry `verifiedGet` on `/audit` is O(n) SDK calls against the verifier. At the default limit of 100 entries this is acceptable; consider lazy verification (verify on expand) if audit pages grow large.
-- If the verifier becomes unreachable partway through a scan, the endpoint stops calling it for the remainder of that scan and defaults the remaining entries to `verified: false` rather than retrying per entry - a fail-safe default, not a fresh proof check, for whatever entries follow the failure in that response.
+- If the verifier becomes unreachable partway through a scan, the entry where the failure was observed gets `verification.state: "unverifiable"`; the endpoint then stops calling the verifier for the remainder of that scan, and every entry after that gets `verification.state: "asserted"` rather than retrying per entry - a fail-safe default, not a fresh proof check, for whatever entries follow the failure in that response.
 
 ## References
 
