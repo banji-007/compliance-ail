@@ -1,0 +1,12 @@
+{
+  "name": "ail-spike-mcp-mediation",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/server-everything": "2026.8.18",
+    "@modelcontextprotocol/server-filesystem": "2026.7.10",
+    "express": "^5.1.0"
+  }
+}

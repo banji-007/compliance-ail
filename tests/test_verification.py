@@ -11,8 +11,8 @@ Environment variables (all default to docker-compose.test.yml values):
   IMMUDB_ADDR           localhost:3322    (gRPC; in-process SDK tests only)
   IMMUDB_USER           immudb
   IMMUDB_PASSWORD       immudb
-  CONTROL_PLANE_URL     http://localhost:8002
-  CONTROL_PLANE_API_KEY test-api-key
+  CONTROL_PLANE_URL       http://localhost:8002
+  CONTROL_PLANE_READ_KEY  test-read-key
 
 Test map:
   1. test_parity         - Criterion 1: state_id from verifier matches what
@@ -31,6 +31,7 @@ Test map:
 import base64
 import os
 import pickle
+import sys
 import tempfile
 import uuid
 
@@ -42,8 +43,8 @@ IMMUDB_URL        = os.getenv("IMMUDB_URL",            "http://localhost:8080")
 IMMUDB_ADDR       = os.getenv("IMMUDB_ADDR",           "localhost:3322")
 IMMUDB_USER       = os.getenv("IMMUDB_USER",           "immudb")
 IMMUDB_PASSWORD   = os.getenv("IMMUDB_PASSWORD",       "immudb")
-CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL",     "http://localhost:8002")
-API_KEY           = os.getenv("CONTROL_PLANE_API_KEY", "test-api-key")
+CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL",       "http://localhost:8002")
+READ_API_KEY      = os.getenv("CONTROL_PLANE_READ_KEY",  "test-read-key")
 
 
 def b64(s: str) -> str:
@@ -282,7 +283,7 @@ def test_cross_process():
 
     audit_resp = httpx.get(
         f"{CONTROL_PLANE_URL}/audit",
-        headers={"X-API-Key": API_KEY},
+        headers={"X-API-Key": READ_API_KEY},
         timeout=30,
     )
     assert audit_resp.status_code == 200, (
@@ -297,7 +298,7 @@ def test_cross_process():
         f"Written tx={written_tx} not found in audit "
         f"(present: {[e.get('tx_id') for e in entries]})"
     )
-    assert matching[0]["verified"] is True, (
+    assert matching[0]["verification"]["state"] == "verified", (
         f"Entry tx={written_tx} is not verified in /audit: {matching[0]}"
     )
 
@@ -333,3 +334,112 @@ def test_roundtrip():
         f"tx_id mismatch: write={write_result['tx_id']} "
         f"verify={verify_result['tx_id']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# D8 (Phase 1.1): not_found is a fifth verification state, not "failed"
+# ---------------------------------------------------------------------------
+
+def test_not_found_state():
+    """
+    Criterion (P11-5): a verifiedGet on a key that was never written returns
+    the not_found state. Detected from the RPC error's message text
+    (immudb 1.9.5's VerifiableGet returns grpc.StatusCode.UNKNOWN for this,
+    not a distinguishable status code - live testing disproved the original
+    status-code-based design; see docs/adr/0006-verification-states.md's
+    note on why message-text matching turned out to be the only option,
+    mirroring immudb-py's own plain-Get handler). Distinct from
+    test_tamper_state's corrupted-anchor case, which still returns
+    error_class == "consistency_failure" via the "failed" state, not
+    not_found - no tampering occurred here at all.
+    """
+    never_written_key = f"test:not-found:{uuid.uuid4().hex}"
+    result = verifier_verify(never_written_key)
+    assert result["verified"] is False, f"Expected verified: false, got {result}"
+    assert result["error_class"] == "not_found", f"Expected error_class 'not_found', got: {result}"
+
+
+def test_control_plane_maps_not_found_state_not_failed():
+    """
+    control_plane/main.py::_verification_from_200 (extracted from
+    get_audit's inline verification-state logic so it is directly
+    unit-testable) must map a not_found verifier response to
+    state == "not_found", never "failed". This is the named mutation for
+    D8/P11-8: folding not_found back under failed.
+
+    Exercised directly against the extracted function, not through /audit's
+    own scan+verify flow, because that scan only ever lists keys ImmuDB
+    itself confirms exist - a key that is simultaneously scanned and never
+    written is not constructible end to end. test_not_found_state above
+    covers the verifier's own detection live; this covers the control
+    plane's mapping of that result.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "control_plane"))
+    import main as control_plane_main  # noqa: E402
+
+    not_found_vdata = {
+        "verified": False,
+        "detail": "key not found: no entry was ever written for this key",
+        "error_class": "not_found",
+    }
+    verification = control_plane_main._verification_from_200(not_found_vdata)
+    assert verification["state"] == "not_found", f"Expected state 'not_found', got: {verification}"
+    assert verification["error_class"] == "not_found"
+
+    # Sanity: a genuine tamper (consistency_failure) still maps to "failed",
+    # so this isn't a change that silently widened - it's a narrower carve-out.
+    tamper_vdata = {"verified": False, "detail": "proof failed", "error_class": "consistency_failure"}
+    tamper_verification = control_plane_main._verification_from_200(tamper_vdata)
+    assert tamper_verification["state"] == "failed", f"Expected state 'failed', got: {tamper_verification}"
+
+
+# ---------------------------------------------------------------------------
+# D10 (Phase 1.2): failed requires positive identification, not a default
+# ---------------------------------------------------------------------------
+
+def test_control_plane_maps_unknown_error_class_to_unverifiable_not_failed():
+    """
+    Criterion (P12-2): a verifier error_class the control plane cannot
+    positively identify as tamper evidence must not be promoted to
+    "failed". Red-team T1: verifier/main.py's own error_class="unknown"
+    fallback (its blanket except branches) used to fall through to
+    "failed" by default - so a change in the ImmuDB server's message
+    wording alone (no source diff, no build to fail) turned a never-written
+    key into the tamper-alarm state. "unverifiable" carries the same
+    detail; nothing is lost, only mis-escalated.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "control_plane"))
+    import main as control_plane_main  # noqa: E402
+
+    unknown_vdata = {
+        "verified": False,
+        "detail": "<_InactiveRpcError ... status = StatusCode.UNKNOWN, "
+                   "details = \"tbtree: key absent from tree\">",
+        "error_class": "unknown",
+    }
+    verification = control_plane_main._verification_from_200(unknown_vdata)
+    assert verification["state"] == "unverifiable", f"Expected 'unverifiable', got: {verification}"
+    assert verification["detail"] == unknown_vdata["detail"], "detail must be preserved, not dropped"
+    assert verification["error_class"] == "unknown"
+
+    # A never-before-seen error_class must default the same way "unknown"
+    # does - the closed set for "failed" is exactly {consistency_failure,
+    # signature_failure}, not "not_found" or "everything else".
+    novel_vdata = {"verified": False, "detail": "a future SDK error", "error_class": "some_future_error_class"}
+    novel_verification = control_plane_main._verification_from_200(novel_vdata)
+    assert novel_verification["state"] == "unverifiable", f"Expected 'unverifiable', got: {novel_verification}"
+
+
+def test_control_plane_maps_both_tamper_classes_to_failed():
+    """
+    D10 narrows the default; it does not touch the two positively-
+    identified tamper conditions. Both must still map to "failed".
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "control_plane"))
+    import main as control_plane_main  # noqa: E402
+
+    for error_class in ("consistency_failure", "signature_failure"):
+        vdata = {"verified": False, "detail": f"{error_class} detail", "error_class": error_class}
+        verification = control_plane_main._verification_from_200(vdata)
+        assert verification["state"] == "failed", f"Expected 'failed' for {error_class}, got: {verification}"
+        assert verification["error_class"] == error_class

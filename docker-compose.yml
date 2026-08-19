@@ -2,8 +2,16 @@ services:
   ail-control-plane:
     build:
       context: ./control_plane
-    ports:
-      - "8002:8002"
+    # No host port published (R1, Phase 1.3 completion pass, red-team V2):
+    # this is a record-writing surface (PUT /tenants, POST/DELETE /content) -
+    # host.docker.internal reaches a loopback-bound port from any container
+    # on the Docker host regardless of which network it is on, so binding
+    # cannot close this the way it closes off-host LAN reach. The dashboard
+    # reaches this service by its compose DNS name (CONTROL_PLANE_URL=http://
+    # ail-control-plane:8002), which does not require a host-published port.
+    # To reach this API from the host for debugging, use
+    # `docker compose exec ail-control-plane` or a sibling container on the
+    # compose network - see readME.md section 4.6.
     environment:
       - DATABASE_URL=sqlite:////data/control_plane.db
       # ImmuDB REST (used for scan in /audit; scan needs no SDK).
@@ -12,9 +20,12 @@ services:
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
       # Verifier service — /audit calls this for per-entry proof verification.
       - VERIFIER_URL=http://verifier:8003
-      # API key for mutating control-plane endpoints (PUT/POST /tenants).
-      # Must be set in .env — absent key disables auth with a 503 response.
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY}
+      # Two independent keys, not one shared key (D6). READ authorizes only
+      # GET /audit; WRITE authorizes PUT/POST /tenants and POST/DELETE
+      # /content. Must be set in .env — an absent key disables the routes it
+      # gates with a 503 response.
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
     volumes:
       # policy/ mounted at runtime — changes on tenant config updates.
       - ./policy:/policy:ro
@@ -30,10 +41,27 @@ services:
 
   opa:
     image: openpolicyagent/opa:1.14.1
-    ports:
-      - "8181:8181"
+    # No host port published (R1, Phase 1.3 completion pass, red-team V2).
+    # The previous fix was a loopback bind ("127.0.0.1:8181:8181", P13-1),
+    # restricting reachability to the host itself and the compose network.
+    # Red-team V2 showed the loopback bind does not hold: host.docker.internal
+    # reaches a 127.0.0.1-published port from any container on the Docker
+    # host, including one on a network unrelated to this compose project.
+    # Binding cannot close that, so the fix is to not publish this port to
+    # the host at all. Envoy (8443) remains the client-facing surface;
+    # nothing needs OPA's own port from outside the compose network. The
+    # test stack (docker-compose.test.yml) still publishes this port,
+    # loopback-bound, deliberately - see that file's own header comment.
     environment:
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
+      # Single-sourced bundle key - opa-config.yaml's `bundles:` key and
+      # interceptor/middleware.py's revision lookup both read this same
+      # var. See opa-config.yaml and docs/reports/phase-0-1.md, P01-3.
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
+      # R4 (Phase 1.3 completion pass): opa-config.yaml attaches this as the
+      # X-API-Key header on every bundle poll against GET /bundles/{tenant}
+      # - that route now requires the read-scoped credential (red-team V6).
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY}
     command:
       - "run"
       - "--server"
@@ -59,10 +87,13 @@ services:
 
   immudb:
     image: codenotary/immudb:1.9.5
-    ports:
-      - "3322:3322"
-      # Port 8080 (REST API) intentionally not exposed to host — internal Docker
-      # network only. Access via service name 'immudb' from other containers.
+    # No host port published (R1, Phase 1.3 completion pass): neither the
+    # gRPC port (3322) nor the REST port (8080) is exposed to the host -
+    # this is ImmuDB's own direct read/write surface, independent of the
+    # verifier layer entirely. Access via service name 'immudb' from other
+    # containers on the compose network. See docs/adr/0002-fastapi-immudb-
+    # proxy.md, which this now matches. docker-compose.test.yml publishes
+    # both, deliberately, for the integration suite - see that file.
     environment:
       - IMMUDB_USER=${IMMUDB_USER}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
@@ -71,6 +102,11 @@ services:
       # "make keygen" before starting. Without this file, ImmuDB starts without
       # signing; the verifier will log a warning but still run.
       - ./keys:/keys:ro
+      # ImmuDB's own data dir. Without this, a `down` (no -v) + `up` cycle
+      # recreates ImmuDB empty while verifier-state (below) persists its old
+      # trust anchor, and the next verifiedGet fails with "illegal state"
+      # (Phase 1, P1-10) - the two volumes must be symmetric.
+      - immudb-data:/var/lib/immudb
     command:
       - "--signingKey=/keys/signing.key"
     healthcheck:
@@ -88,8 +124,16 @@ services:
   verifier:
     build:
       context: ./verifier
-    ports:
-      - "8003:8003"
+    # No host port published (R1, Phase 1.3 completion pass). The previous
+    # fix was a loopback bind ("127.0.0.1:8003:8003", P13-2); red-team V2
+    # showed host.docker.internal reaches a loopback-bound port from any
+    # container on the Docker host, so binding alone does not close this -
+    # /write and /verify carry no authentication of their own (the exact
+    # surface red-team U5 used to forge a tombstone). Residual: anything
+    # inside the compose network, including the agent container, still
+    # reaches both endpoints unauthenticated - see docs/reports/
+    # phase-1-3-complete.md. The test stack still publishes this port,
+    # loopback-bound, deliberately - see docker-compose.test.yml.
     environment:
       - IMMUDB_ADDR=immudb:3322
       - IMMUDB_USER=${IMMUDB_USER}
@@ -119,8 +163,10 @@ services:
     image: ghcr.io/spiffe/spire-server:1.11.1
     container_name: spire-server
     user: "0:0"
-    ports:
-      - "8081:8081"
+    # No host port published (R1, Phase 1.3 completion pass): SPIRE's own
+    # management API. spire-agent reaches it by compose DNS name
+    # (server_address = "spire-server" in agent.conf), which does not
+    # require a host-published port.
     volumes:
       - ./spire/server/server.conf:/opt/spire/conf/server/server.conf
       - spire-server-data:/opt/spire/data
@@ -182,7 +228,9 @@ services:
     pid: "service:spire-agent"
     ports:
       - "8443:8443"
-      - "9901:9901"
+      # 9901 (Envoy's own admin API) is not published to the host (R1,
+      # Phase 1.3 completion pass): it is a management surface, not the
+      # client-facing mTLS gate.
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml
       - spire-sockets:/tmp/spire-sockets
@@ -242,7 +290,12 @@ services:
       - OPA_URL=https://envoy:8443/v1/data/ail/main/allow
       - SPIRE_DISABLED=false
       - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      # Content-store writes (D5, D7) go straight to the control plane, not
+      # through the verifier - POST /content is a mutating route, so this
+      # uses the write-scoped key, never the read key (D6).
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
     volumes:
       # SPIRE workload socket — runtime mount, not baked into image.
       - spire-sockets:/tmp/spire-sockets
@@ -403,12 +456,28 @@ services:
       context: ./dashboard
       dockerfile: Dockerfile
       args:
-        # NEXT_PUBLIC_* vars are baked into the JS bundle at build time.
-        # Browser-side fetches hit localhost:8002 (host-exposed port).
-        NEXT_PUBLIC_API_URL: http://localhost:8002
+        # Only a UI default (which tenant is preselected), not a secret -
+        # safe to bake into the JS bundle. The control plane's API key is
+        # never a build arg or a NEXT_PUBLIC_* var - see D4 and
+        # dashboard/app/api/*/route.ts, which hold it server-side only.
         NEXT_PUBLIC_TENANT_ID: tenant_default
     ports:
       - "3001:3001"
+    environment:
+      # Server-side only (Route Handlers under app/api/) - never reaches
+      # the browser bundle. Two independent control-plane keys (D6): the
+      # audit route forwards READ, the tenants PUT route forwards WRITE.
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
+      # Caller-facing credentials for the dashboard's own routes (D6) -
+      # checked in dashboard/middleware.ts before any control-plane key is
+      # ever attached. Two independent pairs, not a hierarchy - the read
+      # pair never authorizes a write route.
+      - DASHBOARD_READ_USER=${DASHBOARD_READ_USER}
+      - DASHBOARD_READ_PASSWORD=${DASHBOARD_READ_PASSWORD}
+      - DASHBOARD_WRITE_USER=${DASHBOARD_WRITE_USER}
+      - DASHBOARD_WRITE_PASSWORD=${DASHBOARD_WRITE_PASSWORD}
     depends_on:
       ail-control-plane:
         condition: service_healthy
@@ -429,3 +498,7 @@ volumes:
   # Verifier's rolling SDK state (PersistentRootService pickle).
   # Not mounted in the interceptor container — enforces write/verify separation.
   verifier-state:
+  # ImmuDB's own data directory. Must persist symmetrically with
+  # verifier-state (Phase 1, P1-10) or a down/up cycle without -v produces a
+  # verifier trust anchor pointing at transactions ImmuDB no longer has.
+  immudb-data:

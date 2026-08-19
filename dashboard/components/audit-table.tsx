@@ -1,79 +1,156 @@
 "use client";
 
 import { useState, useMemo } from "react";
-import { Copy, Check, Search } from "lucide-react";
+import { Search, ShieldCheck, ShieldAlert, ShieldQuestion, CircleDashed, HelpCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import type { BadgeProps } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { formatTimestamp, truncateHash } from "@/lib/utils";
-import type { AuditEntry } from "@/lib/types";
+import { formatTimestamp } from "@/lib/utils";
+import type { AuditEntry, OutcomeType } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function decisionVariant(
-  decision: string | null
-): "approved" | "denied" | "secondary" {
-  if (!decision) return "secondary";
-  const upper = decision.toUpperCase();
-  if (upper.startsWith("APPROVED")) return "approved";
-  if (upper.startsWith("DENIED")) return "denied";
-  return "secondary";
-}
+const OUTCOME_LABEL: Record<OutcomeType, string> = {
+  policy_allow: "APPROVED",
+  policy_deny: "POLICY DENIED",
+  schema_deny: "SCHEMA REJECTED",
+  fault: "INFRASTRUCTURE FAULT",
+};
+
+const OUTCOME_VARIANT: Record<OutcomeType, NonNullable<BadgeProps["variant"]>> = {
+  policy_allow: "approved",
+  policy_deny: "denied",
+  schema_deny: "warning",
+  fault: "fault",
+};
 
 /**
- * Renders a compact verdict badge ("APPROVED" / "DENIED") with the full
- * policy reason displayed as smaller muted text beneath it.
+ * Renders a badge distinguishing all four outcome_types (P1-7) — a policy
+ * denial (a real compliance violation), a schema rejection (the LLM's
+ * payload was malformed, never reached policy), and an infrastructure
+ * fault (no decision was made at all) must never look alike. Reasons/
+ * fault_class render as smaller text beneath, same as the policy revision.
  */
-function DecisionCell({ decision }: { decision: string | null }) {
-  if (!decision) return <span className="text-muted-foreground text-xs">—</span>;
+function DecisionCell({ entry }: { entry: AuditEntry }) {
+  if (!entry.outcome_type) return <span className="text-muted-foreground text-xs">—</span>;
 
-  // Split "DENIED: gdpr.data_residency_required" into verdict + reason
-  const colonIdx = decision.indexOf(":");
-  const verdict = colonIdx === -1 ? decision : decision.slice(0, colonIdx).trim();
-  const reason = colonIdx === -1 ? null : decision.slice(colonIdx + 1).trim();
+  const detail =
+    entry.outcome_type === "fault"
+      ? entry.fault_class
+      : entry.reasons.length > 0
+      ? entry.reasons.join("; ")
+      : null;
 
   return (
     <div className="flex flex-col gap-1">
-      <Badge variant={decisionVariant(decision)} className="w-fit text-xs">
-        {verdict}
+      <Badge variant={OUTCOME_VARIANT[entry.outcome_type]} className="w-fit text-xs">
+        {OUTCOME_LABEL[entry.outcome_type]}
       </Badge>
-      {reason && (
+      {detail && (
         <span className="text-xs text-muted-foreground break-words leading-tight">
-          {reason}
+          {detail}
         </span>
       )}
+      {entry.policy_revision && (
+        <span className="text-[10px] text-muted-foreground/70 font-mono">
+          policy: {entry.policy_revision}
+        </span>
+      )}
+      {/* P13-8: every record declares the conformance profile it was
+          produced under - "observed" today. Not a per-entry variable in
+          this codebase, but shown per-entry because the field lives on the
+          record, not on a global setting. */}
+      <span className="text-[10px] text-muted-foreground/70 font-mono uppercase">
+        profile: {entry.profile}
+      </span>
     </div>
   );
 }
 
-function CopyHash({ hash }: { hash: string | null }) {
-  const [copied, setCopied] = useState(false);
-  if (!hash) return <span className="text-muted-foreground">—</span>;
+/**
+ * Renders one of the five verification states distinctly (P1-7, D2, D8).
+ * "asserted" is deliberately the quiet, neutral one — it is not a problem,
+ * it means no check was attempted for this entry. "unverifiable" and
+ * "failed" are both problems, but different ones: one is "we could not
+ * check", the other is the actual tamper signal. "not_found" (D8, Phase
+ * 1.1) is neither - no entry was ever written for this key, so there was
+ * never a proof to check in the first place.
+ */
+function VerificationCell({ entry }: { entry: AuditEntry }) {
+  const v = entry.verification;
 
-  function copy() {
-    if (!hash) return;
-    navigator.clipboard.writeText(hash).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+  if (v.state === "verified") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <ShieldCheck className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
+        <span className="text-muted-foreground">
+          Verified{v.state_id != null ? ` · state ${v.state_id}` : ""}
+        </span>
+      </div>
+    );
   }
 
+  if (v.state === "failed") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <ShieldAlert className="h-3.5 w-3.5 text-red-500 shrink-0" />
+        <div className="flex flex-col gap-0.5">
+          <Badge variant="denied" className="w-fit">
+            FAILED{v.error_class ? `: ${v.error_class.toUpperCase()}` : ""}
+          </Badge>
+        </div>
+      </div>
+    );
+  }
+
+  if (v.state === "unverifiable") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <ShieldQuestion className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+        <div className="flex flex-col gap-0.5">
+          <Badge variant="warning" className="w-fit">
+            UNVERIFIABLE
+          </Badge>
+          {v.detail && (
+            <span className="text-[10px] text-muted-foreground break-words leading-tight">
+              {v.detail}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (v.state === "not_found") {
+    // Distinct from "failed" (D8): no proof was ever rejected because there
+    // was never a proof to check — a bug/race signal, not a tamper signal.
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <HelpCircle className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+        <div className="flex flex-col gap-0.5">
+          <Badge variant="warning" className="w-fit">
+            NO RECORD
+          </Badge>
+          {v.detail && (
+            <span className="text-[10px] text-muted-foreground break-words leading-tight">
+              {v.detail}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // asserted — quiet by design: we simply did not look.
   return (
-    <div className="flex items-center gap-1.5 font-mono text-xs">
-      <span className="text-muted-foreground">{truncateHash(hash)}</span>
-      <button
-        onClick={copy}
-        className="rounded p-0.5 hover:bg-accent"
-        aria-label="Copy full hash"
-      >
-        {copied ? (
-          <Check className="h-3.5 w-3.5 text-emerald-500" />
-        ) : (
-          <Copy className="h-3.5 w-3.5 text-muted-foreground" />
-        )}
-      </button>
+    <div className="flex items-center gap-1.5 text-xs">
+      <CircleDashed className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+      <Badge variant="muted" className="w-fit">
+        NOT CHECKED
+      </Badge>
     </div>
   );
 }
@@ -91,7 +168,7 @@ const COLUMNS = [
   { key: "agent_id", label: "Agent ID", width: "w-48" },
   { key: "tool_name", label: "Tool Name", width: "w-44" },
   { key: "decision", label: "Decision", width: "w-48" },
-  { key: "ledger_hash", label: "Ledger Hash (SHA-256)", width: "w-52" },
+  { key: "verified", label: "Verification", width: "w-52" },
 ] as const;
 
 export function AuditTable({ entries }: Props) {
@@ -104,9 +181,11 @@ export function AuditTable({ entries }: Props) {
       const haystack = [
         e.agent_id,
         e.tool_name,
-        e.decision,
+        e.outcome_type,
+        e.fault_class,
+        e.reasons.join(" "),
         e.timestamp,
-        e.ledger_hash,
+        e.verification.state,
         JSON.stringify(e.payload ?? {}),
       ]
         .join(" ")
@@ -121,7 +200,7 @@ export function AuditTable({ entries }: Props) {
       <div className="relative max-w-sm">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
-          placeholder="Search agent, tool, decision, hash…"
+          placeholder="Search agent, tool, decision, verification…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="pl-9"
@@ -174,10 +253,10 @@ export function AuditTable({ entries }: Props) {
                     {entry.tool_name ?? "—"}
                   </td>
                   <td className="px-4 py-3 max-w-[14rem]">
-                    <DecisionCell decision={entry.decision} />
+                    <DecisionCell entry={entry} />
                   </td>
                   <td className="px-4 py-3">
-                    <CopyHash hash={entry.ledger_hash} />
+                    <VerificationCell entry={entry} />
                   </td>
                 </tr>
               ))
@@ -188,7 +267,8 @@ export function AuditTable({ entries }: Props) {
 
       <p className="text-xs text-muted-foreground">
         Showing {filtered.length} of {entries.length} ledger entries — newest
-        first. Hashes are SHA-256(key:entry:tx_id) and verifiable offline.
+        first. Verification is a cryptographic inclusion/consistency proof
+        check against ImmuDB's signed state, performed server-side per entry.
       </p>
     </div>
   );

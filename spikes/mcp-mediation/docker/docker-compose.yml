@@ -1,0 +1,96 @@
+# Topology under test.
+#
+# HTTP transport (M1/M2 HTTP):
+#   agent            -- on 'edge' only
+#   proxy            -- on 'edge' AND 'internal' (the only bridge)
+#   upstream         -- on 'internal' only
+#
+# The claim being tested is that an adopter can, by DECLARATION ALONE (compose
+# networks, no code), put the upstream on a network the agent cannot route to, so
+# the only path from agent to tool is through the proxy. 'internal: true' makes the
+# network non-externally-routable but does NOT isolate the two services on it from
+# each other; that is what the agent-vs-scanner contrast in M2 measures.
+#
+# stdio transport (M1/M2 stdio):
+#   agent-stdio      -- on NO shared network; spawns the proxy as a subprocess,
+#                       which spawns the upstream server as ITS subprocess.
+
+name: ail-mcp-mediation-spike
+
+services:
+  upstream:
+    image: ail-spike-mcp:latest
+    command: >
+      node node_modules/@modelcontextprotocol/server-everything/dist/index.js streamableHttp
+    environment:
+      PORT: "3001"
+      UPSTREAM_MARKER: "i-am-the-real-upstream"
+      UPSTREAM_API_KEY: "s3cr3t-upstream-key"
+    networks:
+      - internal
+
+  proxy:
+    image: ail-spike-mcp:latest
+    command: node proxy/proxy-http.mjs
+    environment:
+      AIL_PROXY_PORT: "8080"
+      AIL_UPSTREAM_URL: "http://upstream:3001/mcp"
+      AIL_UPSTREAM_SECRET: "s3cr3t-upstream-key"
+      AIL_LEDGER: "/ledger/proxy-ledger-http.jsonl"
+    volumes:
+      - ledger:/ledger
+    networks:
+      - edge
+      - internal
+    depends_on:
+      - upstream
+
+  agent:
+    image: ail-spike-mcp:latest
+    command: sleep infinity
+    environment:
+      # What a compromised agent would try to guess. Deliberately provided so the
+      # scan scripts have a target name; the point is whether the ROUTE exists.
+      TARGET_UPSTREAM_URL: "http://upstream:3001/mcp"
+      SCAN_HOSTS: "proxy,upstream,localhost,127.0.0.1"
+      SCAN_PORTS: "3001,8080,3000,80"
+    networks:
+      - edge
+    depends_on:
+      - proxy
+
+  # A container deliberately placed ON the internal network, to prove the upstream
+  # IS reachable to anything that shares its network (i.e. isolation is a property
+  # of the network topology, not of the proxy). Contrast with 'agent' above.
+  scanner-internal:
+    image: ail-spike-mcp:latest
+    command: sleep infinity
+    environment:
+      SCAN_HOSTS: "upstream"
+      SCAN_PORTS: "3001"
+      TARGET_UPSTREAM_URL: "http://upstream:3001/mcp"
+    networks:
+      - internal
+
+  agent-stdio:
+    image: ail-spike-mcp:latest
+    command: sleep infinity
+    environment:
+      AIL_UPSTREAM_CMD: "node"
+      AIL_UPSTREAM_ARGS: "node_modules/@modelcontextprotocol/server-everything/dist/index.js stdio"
+      AIL_UPSTREAM_SECRET: "s3cr3t-upstream-key"
+      AIL_LEDGER: "/ledger/proxy-ledger-stdio.jsonl"
+      SERVER_ENTRY: "/opt/ail/node_modules/@modelcontextprotocol/server-everything/dist/index.js"
+    volumes:
+      - ledger:/ledger
+    networks:
+      - stdio-only
+
+networks:
+  edge:
+  internal:
+    internal: true
+  stdio-only:
+
+volumes:
+  ledger:

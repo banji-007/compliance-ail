@@ -22,6 +22,15 @@
 > checking the result against the actual ledger client code - see
 > `docs/audit/2026-08-16-verification.md`, item V1.
 >
+> The same root cause reaches the control-plane pod too:
+> `templates/control-plane-deployment.yaml` sets no `VERIFIER_URL`
+> anywhere, and `control_plane/main.py`'s `/audit` handler calls
+> `VERIFIER_URL` for its per-entry proof check on every request. A
+> control-plane pod deployed from this chart would report every audit
+> entry `verified: false` from the first request, for the same reason the
+> agent pod fails closed - see `docs/reports/phase-0-redteam.md`, C7, and
+> `docs/reports/phase-0-1.md`, P01-6.
+>
 > Porting the verifier architecture into this chart is deliberately out of
 > scope here: the hosted-deployment direction for this project may retire
 > the chart entirely, and porting a design that might be thrown away is not
@@ -36,6 +45,9 @@
   OPA sharing a pod network namespace, SPIRE workload attestation via an
   init container) reflects the current zero-trust interception design and
   is a reasonable reference even though the ledger wiring is stale.
-- `templates/control-plane-deployment.yaml`, `templates/dashboard-deployment.yaml`,
-  and `templates/immudb-statefulset.yaml` are not known to have the same
-  defect - they were not in scope for this check.
+- `templates/control-plane-deployment.yaml` **is now confirmed** to share
+  the same root cause (no `VERIFIER_URL`, see above) - not merely "not
+  known to have the defect."
+- `templates/dashboard-deployment.yaml` and `templates/immudb-statefulset.yaml`
+  are not known to have the same defect - they were not in scope for this
+  check.

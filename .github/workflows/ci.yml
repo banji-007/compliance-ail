@@ -31,5 +31,10 @@ jobs:
         env:
           IMMUDB_USER: immudb
           IMMUDB_PASSWORD: immudb
-          CONTROL_PLANE_API_KEY: test-api-key
+          CONTROL_PLANE_READ_KEY: test-read-key
+          CONTROL_PLANE_WRITE_KEY: test-write-key
+          DASHBOARD_READ_USER: test-dashboard-reader
+          DASHBOARD_READ_PASSWORD: test-dashboard-read-pw
+          DASHBOARD_WRITE_USER: test-dashboard-writer
+          DASHBOARD_WRITE_PASSWORD: test-dashboard-write-pw
         run: make test-integration

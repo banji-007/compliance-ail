@@ -1,3 +1,10 @@
+# Moved from tests/ in Phase 0.1 (see docs/reports/phase-0-1.md, P01-2):
+# all three items in this file have no assertion (two print raw responses or
+# static informational text with nothing to fail on; the third,
+# test_full_agent_flow, constructs a real OpenAI client with no skip guard,
+# which is what broke CI - see P01-1) - a smoke script, not a test. Not
+# collected by pytest from here. Run directly: python scripts/test_ledger.py
+
 import os
 import sys
 from dotenv import load_dotenv

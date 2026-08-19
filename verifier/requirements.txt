@@ -1,3 +1,9 @@
 immudb-py==1.5.0
+# grpcio: unpinned - already a transitive dependency of immudb-py; pinning
+# here risks a resolver conflict with whatever version immudb-py 1.5.0
+# actually requires. verifier/main.py imports it directly (grpc.RpcError,
+# grpc.StatusCode) for D8's not_found detection, so it is listed explicitly
+# rather than relying on transitive resolution alone.
+grpcio
 fastapi==0.115.0
 uvicorn==0.34.0

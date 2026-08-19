@@ -32,14 +32,24 @@ keygen:
 ## new stack starts. This prevents stale verifier state from a prior keygen
 ## rotation from causing opaque proof failures.
 ##
+## --build (P12-5, Phase 1.2): "up -d --wait" alone does not rebuild an
+## image that already exists under this Compose project's tag, even when
+## the source it was built from has changed - five separate sessions hit
+## this as a wall of spurious failures against stale code (docs/reports/
+## phase-1-1.md, section 1: "two full docker compose build <service>
+## passes were needed this session"; a prior session hit 30 at once).
+## --build forces a build (respecting Docker's own layer cache, so an
+## unchanged service is still fast) before the containers start, every run.
+##
 ## OPA bundle timing: opa-config.yaml sets min_delay_seconds=10 for bundle
 ## polling. "docker compose up --wait" blocks until health checks pass (OPA
 ## binary alive), but the first bundle poll may not have completed yet.
 ## The 15-second sleep ensures OPA has loaded the policy before pytest runs.
 ##
 ## docker compose auto-loads a root .env regardless of -f, so the control
-## plane and immudb containers enforce whatever IMMUDB_USER, IMMUDB_PASSWORD,
-## and CONTROL_PLANE_API_KEY are in .env if one exists. pytest must
+## plane, dashboard, and immudb containers enforce whatever IMMUDB_USER,
+## IMMUDB_PASSWORD, CONTROL_PLANE_READ_KEY/WRITE_KEY, and
+## DASHBOARD_READ/WRITE_USER/PASSWORD are in .env if one exists. pytest must
 ## authenticate with those same values, so each is read from .env in its own
 ## isolated subshell if present, falling back to the prior default otherwise.
 ## Isolated per-variable subshells, not a blanket ". .env", so an unrelated
@@ -50,20 +60,32 @@ keygen:
 test-integration:
 	docker compose -f docker-compose.test.yml down -v
 	$(MAKE) keygen
-	docker compose -f docker-compose.test.yml up -d --wait
+	docker compose -f docker-compose.test.yml up -d --build --wait
 	@echo "Waiting 15s for OPA to complete its first bundle poll..."
 	sleep 15
 	IMMUDB_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_USER" ) ); \
 	IMMUDB_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_PASSWORD" ) ); \
-	CONTROL_PLANE_API_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_API_KEY" ) ); \
+	CONTROL_PLANE_READ_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_READ_KEY" ) ); \
+	CONTROL_PLANE_WRITE_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_WRITE_KEY" ) ); \
+	DASHBOARD_READ_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_READ_USER" ) ); \
+	DASHBOARD_READ_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_READ_PASSWORD" ) ); \
+	DASHBOARD_WRITE_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_WRITE_USER" ) ); \
+	DASHBOARD_WRITE_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_WRITE_PASSWORD" ) ); \
 	SPIRE_DISABLED=true \
 	  OPA_URL=http://localhost:8181/v1/data/ail/main/allow \
+	  AIL_BUNDLE_NAME=$${AIL_BUNDLE_NAME:-ail-policies} \
 	  CONTROL_PLANE_URL=http://localhost:8002 \
 	  IMMUDB_URL=http://localhost:8080 \
 	  IMMUDB_USER=$${IMMUDB_USER_ENV:-$${IMMUDB_USER:-immudb}} \
 	  IMMUDB_PASSWORD=$${IMMUDB_PASSWORD_ENV:-$${IMMUDB_PASSWORD:-immudb}} \
 	  VERIFIER_URL=http://localhost:8003 \
-	  CONTROL_PLANE_API_KEY=$${CONTROL_PLANE_API_KEY_ENV:-$${CONTROL_PLANE_API_KEY:-test-api-key}} \
+	  CONTROL_PLANE_READ_KEY=$${CONTROL_PLANE_READ_KEY_ENV:-$${CONTROL_PLANE_READ_KEY:-test-read-key}} \
+	  CONTROL_PLANE_WRITE_KEY=$${CONTROL_PLANE_WRITE_KEY_ENV:-$${CONTROL_PLANE_WRITE_KEY:-test-write-key}} \
+	  DASHBOARD_URL=http://localhost:3001 \
+	  DASHBOARD_READ_USER=$${DASHBOARD_READ_USER_ENV:-$${DASHBOARD_READ_USER:-test-dashboard-reader}} \
+	  DASHBOARD_READ_PASSWORD=$${DASHBOARD_READ_PASSWORD_ENV:-$${DASHBOARD_READ_PASSWORD:-test-dashboard-read-pw}} \
+	  DASHBOARD_WRITE_USER=$${DASHBOARD_WRITE_USER_ENV:-$${DASHBOARD_WRITE_USER:-test-dashboard-writer}} \
+	  DASHBOARD_WRITE_PASSWORD=$${DASHBOARD_WRITE_PASSWORD_ENV:-$${DASHBOARD_WRITE_PASSWORD:-test-dashboard-write-pw}} \
 	  python -m pytest tests/ -v
 	docker compose -f docker-compose.test.yml down -v
 

@@ -24,6 +24,12 @@ load_dotenv()
 
 _VERIFIER_URL = os.getenv("VERIFIER_URL", "http://verifier:8003")
 
+# P13-8 (Phase 1.3): the only conformance profile this codebase can produce.
+# The agent independently holds every tool's authority - nothing here takes
+# that away from it - so "observed" is not a deployment choice, it is what
+# this architecture is. See docs/adr/0005-outcome-taxonomy.md.
+RECORD_PROFILE = "observed"
+
 
 class ImmuDBLedger:
     def __init__(self, verifier_url: str | None = None):
@@ -44,11 +50,27 @@ class ImmuDBLedger:
         self,
         agent_id: str,
         tool_name: str,
-        payload: dict,
-        decision: str,
+        call_id: str,
+        input_sha256: str,
+        outcome_type: str,
+        fault_class: str | None,
+        policy_revision: str | None,
+        reasons: list,
+        content_state: str,
     ) -> int:
         """
-        Write a policy decision to ImmuDB via the verifier's verifiedSet.
+        Write an outcome record to ImmuDB via the verifier's verifiedSet.
+
+        The record carries a hash of the tool arguments, not the arguments
+        themselves (D5) - the immutable ledger proves what was decided and
+        that the input hashed to this value; the arguments live in the
+        control plane's erasable content store, joined by call_id (D7,
+        Phase 1.1 - minted at intercept, independent of ImmuDB's own tx
+        numbering). content_state records whether that content write landed
+        ("present") or was never attempted because tool_args wasn't
+        dict-shaped ("unavailable") - "erased" is never written here, it is
+        inferred at read time from content_state plus whether the
+        content-store row still exists (control_plane/main.py::get_audit).
 
         The verifier performs inclusion-proof and consistency-proof verification
         on every write. A response with verified: false or any transport error
@@ -59,11 +81,24 @@ class ImmuDBLedger:
         """
         timestamp = datetime.utcnow().isoformat()
         log_entry = {
+            # D11 (Phase 1.2): every ledger record now carries an explicit
+            # record_type so a consumer scanning a broader key range than
+            # tool_call: (e.g. control_plane/main.py's content_erasure: scan)
+            # discriminates on this field, not on key shape - "decision"
+            # here, "content_erasure" for the tombstones erase_content
+            # writes directly via the verifier (see control_plane/main.py).
+            "record_type": "decision",
             "agent_id": agent_id,
             "timestamp": timestamp,
             "tool_name": tool_name,
-            "payload": payload,
-            "decision": decision,
+            "call_id": call_id,
+            "input_sha256": input_sha256,
+            "outcome_type": outcome_type,
+            "fault_class": fault_class,
+            "policy_revision": policy_revision,
+            "reasons": reasons,
+            "content_state": content_state,
+            "profile": RECORD_PROFILE,
         }
         serialized  = json.dumps(log_entry, separators=(",", ":"))
         key         = f"tool_call:{agent_id}:{uuid.uuid4().hex}:{tool_name}"

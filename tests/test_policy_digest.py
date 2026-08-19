@@ -14,7 +14,6 @@ verifier). SPIRE_DISABLED=true bypasses mTLS, matching Makefile:45-53.
 """
 
 import os
-import re
 import sys
 
 import httpx
@@ -29,7 +28,7 @@ import middleware  # noqa: E402
 
 OPA_BASE = os.environ["OPA_URL"].replace("/v1/data/ail/main/allow", "")
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
-API_KEY = os.getenv("CONTROL_PLANE_API_KEY", "test-api-key")
+READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 
 _APPROVED_ARGS = {
     "instance_type": "t3.micro",
@@ -67,9 +66,12 @@ requires_stack = pytest.mark.skipif(
 )
 
 
+_BUNDLE_NAME = os.getenv("AIL_BUNDLE_NAME", "ail-policies")
+
+
 def _opa_live_revision() -> str:
     """The ground truth: what OPA itself currently has loaded."""
-    resp = httpx.get(f"{OPA_BASE}/v1/data/system/bundles/ail-policies/manifest/revision", timeout=5)
+    resp = httpx.get(f"{OPA_BASE}/v1/data/system/bundles/{_BUNDLE_NAME}/manifest/revision", timeout=5)
     resp.raise_for_status()
     revision = resp.json().get("result")
     assert revision, f"OPA has no bundle revision loaded: {resp.json()}"
@@ -77,7 +79,7 @@ def _opa_live_revision() -> str:
 
 
 def _audit_entries() -> list[dict]:
-    resp = httpx.get(f"{CONTROL_PLANE_URL}/audit", headers={"X-API-Key": API_KEY}, timeout=30)
+    resp = httpx.get(f"{CONTROL_PLANE_URL}/audit", headers={"X-API-Key": READ_API_KEY}, timeout=30)
     resp.raise_for_status()
     return resp.json()["entries"]
 
@@ -110,10 +112,8 @@ def test_recorded_digest_matches_opa_not_interceptor_belief(monkeypatch):
     matching = [e for e in entries if e.get("tx_id") == response["ledger_tx_id"]]
     assert matching, f"tx_id {response['ledger_tx_id']} not found in /audit"
 
-    decision = matching[0]["decision"]
-    m = re.search(r"\(policy: ([0-9a-f]+)\)", decision)
-    assert m, f"No policy revision recorded in decision string: {decision!r}"
-    recorded_digest = m.group(1)
+    recorded_digest = matching[0]["policy_revision"]
+    assert recorded_digest, f"No policy_revision recorded on entry: {matching[0]!r}"
 
     assert recorded_digest == live_revision, (
         f"Recorded digest {recorded_digest} does not match OPA's live revision "
@@ -122,31 +122,40 @@ def test_recorded_digest_matches_opa_not_interceptor_belief(monkeypatch):
 
 
 @requires_stack
-def test_digest_unavailable_denies_and_writes_no_ledger_entry(monkeypatch):
+def test_digest_unavailable_denies_and_writes_a_fault_record(monkeypatch):
     """
     Simulates the bundle-revision read failing in the same cycle as an
-    otherwise-successful OPA decision, by pointing the revision lookup at a
-    bundle name OPA never loaded (OPA returns {} - undefined - for that
-    path, exactly as it would for any other reason the read fails). The
-    call must deny and must not write to the ledger - no placeholder digest,
-    no unattributable entry.
+    otherwise-successful OPA decision. Under D1 (Phase 1) this denies AND
+    writes a fault record with a null revision - this reverses the old
+    assertion ("no ledger entry"), the one pre-authorized change in Phase 1.
+
+    Phase 1.2 (D9): the request no longer carries a caller-supplied bundle
+    name - policy/core/main.rego's `evaluation` rule now derives the
+    revision from whichever loaded bundle's manifest claims the `ail` root
+    (see tests/test_bundle_revision_attribution.py for that mechanism
+    exercised directly, live). Undefined revision is simulated here the
+    same way any other undefined /evaluation result would occur: pointing
+    the query at a rule path OPA has never heard of.
     """
     monkeypatch.setattr(
-        middleware,
-        "_OPA_REVISION_URL",
-        f"{OPA_BASE}/v1/data/system/bundles/nonexistent-bundle/manifest/revision",
+        middleware, "_OPA_EVAL_URL",
+        OPA_BASE + "/v1/data/ail/main/nonexistent_entrypoint",
     )
-
-    before = {e["tx_id"] for e in _audit_entries()}
 
     response = middleware.intercept_tool_call(
         "provision_cloud_server", _APPROVED_ARGS, "test_digest_agent"
     )
 
     assert response["status"] == "DENIED", f"Expected DENIED, got: {response}"
-    assert "ledger_tx_id" not in response, f"Expected no ledger write, got: {response}"
+    assert response["outcome_type"] == "fault", f"Expected a fault outcome, got: {response}"
+    assert response["fault_class"] == "revision_unavailable", f"Expected revision_unavailable, got: {response}"
+    assert response["policy_revision"] is None, f"Expected a null revision, got: {response}"
+    assert "ledger_tx_id" in response, f"Expected a fault record to still be written, got: {response}"
 
-    after = {e["tx_id"] for e in _audit_entries()}
-    assert after == before, (
-        f"Ledger gained entries {after - before} despite the digest being unobtainable"
-    )
+    entries = _audit_entries()
+    matching = [e for e in entries if e.get("tx_id") == response["ledger_tx_id"]]
+    assert matching, f"tx_id {response['ledger_tx_id']} not found in /audit"
+    entry = matching[0]
+    assert entry["outcome_type"] == "fault"
+    assert entry["fault_class"] == "revision_unavailable"
+    assert entry["policy_revision"] is None

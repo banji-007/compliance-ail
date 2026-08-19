@@ -1,12 +1,26 @@
 # docker-compose.test.yml — Minimal CI infrastructure for integration tests.
 #
-# Spins up only the three services pytest needs:
+# Spins up the services pytest needs:
 #   ail-control-plane  — serves OPA policy bundles; seeds default tenant
 #   opa                — policy engine; polls bundle from control plane
 #   immudb             — tamper-evident audit ledger
+#   verifier           — isolated immudb-py (gRPC) wrapper
+#   dashboard          — Next.js dashboard, for D6's caller-auth tests only
+#                         (tests/test_dashboard_auth.py); no other test
+#                         exercises it.
 #
-# SPIRE, Envoy, Grafana, Prometheus, and the dashboard are NOT included.
-# Tests run with SPIRE_DISABLED=true so mTLS is bypassed.
+# SPIRE, Envoy, Grafana, and Prometheus are NOT included. Tests run with
+# SPIRE_DISABLED=true so mTLS is bypassed.
+#
+# Deliberately more permissive than docker-compose.yml (R1, Phase 1.3
+# completion pass): ail-control-plane (8002), immudb (3322 and 8080), opa
+# (8181, loopback-bound), and verifier (8003, loopback-bound) are all
+# published to the host here, because the test suite runs on the host and
+# needs to reach every service directly - the interceptor under test, the
+# raw ImmuDB scans in tests/test_verification.py and tests/test_record_
+# profile.py, and the direct OPA queries in tests/test_bundle_revision_
+# attribution.py all connect over localhost. This file is not a deployment
+# target and is never published beyond CI/local test runs.
 #
 # Usage:  make test-integration
 # Requires: Docker Compose v2 (docker compose, not docker-compose)
@@ -24,7 +38,8 @@ services:
       - IMMUDB_USER=${IMMUDB_USER:-immudb}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
       - VERIFIER_URL=http://verifier:8003
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-test-api-key}
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY:-test-read-key}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY:-test-write-key}
     volumes:
       - ./policy:/policy:ro
       - test-control-plane-data:/data
@@ -39,9 +54,16 @@ services:
   opa:
     image: openpolicyagent/opa:1.14.1
     ports:
-      - "8181:8181"
+      # Loopback-only (P13-1) - see docker-compose.yml's opa service for why.
+      # tests/ run on the host (localhost), which this still reaches.
+      - "127.0.0.1:8181:8181"
     environment:
       - AIL_TENANT_ID=tenant_default
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
+      # R4 (Phase 1.3 completion pass): opa-config.yaml attaches this as the
+      # X-API-Key header on every bundle poll - GET /bundles/{tenant} now
+      # requires the read-scoped credential (red-team V6).
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY:-test-read-key}
     command:
       - "run"
       - "--server"
@@ -73,6 +95,12 @@ services:
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
     volumes:
       - ./keys:/keys:ro
+      # ImmuDB's own data dir - must persist symmetrically with
+      # test-verifier-state (P1-10) or a down (no -v) + up cycle leaves the
+      # verifier's trust anchor pointing at transactions a fresh, empty
+      # ImmuDB no longer has, and the next verifiedGet fails with "illegal
+      # state".
+      - test-immudb-data:/var/lib/immudb
     command:
       - "--signingKey=/keys/signing.key"
     healthcheck:
@@ -86,7 +114,9 @@ services:
     build:
       context: ./verifier
     ports:
-      - "8003:8003"
+      # Loopback-only (P13-2) - see docker-compose.yml's verifier service for
+      # why. tests/ run on the host (localhost), which this still reaches.
+      - "127.0.0.1:8003:8003"
     environment:
       - IMMUDB_ADDR=immudb:3322
       - IMMUDB_USER=${IMMUDB_USER:-immudb}
@@ -106,6 +136,36 @@ services:
       retries: 6
       start_period: 20s
 
+  # D6 (Phase 1.1) only - dashboard/middleware.ts's own caller auth, tested
+  # by tests/test_dashboard_auth.py. No other test in this suite depends on
+  # this service being up.
+  dashboard:
+    build:
+      context: ./dashboard
+    ports:
+      - "3001:3001"
+    environment:
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY:-test-read-key}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY:-test-write-key}
+      - DASHBOARD_READ_USER=${DASHBOARD_READ_USER:-test-dashboard-reader}
+      - DASHBOARD_READ_PASSWORD=${DASHBOARD_READ_PASSWORD:-test-dashboard-read-pw}
+      - DASHBOARD_WRITE_USER=${DASHBOARD_WRITE_USER:-test-dashboard-writer}
+      - DASHBOARD_WRITE_PASSWORD=${DASHBOARD_WRITE_PASSWORD:-test-dashboard-write-pw}
+    depends_on:
+      ail-control-plane:
+        condition: service_healthy
+    # No custom /health route exists in this Next.js app; /audit always
+    # renders 200 without auth (only /api/* is gated by middleware.ts), so
+    # it doubles as a liveness probe here.
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/audit',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 25s
+
 volumes:
   test-control-plane-data:
   test-verifier-state:
+  test-immudb-data:

@@ -1,3 +1,9 @@
+# Moved from tests/ in Phase 0.1 (see docs/reports/phase-0-1.md, P01-2):
+# this file's only item has no assertion (its body is wrapped in a
+# try/except that swallows every exception), so it cannot fail under any
+# input and is a smoke script, not a test. Not collected by pytest from
+# here. Run directly: python scripts/test_agent.py
+
 import os
 import json
 import sys

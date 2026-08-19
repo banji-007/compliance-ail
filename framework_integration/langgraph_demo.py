@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 # Add AIL layers to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
 
-from middleware import intercept_tool_call
+from middleware import intercept_tool_call, verify_bundle_at_startup
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -162,6 +162,16 @@ def provision_cloud_server(
         result = execute_provision_cloud_server(instance_type, region, cost_per_hour, tags)
         print(f"{pipeline_prefix} -> [Execution] {result}")
 
+    elif decision.get("outcome_type") == "fault":
+        fault_class = decision.get("fault_class")
+        result = (
+            f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): {decision['message']}\n"
+            f"This request was not evaluated against policy - the compliance "
+            f"gateway could not confirm the decision. An operator should "
+            f"investigate {fault_class}; retrying the same parameters will not fix this."
+        )
+        print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {decision['message']}")
+
     else:
         result = (
             f"BLOCKED by AIL: {decision['message']}\n"
@@ -221,6 +231,15 @@ def query_database(
     if decision["status"] == "APPROVED":
         result = execute_query_database(target_table, query, processing_purpose)
         print(f"{pipeline_prefix} -> [Execution] {result}")
+    elif decision.get("outcome_type") == "fault":
+        fault_class = decision.get("fault_class")
+        result = (
+            f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): {decision['message']}\n"
+            f"This request was not evaluated against policy - the compliance "
+            f"gateway could not confirm the decision. An operator should "
+            f"investigate {fault_class}; retrying the same parameters will not fix this."
+        )
+        print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {decision['message']}")
     else:
         result = (
             f"BLOCKED by AIL: {decision['message']}\n"
@@ -280,6 +299,15 @@ def deploy_to_production(
     if decision["status"] == "APPROVED":
         result = execute_deploy_to_production(repository_name, commit_hash, environment, approval_ticket)
         print(f"{pipeline_prefix} -> [Execution] {result}")
+    elif decision.get("outcome_type") == "fault":
+        fault_class = decision.get("fault_class")
+        result = (
+            f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): {decision['message']}\n"
+            f"This request was not evaluated against policy - the compliance "
+            f"gateway could not confirm the decision. An operator should "
+            f"investigate {fault_class}; retrying the same parameters will not fix this."
+        )
+        print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {decision['message']}")
     else:
         result = (
             f"BLOCKED by AIL: {decision['message']}\n"
@@ -384,6 +412,10 @@ def run(prompt: str):
     print(f"\nAGENT: {final}")
 
 if __name__ == "__main__":
+    # Fail at boot, not at first call, if the configured OPA bundle name
+    # isn't actually loaded (see docs/reports/phase-0-redteam.md, C4).
+    verify_bundle_at_startup()
+
     # Interactive chat loop
     print("LangGraph + AIL Integration Demo")
     print("Type 'quit' or 'exit' to end the conversation")

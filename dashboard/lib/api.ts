@@ -1,10 +1,14 @@
 import type { AuditResponse, Tenant, TenantUpdate } from "./types";
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8002";
+// Same-origin only (D4): every dashboard request goes through this app's own
+// Next.js Route Handlers under app/api/, which hold CONTROL_PLANE_READ_KEY /
+// CONTROL_PLANE_WRITE_KEY server-side and attach the appropriate one. The
+// browser never learns the control plane's address or either key - it only
+// ever holds its own dashboard-level credential (D6, middleware.ts).
 const DEFAULT_TENANT = process.env.NEXT_PUBLIC_TENANT_ID ?? "tenant_default";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`/api${path}`, {
     headers: { "Content-Type": "application/json", ...init?.headers },
     ...init,
   });

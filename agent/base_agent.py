@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 # Add the interceptor directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'interceptor'))
-from middleware import intercept_tool_call
+from middleware import intercept_tool_call, verify_bundle_at_startup
 
 # Load environment variables
 load_dotenv()
@@ -67,8 +67,8 @@ class BaseAgent:
             print(f"[Agent Request] {function_name} | agent={self.agent_id} | args={json.dumps(function_args)}")
 
             interceptor_response = intercept_tool_call(function_name, function_args, self.agent_id)
-            record_hash = interceptor_response.get("record_hash", "")[:16]
-            pipeline_prefix = f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] -> [Ledger Hash] {record_hash}..."
+            ledger_tx_id = interceptor_response.get("ledger_tx_id")
+            pipeline_prefix = f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] -> [Ledger tx] {ledger_tx_id}"
 
             if function_name == "provision_cloud_server":
                 if interceptor_response["status"] == "APPROVED":
@@ -80,6 +80,13 @@ class BaseAgent:
                     )
                     print(f"{pipeline_prefix} -> [Execution] {result}")
                     result += f"\n[Interceptor: {interceptor_response['message']}]"
+                elif interceptor_response.get("outcome_type") == "fault":
+                    fault_class = interceptor_response.get("fault_class")
+                    result = (
+                        f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): "
+                        f"{interceptor_response['message']}. An operator should investigate."
+                    )
+                    print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {interceptor_response['message']}")
                 else:
                     result = f"Action blocked by interceptor: {interceptor_response['message']}"
                     print(f"{pipeline_prefix} -> [Block] {interceptor_response['message']}")
@@ -147,5 +154,9 @@ class BaseAgent:
                 print(f"\nError: {e}")
 
 if __name__ == "__main__":
+    # Fail at boot, not at first call, if the configured OPA bundle name
+    # isn't actually loaded (see docs/reports/phase-0-redteam.md, C4).
+    verify_bundle_at_startup()
+
     agent = BaseAgent()
     agent.chat_loop()

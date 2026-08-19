@@ -25,6 +25,7 @@ import os
 import pathlib
 from contextlib import asynccontextmanager
 
+import grpc
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -108,6 +109,15 @@ class VerifyResponse(BaseModel):
     timestamp: int | None = None
     state_id: int | None = None  # latest verified state tx_id
     detail: str | None = None
+    # Closed set distinguishing which proof failed (D2): "consistency_failure"
+    # (ErrCorruptedData - the linear-hash chain diverged), "signature_failure"
+    # (BadSignatureError - the server's ECDSA state signature didn't verify),
+    # "not_found" (D8, Phase 1.1 - no entry was ever written for this key, so
+    # no proof was ever rejected; detected from the RPC error's message text,
+    # not its gRPC status code - see the except grpc.RpcError branch below
+    # for why), or "unknown" for anything else. Only meaningful when verified
+    # is False.
+    error_class: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +167,7 @@ def verify(payload: VerifyRequest):
     If signing is configured, the returned state is verified against the
     server's ECDSA signature before updating local state.
     """
+    from ecdsa.keys import BadSignatureError
     from immudb.exceptions import ErrCorruptedData
 
     key = base64.b64decode(payload.key)
@@ -179,10 +190,48 @@ def verify(payload: VerifyRequest):
         )
     except ErrCorruptedData:
         logger.warning("verifiedGet: proof failed for key %.32s...", payload.key)
-        return VerifyResponse(verified=False, detail="proof verification failed")
+        return VerifyResponse(
+            verified=False,
+            detail="consistency proof failed - the linear-hash chain diverged",
+            error_class="consistency_failure",
+        )
+    except BadSignatureError:
+        logger.warning("verifiedGet: state signature failed for key %.32s...", payload.key)
+        return VerifyResponse(
+            verified=False,
+            detail="state signature verification failed",
+            error_class="signature_failure",
+        )
+    except grpc.RpcError as exc:
+        # D8 (Phase 1.1): a key that was never written is not tampering - no
+        # proof was ever rejected, because there was never a proof to check.
+        #
+        # The original design called for detecting this via a dedicated gRPC
+        # status code rather than matching message text. Live testing against
+        # immudb 1.9.5 disproved that premise: VerifiableGet on a missing key
+        # returns StatusCode.UNKNOWN, not NOT_FOUND - the server gives no
+        # status-code-level signal to distinguish this from any other
+        # failure. immudb-py's own plain-Get handler
+        # (immudb/handler/get.py::call) makes exactly this distinction the
+        # same way, out of the same necessity:
+        # `e.details().endswith('key not found')`. This mirrors that
+        # established precedent rather than inventing a different strategy
+        # for VerifiableGet specifically. Still a real fragility - pin
+        # immudb-py's version (see verifier/requirements.txt) and re-check
+        # this string on any upgrade.
+        details = exc.details() or ""
+        if details.endswith("key not found"):
+            logger.info("verifiedGet: key not found (no prior write) for key %.32s...", payload.key)
+            return VerifyResponse(
+                verified=False,
+                detail="key not found: no entry was ever written for this key",
+                error_class="not_found",
+            )
+        logger.error("verifiedGet grpc error: %s", exc)
+        return VerifyResponse(verified=False, detail=str(exc), error_class="unknown")
     except Exception as exc:
         logger.error("verifiedGet error: %s", exc)
-        return VerifyResponse(verified=False, detail=str(exc))
+        return VerifyResponse(verified=False, detail=str(exc), error_class="unknown")
 
 
 if __name__ == "__main__":
