@@ -91,28 +91,65 @@ The single failure is the dangling-reference guard (`cleanup-p13-b`'s test) corr
 
 ```
 $ git push origin phase-1-3-complete
-$ gh run view <RUN_ID> --json databaseId,headSha,status,conclusion,workflowName,url
+   ae5840b..e09f6c2  phase-1-3-complete -> phase-1-3-complete
+$ gh run list --branch phase-1-3-complete --limit 5 --json databaseId,status,conclusion,headSha,event,createdAt
+[{"conclusion":"success","createdAt":"2026-08-19T16:40:46Z","databaseId":32277277818,"event":"pull_request","headSha":"e09f6c279f688b35d13b65db6cdf3a2bff5db520","status":"completed"}, ...]
+$ gh run view 32277277818 --json databaseId,headSha,status,conclusion,workflowName,url
+{"conclusion":"success","databaseId":32277277818,"headSha":"e09f6c279f688b35d13b65db6cdf3a2bff5db520","status":"completed","workflowName":"Integration Tests","url":"https://github.com/banji-007/compliance-ail/actions/runs/32277277818"}
 ```
 
-CI run id: **PENDING_FILL_IN**, conclusion: **PENDING_FILL_IN**.
+CI run id: **32277277818**, conclusion: **success**. Head SHA `e09f6c2` (includes items 1-2 of this pass).
 
 ---
 
 ## 5. Item 4 - merge PR #5 into `phase-1-1-remediation`
 
-**Command and output:** PENDING_FILL_IN
+With CI confirmed green on the PR's head SHA (section 4), merged as a merge commit (not squash, not rebase - the default `--merge` strategy, preserving each of the two commits on `phase-1-3-complete` individually):
+
+```
+$ gh pr merge 5 --merge --subject "Merge pull request #5 from phase-1-3-complete" --body "..."
+$ gh pr view 5 --json state,mergedAt,mergeCommit
+{"mergeCommit":{"oid":"dcb2f78f2699b4743b5a3e5e0185ae883930bd83"},"mergedAt":"2026-08-19T16:54:01Z","state":"MERGED"}
+```
+
+`phase-1-1-remediation` now includes `phase-1-3-complete`'s full history (`ce38cd0`, `ae5840b`, `3b535ea`, `e09f6c2`) via merge commit `dcb2f78`.
 
 ---
 
 ## 6. Item 5 - merge PR #2 into `main` with a merge commit
 
-**Command and output:** PENDING_FILL_IN
+Merged with `--merge` (a real merge commit, not a squash), message enumerating the phases it contains, exactly as instructed:
+
+```
+$ gh pr merge 2 --merge --subject "Merge pull request #2 from phase-1-1-remediation" --body "Phase 1 record truth, Phase 1.1 remediation, Phase 1.2 record integrity,
+Phase 1.3 claims true, plus the WASM parity and MCP mediation spikes."
+$ gh pr view 2 --json state,mergedAt,mergeCommit
+{"mergeCommit":{"oid":"4fc80428544d5c995885fc0e94e655dee1b58027"},"mergedAt":"2026-08-19T16:54:56Z","state":"MERGED"}
+```
+
+`main` now includes the full chain: Phase 0/0.1 truth pass, Phase 1 record truth, Phase 1.1 remediation, Phase 1.2 record integrity, Phase 1.3 claims true (and this pass's items 1-2), plus the WASM parity spike (`18620ec`) and MCP mediation spike (`bc1f1ff`), via merge commit `4fc8042`.
 
 ---
 
 ## 7. Item 6 - CI green on `main`
 
-**Command and output:** PENDING_FILL_IN
+The merge to `main` triggered two runs: the repo's own `ci.yml` ("Integration Tests", a `push` event) and GitHub's own auto-generated "Dependency Graph" workflow (a `dynamic` event, unrelated to this repo's test gate - not part of `.github/workflows/`, which contains only `ci.yml`). Watched the relevant one to completion:
+
+```
+$ gh run list --branch main --limit 5 --json databaseId,status,conclusion,headSha,event,createdAt
+[{"conclusion":"","createdAt":"...","databaseId":32278639605,"event":"dynamic", ...},
+ {"conclusion":"","createdAt":"...","databaseId":32278635309,"event":"push","headSha":"4fc80428544d5c995885fc0e94e655dee1b58027","status":"in_progress"}, ...]
+$ gh run view 32278639605 --json workflowName,event,url
+{"event":"dynamic","workflowName":"Dependency Graph", ...}
+$ gh run watch 32278635309 --exit-status
+... (exit 0)
+$ gh run view 32278635309 --json databaseId,headSha,status,conclusion,workflowName,url
+{"conclusion":"success","databaseId":32278635309,"headSha":"4fc80428544d5c995885fc0e94e655dee1b58027","status":"completed","workflowName":"Integration Tests","url":"https://github.com/banji-007/compliance-ail/actions/runs/32278635309"}
+```
+
+**CI run id on `main`: 32278635309, conclusion: success.**
+
+Confirmed the checked commit includes this pass's item 1-2 fixes: `e09f6c2` (phase-1-3-complete's final commit) is an ancestor of `4fc8042` (`git merge-base --is-ancestor e09f6c2 origin/main` exited 0).
 
 ---
 
@@ -120,10 +157,75 @@ CI run id: **PENDING_FILL_IN**, conclusion: **PENDING_FILL_IN**.
 
 For each named branch, `git log --oneline main..<branch>` after PR #2 merges. Delete (remote and local) only if that command outputs nothing; if it outputs anything, stop and report rather than delete.
 
-**Command and output:** PENDING_FILL_IN
+**`phase-1-3-complete`:**
+
+```
+$ git log --oneline origin/main..origin/phase-1-3-complete
+(no output)
+```
+
+Empty. Deleted:
+
+```
+$ git worktree remove <this run's worktree path>
+$ git branch -d phase-1-3-complete
+Deleted branch phase-1-3-complete (was e09f6c2).
+$ git push origin --delete phase-1-3-complete
+ - [deleted]         phase-1-3-complete
+```
+
+**`phase-1-1-remediation`:**
+
+```
+$ git log --oneline origin/main..origin/phase-1-1-remediation
+(no output)
+```
+
+Empty. Deleted:
+
+```
+$ git checkout main   # freed the primary directory's checkout of this branch
+$ git branch -d phase-1-1-remediation
+Deleted branch phase-1-1-remediation (was 0cf0f92).
+$ git push origin --delete phase-1-1-remediation
+ - [deleted]         phase-1-1-remediation
+```
+
+**`phase-0-truth-pass`:**
+
+```
+$ git log --oneline origin/main..origin/phase-0-truth-pass
+fatal: ambiguous argument 'origin/main..origin/phase-0-truth-pass': unknown revision or path not in the working tree.
+```
+
+Does not exist, locally or on the remote (`git ls-remote --heads origin` before any deletion in this pass showed only `main`, `phase-1-1-remediation`, `phase-1-3-complete`). Not deleted because there was nothing to delete - reported per the instruction rather than silently skipped. Likely already deleted in an earlier session: its "Phase 0 truth pass" commit (`65dd365`'s message references it) is already on `main` directly, consistent with the branch having been merged and removed before this run started.
+
+**`phase-1-record-truth`:**
+
+```
+$ git log --oneline origin/main..origin/phase-1-record-truth
+fatal: ambiguous argument 'origin/main..origin/phase-1-record-truth': unknown revision or path not in the working tree.
+```
+
+Same as above: does not exist locally or on the remote. Not deleted, reported rather than skipped silently.
+
+**Final state:**
+
+```
+$ git ls-remote --heads origin
+4fc80428544d5c995885fc0e94e655dee1b58027	refs/heads/main
+$ git branch -a
+* main
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/main
+```
+
+Only `main` remains, remote and local.
 
 ---
 
 ## 9. Could not verify
 
-PENDING_FILL_IN
+- Whether any local clone other than this run's own primary directory and worktree still holds a copy of `phase-1-3-complete` or `phase-1-1-remediation` - only this machine's state and the `origin` remote were checked.
+- The exact reason `phase-0-truth-pass` and `phase-1-record-truth` no longer exist (already deleted in an earlier session vs. never pushed as a named branch) - inferred from `65dd365`'s commit message and `main`'s own history containing that work directly, not confirmed against reflog or any external record of a prior deletion.
+- `git worktree remove` for this run's own worktree returned `error: failed to delete '.git/worktrees/phase-1-3-complete': Permission denied` on the first attempt; `git worktree list` immediately after showed the worktree gone regardless (the working-directory removal succeeded, only a metadata-directory cleanup step errored, likely a transient file handle on Windows). Not re-verified beyond confirming `git worktree list` no longer shows it and the local branch delete (which requires the worktree to be gone) succeeded cleanly.
