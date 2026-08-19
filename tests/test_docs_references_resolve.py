@@ -83,7 +83,9 @@ _PROSE_EXCLUDE_PATH_PREFIXES = (
 # definite reference ("the roadmap", "this ADR") with nothing resolvable
 # nearby is safe to flag without a pointer phrase.
 _STRICT_NOUN_RE = re.compile(
-    r"\b(?:the|this|that|its|our)\s+(roadmap|ADR)\b", re.IGNORECASE
+    r"\b(?:the|this|that|its|our|this repository's|this repo's|the project's)"
+    r"\s+(roadmap|ADR)\b",
+    re.IGNORECASE,
 )
 
 # Nouns too common as ordinary English words ("the original plan called
