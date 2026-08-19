@@ -40,13 +40,19 @@ a control-plane key to be attached at all.
 
 **Control-plane layer** (`control_plane/main.py`): the single
 `CONTROL_PLANE_API_KEY` splits into `CONTROL_PLANE_READ_KEY` (authorizes the
-two read routes, `GET /audit` and `GET /tenants/{tenant_id}`) and
-`CONTROL_PLANE_WRITE_KEY` (authorizes `PUT`/`POST /tenants`, `POST /content`,
-`DELETE /content/{call_id}`). `GET /tenants/{tenant_id}` had no dependency at
-all until P13-3 (Phase 1.3) added one - named by Phase 1.1's red-team
-(finding #2) and reconfirmed still open by Phase 1.2's red-team (finding
-6.2) in the interim; full tenant configuration was readable with zero
-credentials until then. These are independent secrets, not a hierarchy -
+three read routes, `GET /audit`, `GET /tenants/{tenant_id}`, and
+`GET /bundles/{tenant_id}`) and `CONTROL_PLANE_WRITE_KEY` (authorizes
+`PUT`/`POST /tenants`, `POST /content`, `DELETE /content/{call_id}`).
+`GET /tenants/{tenant_id}` had no dependency at all until P13-3 (Phase 1.3)
+added one - named by Phase 1.1's red-team (finding #2) and reconfirmed
+still open by Phase 1.2's red-team (finding 6.2) in the interim; full
+tenant configuration was readable with zero credentials until then.
+`GET /bundles/{tenant_id}` had the same gap, named by the Phase 1.3
+red-team (V6) and closed by R4 (Phase 1.3 completion pass): it returned
+the same tenant configuration `GET /tenants/{tenant_id}` is gated to
+protect. OPA is the only caller of this route in normal operation, and
+carries the read key in `opa-config.yaml` as a static header on every
+poll. These are independent secrets, not a hierarchy -
 the read key structurally cannot authorize a write route, checked by
 `_require_read_key`/`_require_write_key`, two separate FastAPI dependencies
 replacing the single `_require_api_key`. Either key being unset returns 503
@@ -116,10 +122,15 @@ just the layer where the regression happened to land.
 - `dashboard/app/api/audit/route.ts`, `dashboard/app/api/tenants/[id]/route.ts`
 - `docs/reports/phase-1-redteam.md`, S6 - the open-relay finding this closes
 - `docs/reports/phase-1-1-redteam.md` and `docs/reports/phase-1-2-redteam.md` - `GET /tenants/{tenant_id}`'s missing dependency, closed by P13-3 (Phase 1.3)
+- `docs/reports/phase-1-3-redteam.md`, V6 - `GET /bundles/{tenant_id}`'s missing dependency, closed by R4 (Phase 1.3 completion pass)
 - D4 (Phase 3) - the server-side-only credential handling this ADR extends
   rather than replaces; referenced in `dashboard/lib/api.ts` and
   `dashboard/app/api/*/route.ts` comments, no dedicated ADR of its own
 - `tests/test_dashboard_auth.py`, including
   `test_control_plane_get_tenant_rejected_with_no_key`,
   `::test_control_plane_get_tenant_rejected_with_wrong_key`,
-  `::test_control_plane_get_tenant_accepted_with_read_key` (P13-3)
+  `::test_control_plane_get_tenant_accepted_with_read_key` (P13-3),
+  `::test_control_plane_get_bundle_rejected_with_no_key`,
+  `::test_control_plane_get_bundle_rejected_with_wrong_key`,
+  `::test_control_plane_get_bundle_accepted_with_read_key`,
+  `::test_opa_still_loads_bundle_through_the_now_credentialed_poll` (R4)

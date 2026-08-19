@@ -112,7 +112,7 @@ AIL uses **SPIFFE/SPIRE** (the CNCF standard for workload identity) to issue eph
 
 - Every agent is assigned a unique SPIFFE ID: `spiffe://ail.internal/workload/agent`
 - Certificates are short-lived and automatically rotated by the SPIRE agent
-- All traffic from the agent to the policy engine transits through an **Envoy proxy** enforcing strict mutual TLS - both parties must authenticate
+- On the full docker-compose.yml stack, the langgraph-demo agent's traffic to OPA transits an **Envoy proxy** enforcing strict mutual TLS (`OPA_URL=https://envoy:8443/...`). This is not a universal gate: `docker-compose.test.yml`, which the integration suite and CI actually run against, has no Envoy service at all - `SPIRE_DISABLED=true` there means the interceptor calls OPA directly, unauthenticated at the transport layer. Even on the full stack, OPA's own port is reachable directly by anything on the compose network (Residual Limits, §5), so Envoy is an additional authenticated path alongside OPA's own listener, not a gate every packet is forced through.
 - Certificates are loaded **in-memory only** on Linux (`os.memfd_create`), never written to disk
 - If the SPIRE workload socket is absent at boot, the agent process exits immediately
 
@@ -179,7 +179,7 @@ The Python interceptor middleware exports native **Prometheus metrics** (`ail_po
 The CISO Control Plane dashboard (Next.js 15, Tailwind, Shadcn UI) authenticates to the control plane entirely server-side: every dashboard request goes through this app's own Next.js Route Handlers (`dashboard/app/api/*/route.ts`), which hold `CONTROL_PLANE_READ_KEY`/`CONTROL_PLANE_WRITE_KEY` as ordinary server-side environment variables and attach the appropriate one — neither key is ever a `NEXT_PUBLIC_*` variable or reaches the browser bundle. Those route handlers are themselves gated by `dashboard/middleware.ts`, which requires the caller (browser or curl) to authenticate with a separate read/write credential pair over HTTP Basic Auth before any control-plane key is attached — an anonymous request to `/api/audit` or `/api/tenants/{id}` is rejected before it ever reaches the control plane. It provides:
 
 - **Policy Settings** - toggle compliance packs per tenant, manage cost center allowlists, approved regions, and processing purpose constraints. Every save generates a new OPA bundle immediately.
-- **Audit Ledger** - paginated, searchable table of all agent decisions sourced live from ImmuDB, rendering `outcome_type`/`fault_class` and all four verification states distinctly; entries are reproducible offline via immuclient against the signed state.
+- **Audit Ledger** - paginated, searchable table of all agent decisions sourced live from ImmuDB, rendering `outcome_type`/`fault_class` and all five verification states distinctly; entries are reproducible offline via immuclient against the signed state.
 
 ---
 
@@ -299,10 +299,10 @@ OPA resolves its bundle resource from its own `AIL_TENANT_ID` once at process st
 AIL_TENANT_ID=tenant_finance docker compose up -d --force-recreate --no-deps opa
 ```
 
-Confirm the bundle actually loaded before continuing (OPA fetches immediately on startup, but this is not instantaneous):
+Confirm the bundle actually loaded before continuing (OPA fetches immediately on startup, but this is not instantaneous). OPA's own port is not published to the host (R1, Phase 1.3 completion pass - see Residual Limits, §5), so check from inside the compose network instead of `curl localhost:8181`:
 
 ```bash
-curl -s localhost:8181/v1/data/ail/config
+docker compose exec ail-control-plane python -c "import urllib.request; print(urllib.request.urlopen('http://opa:8181/v1/data/ail/config').read().decode())"
 ```
 
 Wait until `tenant_id` in the response reads `tenant_finance` and `allowed_cost_centers` reads `["finance", "executive"]`.
@@ -343,10 +343,10 @@ The same gateway binary and the same Rego evaluation engine enforce both tenants
 | Service | URL | Purpose |
 | :--- | :--- | :--- |
 | CISO Control Plane | `http://localhost:3001` | Policy management + audit ledger |
-| Control Plane API | `http://localhost:8002/docs` | FastAPI Swagger - REST bundle server |
-| OPA | `http://localhost:8181` | Policy engine (direct query) |
 | Grafana | `http://localhost:3000` | Prometheus metrics dashboard |
 | Prometheus | `http://localhost:9090` | Raw metrics scrape target |
+
+The Control Plane API and OPA are not published to the host (R1, Phase 1.3 completion pass - see Residual Limits, §5): both are management or record-writing surfaces, and a host-published loopback bind does not stop `host.docker.internal` from reaching it. Reach either from inside the compose network - `docker compose exec ail-control-plane python -c "import urllib.request; print(urllib.request.urlopen('http://opa:8181/v1/data/ail/config').read().decode())"` for OPA, `docker compose exec dashboard node -e "require('http').get('http://ail-control-plane:8002/health',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>console.log(d))})"` for the control plane (or any sibling container on the same network).
 
 ### 4.7 Kubernetes Deployment (Chart Unsupported)
 
@@ -397,10 +397,10 @@ This bounds prompt injection rather than eliminating it. The guarantee is precis
 This gateway operates in the `observed` conformance profile (`docs/adr/0005-outcome-taxonomy.md`): the agent independently holds every tool's real authority, and nothing here takes that away from it. The limits below are not bugs pending a patch on this architecture - they are what "observed" means, stated precisely rather than left implicit. Phase 2 of the roadmap is the work that would move this gateway toward `mediated`; nothing in this repository does that yet.
 
 - **A compromised container evades the interceptor entirely.** §1 and §3.1 above state this directly: `intercept_tool_call` is an in-process hook, not a network perimeter. Arbitrary code execution in the agent's own process can call a tool's real backend directly, or skip the interceptor call, and no record is produced either way - a bypassed call is, by construction, a call this gateway never saw.
-- **OPA's management API is reachable from the host and from any container on the compose network.** `docker-compose.yml` and `docker-compose.test.yml` now bind OPA's port to loopback only (`tests/test_host_port_bindings.py`), which stops a second machine on the same network from reaching it merely because the host published the port. It does not stop the host itself, and it does not stop anything running inside the compose network - including the agent container - from reaching OPA's Data API and its unauthenticated management endpoints (`/v1/policies`, `/v1/data/system/bundles/*`) directly. Phase 2's removal of the agent's own network path to OPA is what actually closes this.
-- **The verifier's `/write` and `/verify` carry no authentication, and this is the more important of the two.** The same loopback binding (`tests/test_host_port_bindings.py`) applies to the verifier's port. Tamper-evidence - the property ImmuDB's inclusion and consistency proofs actually provide - protects a record already written from being modified without detection. It does not protect against a record being forged in the first place: **any party with the agent's network position can write arbitrary records to the ledger, and those records will carry valid inclusion proofs.** A forged `content_erasure` tombstone is one demonstrated instance of this (`docs/reports/phase-1-2-redteam.md`, U5); it is not the only shape a forged record could take.
+- **OPA's management API, the verifier's `/write` and `/verify`, ImmuDB's own ports, the control plane's record-writing routes, Envoy's admin API, and SPIRE's management API are not published to the host at all in the deployment compose (`docker-compose.yml`, R1, Phase 1.3 completion pass).** The previous fix (P13-1, P13-2) bound OPA and the verifier to `127.0.0.1` rather than every interface. That bind does not hold: `host.docker.internal` reaches a loopback-bound port from any container on the Docker host, including one on a network sharing nothing with this compose project - live-demonstrated against both OPA and the verifier in `docs/reports/phase-1-3-complete.md` (R1), and closed only by removing the publish entirely, which `tests/test_host_port_bindings.py` now enforces for the full set. This closes off-host and cross-container-on-the-host reach for the deployment compose. It does **not** close reach from anything inside the compose network itself, including the agent container: OPA's Data API and its unauthenticated management endpoints (`/v1/policies`, `/v1/data/system/bundles/*`), and the verifier's unauthenticated `/write` and `/verify`, are all still reachable by compose DNS name from any container on the same network. Phase 2's removal of the agent's own network path to these services is what actually closes that. `docker-compose.test.yml` still publishes OPA and the verifier to the host, loopback-bound, and ImmuDB and the control plane without even a loopback restriction - deliberately, so the integration suite can reach them from the host - and is never a deployment target.
+- **Tamper-evidence is not forgery-resistance.** The property ImmuDB's inclusion and consistency proofs actually provide protects a record already written from being modified without detection. It does not protect against a record being forged in the first place: **any party that can reach the verifier's network position can write arbitrary records to the ledger, and those records will carry valid inclusion proofs.** A forged `content_erasure` tombstone is one demonstrated instance of this (`docs/reports/phase-1-2-redteam.md`, U5); it is not the only shape a forged record could take. A record forged this way that omits the `profile` field renders as `"unknown"`, not as a genuine `"observed"` record (R3, Phase 1.3 completion pass) - this narrows what a forgery can pass off as, but a forger who includes a `profile` field is unaffected.
 - **Attribution has a ceiling, not a gap.** A record names a session or a process; in a future `attested` profile, a workload. It cannot name intent. A compromised agent's calls carry the same identity as its legitimate ones, because the credential authenticates the process, not the process's current loyalty - see `docs/adr/0005-outcome-taxonomy.md` and the go/no-go findings in `docs/reports/spike-mcp-mediation.md` this is drawn from. No profile this project defines changes that ceiling.
-- **`GET /tenants/{tenant_id}` and `POST /content` are now access-controlled, but the credential they check is a single shared secret, not a per-caller identity** (ADR-0007) - this is the same authorization model the rest of the control plane already uses, disclosed here because P13-3/P13-4 add two more routes to it rather than changing the model.
+- **`GET /tenants/{tenant_id}`, `GET /bundles/{tenant_id}` (R4, Phase 1.3 completion pass), and `POST`/`DELETE /content` are now access-controlled, but the credential they check is a single shared secret, not a per-caller identity** (ADR-0007) - this is the same authorization model the rest of the control plane already uses. OPA itself holds this credential (in `opa-config.yaml`, as an environment variable) in order to poll `GET /bundles/{tenant_id}` - a shared secret an automated poller holds is not a stronger guarantee than one a human operator holds.
 
 ---
 
@@ -414,7 +414,7 @@ The current resolution uses process isolation: a dedicated `verifier` container 
 
 **ADR-002: FastAPI as ImmuDB Proxy**
 
-ImmuDB is intentionally not exposed on the host network interface. The CISO dashboard (a browser application) cannot reach an internal Docker service directly. The FastAPI control plane exposes a `GET /audit` endpoint that scans ImmuDB via REST for key listing, then calls the verifier service for a `verifiedGet` proof check on each entry. The response reports one of four verification states per entry (Phase 1, ADR-0006), not a single boolean. CORS is restricted to `localhost:3001`. See `docs/adr/0002-fastapi-immudb-proxy.md` for the full record.
+ImmuDB is intentionally not exposed on the host network interface in the deployment compose (`docker-compose.yml`, R2/R1, Phase 1.3 completion pass) - neither its gRPC port (3322) nor its REST port (8080) is published there. `docker-compose.test.yml` publishes both, deliberately, so the integration suite can reach ImmuDB directly from the host; it is never a deployment target. The CISO dashboard (a browser application) cannot reach an internal Docker service directly. The FastAPI control plane exposes a `GET /audit` endpoint that scans ImmuDB via REST for key listing, then calls the verifier service for a `verifiedGet` proof check on each entry. The response reports one of five verification states per entry (Phase 1.1, ADR-0006), not a single boolean. CORS is restricted to `localhost:3001`. See `docs/adr/0002-fastapi-immudb-proxy.md` for the full record.
 
 **ADR-003: OPA Bundle API over Direct Rego Push**
 
@@ -428,9 +428,9 @@ OPA is a powerful but general-purpose policy engine. Running a full Rego evaluat
 
 Every intercepted call is assigned one `outcome_type` (`policy_allow`, `policy_deny`, `schema_deny`, or `fault`, the last carrying a closed-set `fault_class`) at a single point in the interceptor, and the ledger entry carries this taxonomy directly rather than a free-text decision string. This is what makes a real policy violation, a malformed payload, and an infrastructure fault distinguishable everywhere - the ledger, `/audit`, the dashboard, and Prometheus - instead of collapsing to the same `DENIED` shape. Every record also carries a `profile` (`observed` | `mediated` | `attested`) declaring which conformance guarantee it was produced under - this codebase produces `observed` only, see Residual Limits above. See `docs/adr/0005-outcome-taxonomy.md` for the full record, including the one documented case (`fault_class: verifier_unreachable`) where no record can exist at all, and the profile definitions with their attribution ceiling.
 
-**ADR-006: Four Read-Time Verification States**
+**ADR-006: Five Read-Time Verification States**
 
-A ledger entry cannot assert its own verification status - that would be self-certifying. `/audit` computes `verified`, `failed`, `unverifiable`, or `asserted` per entry, at request time, based on whether a `verifiedGet` was attempted and what it found; none of these states are stored in the immutable entry itself. See `docs/adr/0006-verification-states.md` for the full record.
+A ledger entry cannot assert its own verification status - that would be self-certifying. `/audit` computes `verified`, `failed`, `unverifiable`, `asserted`, or `not_found` per entry, at request time, based on whether a `verifiedGet` was attempted and what it found; none of these states are stored in the immutable entry itself. See `docs/adr/0006-verification-states.md` for the full record.
 
 ---
 

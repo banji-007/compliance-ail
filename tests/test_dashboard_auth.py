@@ -191,6 +191,65 @@ def test_control_plane_get_tenant_accepted_with_read_key():
 
 
 @requires_dashboard
+def test_control_plane_get_bundle_rejected_with_no_key():
+    """
+    R4 (Phase 1.3 completion pass, red-team V6): GET /bundles/{tenant_id}
+    returned the same tenant configuration GET /tenants/{id} is gated to
+    protect, with zero authentication - live-confirmed by fetching a real
+    tenant's bundle and untarring the same allowed_cost_centers/
+    approved_regions/approved_purposes data.json GET /tenants/{id} guards.
+    """
+    resp = httpx.get(f"{CONTROL_PLANE_URL}/bundles/{_TENANT_ID}", timeout=10)
+    assert resp.status_code == 422, f"Expected 422 (missing header), got {resp.status_code}: {resp.text}"
+
+
+@requires_dashboard
+def test_control_plane_get_bundle_rejected_with_wrong_key():
+    resp = httpx.get(
+        f"{CONTROL_PLANE_URL}/bundles/{_TENANT_ID}",
+        headers={"X-API-Key": "definitely-not-the-real-key"},
+        timeout=10,
+    )
+    assert resp.status_code == 403, f"Expected 403, got {resp.status_code}: {resp.text}"
+
+
+@requires_dashboard
+def test_control_plane_get_bundle_accepted_with_read_key():
+    """Read-scoped, not write-scoped - OPA only ever polls this route."""
+    resp = httpx.get(
+        f"{CONTROL_PLANE_URL}/bundles/{_TENANT_ID}",
+        headers={"X-API-Key": CONTROL_PLANE_READ_KEY},
+        timeout=10,
+    )
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    assert resp.headers["content-type"] == "application/gzip"
+
+
+@requires_dashboard
+def test_opa_still_loads_bundle_through_the_now_credentialed_poll():
+    """
+    R4's own fix must not break the caller it was written for: OPA is the
+    only consumer of GET /bundles/{tenant_id} in normal operation, and
+    opa-config.yaml now attaches CONTROL_PLANE_READ_KEY as X-API-Key on
+    every poll. Confirmed directly against the live OPA instance in this
+    stack, which has been polling since it started - a real revision
+    resolves, and the bundle's tenant-scoped config is actually loaded.
+    """
+    revision_resp = httpx.get(
+        "http://localhost:8181/v1/data/system/bundles/ail-policies/manifest/revision",
+        timeout=5,
+    )
+    revision_resp.raise_for_status()
+    revision = revision_resp.json().get("result")
+    assert revision, f"OPA has no ail-policies revision loaded: {revision_resp.json()}"
+
+    config_resp = httpx.get("http://localhost:8181/v1/data/ail/config", timeout=5)
+    config_resp.raise_for_status()
+    config = config_resp.json().get("result")
+    assert config and config.get("tenant_id"), f"OPA has no tenant config loaded: {config_resp.json()}"
+
+
+@requires_dashboard
 def test_control_plane_write_key_succeeds_on_mutating_routes():
     call_id = f"test-auth-probe-{uuid.uuid4().hex}"
 

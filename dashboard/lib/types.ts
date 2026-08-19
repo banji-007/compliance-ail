@@ -26,12 +26,23 @@ export type TenantUpdate = Partial<Omit<Tenant, "id">>;
 /** Closed set (D1) — never inferred from message text. */
 export type OutcomeType = "policy_allow" | "policy_deny" | "schema_deny" | "fault";
 
-/** Closed set (D1). Null unless outcome_type is "fault". */
+/**
+ * The fault classes /audit can actually send, not the full six-member
+ * closed set (docs/adr/0005-outcome-taxonomy.md). Two of the six
+ * (verifier_unreachable, content_store_unreachable) are documented as
+ * never producing a ledger record - each is discovered in a path that
+ * itself precedes, or is, the write that would record it - so they can
+ * never reach this API. R5 (Phase 1.3 completion pass, red-team V1
+ * finding 3): this type previously included verifier_unreachable (which
+ * cannot reach here) and omitted malformed_policy_response (which does -
+ * live-forced through the real interceptor and confirmed to produce a
+ * ledger entry with fault_class: "malformed_policy_response").
+ */
 export type FaultClass =
   | "opa_unreachable"
   | "revision_unavailable"
-  | "verifier_unreachable"
   | "spiffe_unavailable"
+  | "malformed_policy_response"
   | null;
 
 /**
@@ -124,11 +135,15 @@ export interface AuditEntry {
   verification: Verification;
   /**
    * Conformance profile this record was produced under (P13-8). "observed"
-   * is the only value that exists today — the agent independently holds
+   * is the only value that exists today - the agent independently holds
    * every tool's authority, so a bypass of this gateway is possible and
    * would leave no record at all. See docs/adr/0005-outcome-taxonomy.md.
+   *
+   * "unknown" (R3, Phase 1.3 completion pass) is not a profile - it is
+   * what /audit renders for a record that structurally lacks the field,
+   * so that case is never confused with a genuine "observed" record.
    */
-  profile: "observed" | "mediated" | "attested";
+  profile: "observed" | "mediated" | "attested" | "unknown";
 }
 
 export interface AuditResponse {

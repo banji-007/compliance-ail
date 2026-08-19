@@ -71,11 +71,13 @@ function DecisionCell({ entry }: { entry: AuditEntry }) {
 }
 
 /**
- * Renders one of the four verification states distinctly (P1-7, D2).
+ * Renders one of the five verification states distinctly (P1-7, D2, D8).
  * "asserted" is deliberately the quiet, neutral one — it is not a problem,
  * it means no check was attempted for this entry. "unverifiable" and
  * "failed" are both problems, but different ones: one is "we could not
- * check", the other is the actual tamper signal.
+ * check", the other is the actual tamper signal. "not_found" (D8, Phase
+ * 1.1) is neither - no entry was ever written for this key, so there was
+ * never a proof to check in the first place.
  */
 function VerificationCell({ entry }: { entry: AuditEntry }) {
   const v = entry.verification;

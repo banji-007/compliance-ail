@@ -255,10 +255,21 @@ def update_tenant(
 
 
 @app.get("/bundles/{tenant_id}")
-def get_bundle(tenant_id: str, request: Request, db: Session = Depends(get_db)):
+def get_bundle(
+    tenant_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_read_key),
+):
     """
     OPA Bundle API endpoint. OPA polls this on the configured interval,
     sending If-None-Match with the last known ETag. Return 304 if unchanged.
+
+    R4 (Phase 1.3 completion pass, red-team V6): this returned the same
+    tenant configuration GET /tenants/{id} is gated to protect, with zero
+    authentication. Read-scoped, not write-scoped - OPA only ever reads
+    this route. See opa-config.yaml, which attaches the read key as
+    X-API-Key on every poll.
     """
     tenant = db.query(Tenant).filter_by(id=tenant_id).first()
     if not tenant:
@@ -711,11 +722,17 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
                 "payload":         payload,
                 "payload_state":   payload_state,
                 "verification":    verification,
-                # P13-8: every record ever written by this codebase carries
-                # this same value (RECORD_PROFILE) - defaulted here, not
-                # trusted from a caller-suppliable field, for the rare
-                # pre-P13-8 entry that predates the key existing at all.
-                "profile":         log_entry.get("profile", RECORD_PROFILE),
+                # R3 (Phase 1.3 completion pass, red-team V5): a record with
+                # no "profile" key at all must render as explicitly unknown,
+                # not as a definite, valid-looking value. The previous
+                # default (RECORD_PROFILE) rendered a structurally
+                # profile-less record identically to a genuine, correctly-
+                # produced one - live-demonstrated by forging a raw write
+                # with the field omitted entirely. "unknown" is deliberately
+                # outside the closed set {observed, mediated, attested}
+                # (docs/adr/0005-outcome-taxonomy.md) so it cannot be
+                # confused with a real profile value.
+                "profile":         log_entry.get("profile", "unknown"),
             })
         except Exception as exc:
             logger.warning("Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc)
