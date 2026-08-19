@@ -1,5 +1,20 @@
 # AIL v2: gap closure, pivot, and hosted architecture
 
+> **Status: partly superseded.** `docs/plan/ail-roadmap.md` replaces the
+> phasing in section 4 (Phasing) and section 6 (What to share, and when) —
+> follow the roadmap's phases, not this document's. Section 3 (Target
+> architecture) still stands, with the changes established by
+> `docs/reports/spike-wasm-parity.md`: the bundle-revision digest cannot be
+> read under WASM and is replaced by a module+data hash computed in the
+> isolate, four Rego rules' `sprintf("%v", ...)` set-formatting diverges from
+> the WASM evaluator's output, and the corpus is 13 deny rules, not 12
+> (GDPR has 3). Section 3's MCP-mediation assumption is also refuted by
+> `docs/reports/spike-mcp-mediation.md`: mediation is not a configuration
+> change but a function of authority exclusivity — see the roadmap's
+> section 2. This document is not deleted because it is cited elsewhere;
+> read it for architecture context, not for phase sequencing or the MCP
+> claim.
+
 Baseline: HEAD `1ba5d05`, audit report `docs/audit/2026-08-16-verification.md`.
 
 ---
@@ -124,7 +139,7 @@ Second framework integration. Retires the "LangGraph reference only" caveat and 
 ## 5. Risks
 
 - **Rego builtin coverage under wasm.** Not all builtins compile. The rules use `contains`, `sprintf`, set membership. Phase 2 exists to find out before anything depends on the answer.
-- **Losing SPIFFE in hosted mode** weakens the "off-host enforcement bound to cryptographic workload identity" position, which is the one thing the current design has that CaMeL, Progent, and IsolateGPT do not. Mitigated by keeping SPIFFE in the self-hosted profile and by treating identity as an interface, but it is a real trade and should be stated in the ADR rather than glossed.
+- **Losing SPIFFE in hosted mode** weakens the "off-host enforcement bound to cryptographic workload identity" position, which is the one thing the current design has that CaMeL, Progent, and IsolateGPT do not. Mitigated by keeping SPIFFE in the self-hosted profile and by treating identity as an interface, but it is a real trade and should be stated in an ADR rather than glossed.
 - **Rewrite cost.** Control plane and decision path move from Python to TypeScript. The interceptor SDK staying in Python contains the blast radius.
 - **Rekor is public.** Only roots are published. Any design that would put record contents in the log is out of scope. An enterprise profile needs a private Trillian or an ImmuDB fallback, and that should be a documented deployment option, not an afterthought.
 - **Durable Objects are Cloudflare-specific.** The session store should sit behind an interface with a Postgres or Redis implementation for the self-hosted profile.
