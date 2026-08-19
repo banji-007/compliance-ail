@@ -159,6 +159,60 @@ def test_raw_tombstone_record_carries_observed_profile():
 
 
 @requires_stack
+def test_audit_forged_profile_less_record_renders_as_unknown_not_observed():
+    """
+    R3 (Phase 1.3 completion pass, red-team V5): a record written directly
+    to the verifier with no "profile" key at all must render distinctly as
+    "unknown" in /audit, never as "observed" - the default that would make
+    a structurally profile-less record indistinguishable from a genuine
+    one. Reproduces the red-team's own live forgery.
+
+    Mutation: change control_plane/main.py::get_audit's
+    `log_entry.get("profile", "unknown")` back to
+    `log_entry.get("profile", RECORD_PROFILE)`. This test must fail against
+    that mutation - the forged entry would render "observed" again.
+    """
+    agent_id = f"profile_less_probe_{uuid.uuid4().hex}"
+    call_id = f"profile-less-{uuid.uuid4().hex}"
+    key = f"tool_call:{agent_id}:{uuid.uuid4().hex}:provision_cloud_server"
+    entry = {
+        "record_type": "decision",
+        "agent_id": agent_id,
+        "timestamp": "2026-08-19T00:00:00",
+        "tool_name": "provision_cloud_server",
+        "call_id": call_id,
+        "input_sha256": "deadbeef",
+        "outcome_type": "policy_allow",
+        "fault_class": None,
+        "policy_revision": "test-revision",
+        "reasons": [],
+        "content_state": "unavailable",
+        # deliberately no "profile" key
+    }
+    write_resp = httpx.post(
+        f"{os.getenv('VERIFIER_URL', 'http://localhost:8003')}/write",
+        json={"key": b64(key), "value": b64(json.dumps(entry))},
+        timeout=15,
+    )
+    write_resp.raise_for_status()
+    assert write_resp.json().get("verified"), write_resp.json()
+
+    entries = httpx.get(
+        f"{CONTROL_PLANE_URL}/audit",
+        params={"limit": 500},
+        headers={"X-API-Key": READ_API_KEY},
+        timeout=30,
+    ).json()["entries"]
+    matching = [e for e in entries if e["agent_id"] == agent_id]
+    assert matching, f"forged entry for {agent_id} not found in /audit"
+    assert matching[0]["profile"] == "unknown", (
+        f"Expected 'unknown' for a structurally profile-less record, "
+        f"got {matching[0]['profile']!r} - this masks a forged or "
+        f"pre-P13-8 record as a genuine 'observed' one: {matching[0]}"
+    )
+
+
+@requires_stack
 def test_audit_response_carries_profile_from_closed_set():
     """The /audit projection must surface profile, not drop it the way it
     would if a producer forgot to read the field back out of log_entry."""

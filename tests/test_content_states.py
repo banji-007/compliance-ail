@@ -83,9 +83,27 @@ requires_stack = pytest.mark.skipif(
 # from a real regression in the erasure/tombstone logic they exist to guard.
 # Project convention (P01-1, docs/reports/phase-0-1.md): an
 # environment-dependent test gets a clean skipif, not a crash.
+#
+# R6 (Phase 1.3 completion pass, red-team V7 sub-attack 3): shutil.which
+# alone is not enough - a file named "docker" on PATH that is not a valid
+# Windows executable still satisfies shutil.which, and subprocess.run then
+# raises an uncaught OSError (WinError 216) instead of returning a nonzero
+# CompletedProcess. pytest reports that as ERROR, not a clean skip or a
+# clean assertion failure. Actually invoking the CLI here, not just
+# resolving it, turns that same OSError into a skip instead of a crash.
+def _docker_cli_usable() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        subprocess.run(["docker", "version"], capture_output=True, timeout=10)
+        return True
+    except OSError:
+        return False
+
+
 requires_docker_cli = pytest.mark.skipif(
-    shutil.which("docker") is None,
-    reason="docker CLI not on PATH",
+    not _docker_cli_usable(),
+    reason="docker CLI not on PATH or not runnable",
 )
 
 

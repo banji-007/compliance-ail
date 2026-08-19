@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-ImmuDB is intentionally not exposed on the host network interface (`docker-compose.yml`'s `immudb` service publishes only the gRPC port, 3322, to the host; its REST port, 8080, is internal-only). The CISO dashboard is a browser application and cannot reach an internal Docker-network-only service directly, and should not be given direct ImmuDB credentials regardless.
+ImmuDB is intentionally not exposed on the host network interface. As of R1/R2 (Phase 1.3 completion pass), `docker-compose.yml`'s `immudb` service publishes neither the gRPC port (3322) nor the REST port (8080) to the host - both are a direct ledger read/write surface, independent of the verifier layer entirely, and a loopback-only bind was found not to hold (`host.docker.internal` reaches a loopback-bound port from any container on the Docker host - see `docs/reports/phase-1-3-complete.md`, R1). Before this fix, the gRPC port was published unrestricted (`"3322:3322"`), contradicting this ADR's own claim - that contradiction is what R2 closes. `docker-compose.test.yml` publishes both ports, deliberately, so the integration suite's own ImmuDB scans (`tests/test_verification.py`, `tests/test_record_profile.py`) can reach it directly from the host; it is never a deployment target. The CISO dashboard is a browser application and cannot reach an internal Docker-network-only service directly, and should not be given direct ImmuDB credentials regardless.
 
 ## Decision
 

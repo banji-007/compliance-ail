@@ -13,10 +13,14 @@ mTLS, matching Makefile:45-53.
 """
 
 import os
+import re
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
 
@@ -250,3 +254,59 @@ def test_metric_label_set_matches_closed_collection():
             assert sample.labels["outcome_type"] in allowed_outcome_types, sample.labels
             assert sample.labels["fault_class"] in allowed_fault_classes, sample.labels
             assert sample.labels["status"] in allowed_statuses, sample.labels
+
+
+# ---------------------------------------------------------------------------
+# R5 (Phase 1.3 completion pass, red-team V1 finding 3): dashboard/lib/
+# types.ts's FaultClass union must match the fault classes /audit can
+# actually send, not the full six-member closed set middleware.py defines.
+# docs/adr/0005-outcome-taxonomy.md's Documented Boundary section states
+# verifier_unreachable and content_store_unreachable never produce a ledger
+# record - each is discovered in a path that itself precedes, or is, the
+# ledger write, so a fault of that class can never carry a ledger_tx_id for
+# /audit to later surface. test_fault_verifier_unreachable_writes_no_record
+# (above) and test_content_states.py::test_content_store_down_denies_as_
+# fault_and_writes_no_record cover that structural claim directly, live.
+# This test covers the other half: the dashboard's own type must include
+# every fault class that DOES reach /audit, and nothing else.
+# ---------------------------------------------------------------------------
+
+_NEVER_REACHES_LEDGER = {
+    middleware.FAULT_VERIFIER_UNREACHABLE,
+    middleware.FAULT_CONTENT_STORE_UNREACHABLE,
+}
+
+_ALL_FAULT_CLASSES = {
+    middleware.FAULT_OPA_UNREACHABLE,
+    middleware.FAULT_REVISION_UNAVAILABLE,
+    middleware.FAULT_VERIFIER_UNREACHABLE,
+    middleware.FAULT_SPIFFE_UNAVAILABLE,
+    middleware.FAULT_MALFORMED_POLICY_RESPONSE,
+    middleware.FAULT_CONTENT_STORE_UNREACHABLE,
+}
+
+_REACHES_AUDIT = _ALL_FAULT_CLASSES - _NEVER_REACHES_LEDGER
+
+
+def _dashboard_fault_class_union() -> set[str]:
+    types_ts = (REPO_ROOT / "dashboard" / "lib" / "types.ts").read_text(encoding="utf-8")
+    match = re.search(r"export type FaultClass =\s*((?:\s*\|\s*(?:\"[^\"]+\"|null)\s*)+);", types_ts)
+    assert match, "Could not find `export type FaultClass = ...;` in dashboard/lib/types.ts"
+    members = re.findall(r'"([^"]+)"', match.group(1))
+    return set(members)
+
+
+def test_dashboard_fault_class_type_matches_reachable_set():
+    """
+    Mutation: add FAULT_VERIFIER_UNREACHABLE (or any never-reaches-ledger
+    class) back to dashboard/lib/types.ts's FaultClass union, or remove
+    FAULT_MALFORMED_POLICY_RESPONSE from it. This test must fail against
+    either mutation.
+    """
+    dashboard_set = _dashboard_fault_class_union()
+    assert dashboard_set == _REACHES_AUDIT, (
+        f"dashboard/lib/types.ts FaultClass {sorted(dashboard_set)} does not match the "
+        f"fault classes /audit can actually send {sorted(_REACHES_AUDIT)} - "
+        f"missing: {sorted(_REACHES_AUDIT - dashboard_set)}, "
+        f"unreachable-but-present: {sorted(dashboard_set - _REACHES_AUDIT)}"
+    )
