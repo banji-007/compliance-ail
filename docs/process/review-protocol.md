@@ -18,6 +18,10 @@ Steps 2 and 4 must not share a session. The value of the red-team slot comes fro
 
 Work is committed to a branch and pushed before step 4, so CI runs and the diff is reviewable. A phase that ends with start SHA equal to end SHA has not finished.
 
+Every instruction carries a unique run id. A session's first reported action states the run id, its working directory, and its branch. A session that finds another branch for the same run id, or a dirty primary directory, stops and reports rather than proceeding. Sessions never run in the primary working directory.
+
+Before deleting a branch, enumerate what is unique to it and confirm each item either exists on the target branch or is intentionally discarded. Use git diff --stat against the target, not a recollection of what was ported.
+
 ---
 
 ## 2. Writing acceptance criteria
