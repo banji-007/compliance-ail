@@ -229,4 +229,6 @@ Same format as `docs/reports/phase-1-3-complete.md` §9.
 
 ## 6. CI run id
 
-Pending - filled in once the branch is pushed and the PR's CI run completes.
+PR #8, `integration-tests` job: **pass, 2m56s** - https://github.com/banji-007/compliance-ail/actions/runs/32396033248/job/96512953206
+
+(Local runs against this same suite took much longer over the course of this session - up to several hours on one run - purely from sustained Docker Desktop resource contention on the Windows dev host after many consecutive builds; CI, on a clean Linux runner, completed in under three minutes. Noted so a reader comparing timings isn't misled by the local transcripts in §2 above, which were captured for their outcomes, not their wall-clock time.)
