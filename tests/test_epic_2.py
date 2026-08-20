@@ -2,8 +2,16 @@
 tests/test_epic_2.py — Pytest test suite for Phase 4 pre-flight validation.
 
 Part A — Pure schema unit tests      (no I/O, always run)
-Part B — Middleware routing tests    (no OPA / ImmuDB — returns before network)
+Part B — Decision-service routing tests (no OPA / ImmuDB — returns before network)
 Part C — OPA integration tests       (skipped if OPA unreachable at localhost:8181)
+
+Migrated in Phase 2 (P2-1): schema validation, the tool registry, and
+query_opa_policy all moved from interceptor/{schemas,middleware}.py to
+decision_service/{schemas,main}.py (D12) - interceptor/schemas.py was
+deleted entirely. TOOL_VALIDATORS (Dict[str, Callable]) was also renamed
+TOOL_REGISTRY (Dict[str, ToolRegistration]) as part of D13; membership
+checks ("x" in registry) are unaffected by that shape change since they
+only ever tested key presence, not the callable itself.
 """
 
 import os
@@ -12,15 +20,44 @@ import sys
 import httpx
 import pytest
 
-# Make the interceptor package importable from within the tests/ directory.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+# Make the decision_service package importable from within the tests/ directory.
 
 # ---------------------------------------------------------------------------
-# Environment must be set BEFORE middleware is imported so that Prometheus
-# and SPIRE init code picks up dev-mode settings on first import.
+# Environment must be set BEFORE decision_service's main is imported so that
+# Prometheus and OPA_URL init code picks up dev-mode settings on first import.
 # ---------------------------------------------------------------------------
+import importlib.util as _importlib_util
+
+# decision_service/main.py's own `from schemas import ...` needs this
+# directory on sys.path - loading main.py itself via spec_from_file_location
+# below (to dodge the module-name collision, see _load_decision_service_main)
+# does not add its own directory to sys.path automatically the way a normal
+# package-relative import would.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "decision_service"))
+
+
+def _load_decision_service_main():
+    """decision_service/main.py and control_plane/main.py are both named
+    main.py - a bare `import main` in one test file clobbers whichever
+    module sys.modules["main"] already held for every other test file in
+    the same pytest session (Python caches by module name, not by which
+    sys.path entry was active when the import statement ran - confirmed
+    live: test_verification.py's control-plane tests got decision_service's
+    module back instead, AttributeError on a function that only exists in
+    control_plane/main.py). Loading this one under its own explicit module
+    name sidesteps the collision instead of depending on import order."""
+    spec = _importlib_util.spec_from_file_location(
+        "decision_service_main",
+        os.path.join(os.path.dirname(__file__), "..", "decision_service", "main.py"),
+    )
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules["decision_service_main"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 os.environ.setdefault("SPIRE_DISABLED", "true")
-os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
+os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluation")
 
 
 # ===========================================================================
@@ -28,7 +65,7 @@ os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
 # ===========================================================================
 
 from pydantic import ValidationError  # noqa: E402 — after sys.path patch
-from schemas import TOOL_VALIDATORS, QueryDatabaseSchema, DeployToProductionSchema  # noqa: E402
+from schemas import TOOL_REGISTRY, QueryDatabaseSchema, DeployToProductionSchema  # noqa: E402
 
 
 class TestQueryDatabaseSchema:
@@ -123,31 +160,33 @@ class TestDeployToProductionSchema:
 
 
 class TestToolValidatorsRegistry:
-    """Assert the TOOL_VALIDATORS registry contains the expected tool entries."""
+    """Assert the TOOL_REGISTRY registry contains the expected tool entries."""
 
     def test_provision_cloud_server_registered(self):
-        assert "provision_cloud_server" in TOOL_VALIDATORS
+        assert "provision_cloud_server" in TOOL_REGISTRY
 
     def test_query_database_registered(self):
-        assert "query_database" in TOOL_VALIDATORS
+        assert "query_database" in TOOL_REGISTRY
 
     def test_deploy_to_production_registered(self):
-        assert "deploy_to_production" in TOOL_VALIDATORS
+        assert "deploy_to_production" in TOOL_REGISTRY
 
 
 # ===========================================================================
-# Part B: Middleware Routing Tests (no OPA / no ImmuDB)
+# Part B: Decision-Service Routing Tests (no OPA / no ImmuDB)
 # ===========================================================================
 
-from middleware import query_opa_policy  # noqa: E402
+decision_main = _load_decision_service_main()
+
+query_opa_policy = decision_main.query_opa_policy
 
 
 class TestMiddlewareRoutingFailClosed:
-    """Tests for the TOOL_VALIDATORS routing stage inside query_opa_policy.
+    """Tests for the TOOL_REGISTRY routing stage inside query_opa_policy.
 
     query_opa_policy returns a fail-closed schema_deny outcome at the
     registry lookup before any network call to OPA is made and before
-    intercept_tool_call's ImmuDB block is reached. No mocking is required.
+    decide()'s ImmuDB block is reached. No mocking is required.
     """
 
     def test_hallucinated_tool_is_schema_denied(self):

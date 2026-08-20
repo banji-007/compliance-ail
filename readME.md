@@ -34,7 +34,7 @@ For a SOC2 Type II audit, GDPR Article 25 (Data Protection by Design), or any re
 
 **The required architecture is a deterministic enforcement layer the LLM's own output cannot talk its way past.**
 
-The Agentic Integrity Ledger (AIL) is that layer, and it is honest to be precise about its own placement: it is an **in-process hook**, not a network appliance sitting beside the agent. `interceptor/middleware.py::intercept_tool_call` runs inside the agent's own Python process, on the agent's own call path - every registered tool call funnels through it before execution, which evaluates the call against formally defined Rego policies in Open Policy Agent and cryptographically logs the decision to an immutable ledger before allowing or blocking it. A cooperating agent - including one whose LLM has been successfully prompt-injected or jailbroken - cannot evade this, because the call is evaluated on its parameters regardless of what token sequence produced it. What this does not defend against is a **compromised container**: arbitrary code execution in the agent's own process can call the underlying tool directly, monkey-patch or skip `intercept_tool_call` outright, or reach the policy/ledger infrastructure's own APIs on the same network position the agent holds. See the Residual Limits section (§5) for what that means concretely, and [`docs/plan/ail-roadmap.md`](docs/plan/ail-roadmap.md) for the isolation work (Phase 2) that closes it.
+The Agentic Integrity Ledger (AIL) is that layer. Through Phase 1 it was an **in-process hook**, not a network appliance beside the agent - `intercept_tool_call` ran inside the agent's own Python process, holding every credential the policy engine and ledger needed. Phase 2 moved the decision itself out: `interceptor/middleware.py::intercept_tool_call` is now a thin client that sends the tool call to a separate `decision_service` over an mTLS-authenticated channel and returns its verdict - the agent's own network position no longer reaches OPA's management API, the ledger's verifier, or the control plane at all (`docs/adr/0008-decision-service-boundary.md`). A cooperating agent - including one whose LLM has been successfully prompt-injected or jailbroken - cannot evade this, because the call is evaluated on its parameters regardless of what token sequence produced it. **This still does not make every tool call unbypassable.** For the three Python-function tools (`provision_cloud_server`, `query_database`, `deploy_to_production`), arbitrary code execution in the agent's own container can still call the underlying dummy function directly, or send one tool call to the decision service for evaluation and then act on a different one - their authority was never the gateway's to take away. Exactly one tool, `read_vault_secret`, is different: the gateway holds its credential exclusively, delivered to the decision service alone across an OS boundary the agent's container cannot cross, and an agent with arbitrary code execution in its own container cannot reach it by any means in the spike's own bypass list (`docs/reports/spike-mcp-mediation.md`). See the Residual Limits section (§5) for what this distinction means precisely, per tool.
 
 The LLM is treated as an **untrusted client**. The interceptor is the authority the LLM's output must pass through - it is not a perimeter the agent process itself is outside of.
 
@@ -54,9 +54,15 @@ flowchart TD
         B1 -->|X.509 SVID\nEphemeral Cert| B
     end
 
-    B -->|Authenticated Request| C
+    B -->|Authenticated Request\nretargeted, Phase 2| DS
 
-    subgraph POLICY ["Stage 2 - Policy Enforcement"]
+    subgraph DECISION ["Stage 2 - Decision Service (Phase 2, D12)"]
+        DS[POST /decide\nSchema + OPA + Ledger + Vault]
+    end
+
+    DS -->|Policy query| C
+
+    subgraph POLICY ["Stage 3 - Policy Enforcement"]
         C[Open Policy Agent\nRego Evaluation]
         C1[AIL Control Plane\nFastAPI Bundle Server]
         C2[OPA Bundle\nper Tenant]
@@ -64,9 +70,10 @@ flowchart TD
         C2 -->|Loaded into OPA\non poll cycle| C
     end
 
-    C -->|APPROVED / DENIED\nlogged via verifier| V
+    C -->|APPROVED / DENIED| DS
+    DS -->|logged via verifier| V
 
-    subgraph LEDGER ["Stage 3 - Verified Immutable Audit"]
+    subgraph LEDGER ["Stage 4 - Verified Immutable Audit"]
         V[AIL Verifier\nisolated immudb-py SDK]
         D[ImmuDB\nMerkle-Tree Ledger]
         V -->|verifiedSet\ninclusion + consistency proof| D
@@ -75,27 +82,33 @@ flowchart TD
 
     V -->|verified entries + state_id\nvia verifiedGet| E
 
-    subgraph OBSERVE ["Stage 4 - Observability & Control"]
+    subgraph OBSERVE ["Stage 5 - Observability & Control"]
         E[CISO Control Plane\nNext.js Dashboard]
         F[Prometheus + Grafana\nReal-Time Metrics]
     end
 
-    C -->|DENIED| G([Execution Blocked\nAgent receives structured error])
-    C -->|APPROVED| H([Tool Executes\nResult returned to agent])
+    DS -->|DENIED| G([Execution Blocked\nAgent receives structured error])
+    DS -->|APPROVED\nobserved tools| H([Agent Executes\nThree Python-function tools])
+    DS -->|APPROVED\nread_vault_secret only| I([Decision Service Executes\nAgent never holds the credential])
 
     style IDENTITY fill:#1e3a5f,color:#fff,stroke:#4a90d9
+    style DECISION fill:#4a1e5f,color:#fff,stroke:#a94ad9
     style POLICY fill:#1e3f1e,color:#fff,stroke:#4aaa4a
     style LEDGER fill:#5f1e1e,color:#fff,stroke:#d94a4a
     style OBSERVE fill:#3f2e1e,color:#fff,stroke:#d9944a
     style G fill:#8b0000,color:#fff,stroke:#ff0000
     style H fill:#004d00,color:#fff,stroke:#00aa00
+    style I fill:#00394d,color:#fff,stroke:#00aacc
 ```
 
+Stage boxes are numbered for readability; they are not a claim that every call visits every stage in strict physical order (the decision service's own OPA query and ledger write are itself two of the calls the diagram groups as one "Decision Service" node - see `decision_service/main.py`).
+
 **Fail-closed guarantees:**
+- Decision service unreachable from the agent → **DENY** (Phase 2; no ledger record, the agent's own client leg never reached it)
 - OPA unreachable → **DENY**
 - ImmuDB unreachable → **DENY**
 - Verifier unreachable or entry unverified → **DENY**
-- SPIRE socket absent → **DENY**
+- SPIRE socket absent → **DENY**, with its own dedicated guard independent of decision-service readiness (P2-5)
 - Schema validation failure → **DENY** (before OPA is even queried)
 
 There is no code path in which an infrastructure failure results in a silent approval.
@@ -112,24 +125,25 @@ AIL uses **SPIFFE/SPIRE** (the CNCF standard for workload identity) to issue eph
 
 - Every agent is assigned a unique SPIFFE ID: `spiffe://ail.internal/workload/agent`
 - Certificates are short-lived and automatically rotated by the SPIRE agent
-- On the full docker-compose.yml stack, the langgraph-demo agent's traffic to OPA transits an **Envoy proxy** enforcing strict mutual TLS (`OPA_URL=https://envoy:8443/...`). This is not a universal gate: `docker-compose.test.yml`, which the integration suite and CI actually run against, has no Envoy service at all - `SPIRE_DISABLED=true` there means the interceptor calls OPA directly, unauthenticated at the transport layer. Even on the full stack, OPA's own port is reachable directly by anything on the compose network (Residual Limits, §5), so Envoy is an additional authenticated path alongside OPA's own listener, not a gate every packet is forced through.
+- On the full docker-compose.yml stack, the langgraph-demo agent's traffic transits an **Envoy proxy** enforcing strict mutual TLS (`DECISION_SERVICE_URL=https://envoy:8443/decide`) - retargeted in Phase 2 from OPA directly to the decision service, since the agent no longer talks to OPA at all. This is not a universal gate: `docker-compose.test.yml`, which the integration suite and CI actually run against, has no Envoy service at all - `SPIRE_DISABLED=true` there means the interceptor calls the decision service directly, unauthenticated at the transport layer. Even on the full stack, `docker-compose.yml`'s `edge`/`backend` network split (Phase 2, `docs/adr/0008-decision-service-boundary.md`) is what actually keeps the agent from reaching OPA's, the verifier's, or the control plane's ports at all - Envoy is the authenticated path onto `backend`, not a packet filter sitting in front of an otherwise-reachable one.
 - Certificates are loaded **in-memory only** on Linux (`os.memfd_create`), never written to disk
-- If the SPIRE workload socket is absent at boot, the agent process exits immediately
+- If the SPIRE workload socket is absent at boot, the agent process exits immediately, via its own dedicated guard (P2-5) independent of decision-service reachability
 
-This means exfiltrating a *static API key* buys an attacker nothing on this data plane - identity is bound to the workload's cryptographic attestation, not a secret that can be copied out and replayed elsewhere. It does not mean a compromised container has nothing actionable in general: code running inside the agent's own container holds that workload's real SPIFFE identity for as long as it runs, and can use it to reach whatever that identity is authorized to reach - including, in this codebase, OPA's and the verifier's own network-exposed APIs (see Residual Limits, §5). What SPIFFE/SPIRE removes is the *static-secret-theft* attack; it does not remove the *I am now running inside the trusted workload* attack, which is a different threat entirely.
+This means exfiltrating a *static API key* buys an attacker nothing on this data plane - identity is bound to the workload's cryptographic attestation, not a secret that can be copied out and replayed elsewhere. It does not mean a compromised container has nothing actionable in general: code running inside the agent's own container holds that workload's real SPIFFE identity for as long as it runs, and can use it to reach whatever that identity is authorized to reach - which, since Phase 2, is the decision service's `/decide` route and nothing else (see Residual Limits, §5, for what that identity still lets a compromised agent do to the three observed tools). What SPIFFE/SPIRE removes is the *static-secret-theft* attack; it does not remove the *I am now running inside the trusted workload* attack, which is a different threat entirely.
 
 ### 3.2 Multi-Schema Pre-flight Inspection
 
-The interceptor maintains a **Pydantic v2 schema registry** (`TOOL_VALIDATORS`) that maps tool names to strict input schemas. Schema validation runs before the OPA call.
+The decision service maintains a **Pydantic v2 schema and tool registry** (`decision_service/schemas.py::TOOL_REGISTRY`) that maps tool names to a validator, an authority holder, a mechanism, and a conformance profile. Schema validation runs before the OPA call - this moved out of the agent process in Phase 2 along with everything else `intercept_tool_call` used to do in-process (`docs/adr/0008-decision-service-boundary.md`).
 
 This catches hallucinated or malformed payloads - missing required fields, wrong types, values outside expected ranges - and blocks them with a structured error before they consume a policy evaluation cycle.
 
-| Tool | Schema Enforces |
-| :--- | :--- |
-| `provision_cloud_server` | Instance type, region format, required tag fields (`cost_center`, `environment`, `encryption_at_rest`) |
-| `query_database` | Table name, query string, required `processing_purpose` declaration |
-| `deploy_to_production` | Repository name, environment target, required approval metadata |
-| Unregistered tool | **Blocked at registry lookup** - fail-closed before OPA is queried |
+| Tool | Schema Enforces | Profile | Exclusivity |
+| :--- | :--- | :--- | :--- |
+| `provision_cloud_server` | Instance type, region format, required tag fields (`cost_center`, `environment`, `encryption_at_rest`) | `observed` | n/a |
+| `query_database` | Table name, query string, required `processing_purpose` declaration | `observed` | n/a |
+| `deploy_to_production` | Repository name, environment target, required approval metadata | `observed` | n/a |
+| `read_vault_secret` | Secret name, restricted to an allowlist enforced in Rego | `mediated` | `demonstrated`, checked at decision-service startup - never taken from config alone (D13) |
+| Unregistered tool | **Blocked at registry lookup** - fail-closed before OPA is queried | — | — |
 
 ### 3.3 Multi-Tenant Policy Isolation
 
@@ -154,7 +168,7 @@ The control plane persists tenant config in SQLite, which is sufficient for the 
 
 Every policy decision is written to ImmuDB through an isolated verifier service wrapping the official `immudb-py` gRPC SDK. The verifier runs in its own process so its Protobuf dependency never reaches the interceptor, preserving the SPIFFE mTLS posture (see ADR-0001).
 
-**The record, not a message.** The ledger entry itself is a structured outcome record, not a free-text string: `outcome_type` (one of `policy_allow`, `policy_deny`, `schema_deny`, `fault`), `fault_class` when `outcome_type` is `fault`, the `policy_revision` that produced the decision, and the deny `reasons`. This is set at one point in the interceptor (`query_opa_policy`) and never reconstructed downstream by inspecting message text — a policy denial, a schema rejection, and an infrastructure fault are distinguishable everywhere: the ledger, `/audit`, the dashboard, and Prometheus. See `docs/adr/0005-outcome-taxonomy.md`.
+**The record, not a message.** The ledger entry itself is a structured outcome record, not a free-text string: `outcome_type` (one of `policy_allow`, `policy_deny`, `schema_deny`, `fault`), `fault_class` when `outcome_type` is `fault`, the `policy_revision` that produced the decision, and the deny `reasons`. This is set at one point in the decision service (`decision_service/main.py::query_opa_policy`, moved here from the interceptor in Phase 2) and never reconstructed downstream by inspecting message text — a policy denial, a schema rejection, and an infrastructure fault are distinguishable everywhere: the ledger, `/audit`, the dashboard, and Prometheus. Every record also carries `profile`, per-tool since Phase 2 (D13); a `mediated` record additionally carries `exclusivity`. See `docs/adr/0005-outcome-taxonomy.md` and `docs/adr/0008-decision-service-boundary.md`.
 
 **The hash, not the payload.** The entry carries `input_sha256`, a hash over the canonically serialized tool arguments, not the arguments themselves. The full arguments are stored separately, in the control plane's own database, keyed by `call_id` (minted at intercept, independent of ImmuDB's own transaction numbering) — erasable independently of the immutable ledger, so a GDPR Article 17 request can delete the arguments without touching the proof of what was decided or that the input hashed to that value. The content write happens *before* the ledger write; the ledger entry then records `content_state` (`present` or `unavailable`), and a content-store failure denies the call as a fault rather than recording a decision it cannot describe.
 
@@ -170,7 +184,7 @@ Coverage is enforced by integration tests run against a live ImmuDB on every CI 
 
 ### 3.5 Real-Time CISO Observability
 
-The Python interceptor middleware exports native **Prometheus metrics** (`ail_policy_decisions_total`, labeled by `status`, `outcome_type`, `fault_class`, and `tool_name` — all closed sets, never derived from Rego deny-message text, so a policy author rewording a denial cannot reshape metric cardinality). A bundled Grafana dashboard provides:
+The decision service exports native **Prometheus metrics** (`ail_policy_decisions_total`, labeled by `status`, `outcome_type`, `fault_class`, and `tool_name` — all closed sets, never derived from Rego deny-message text, so a policy author rewording a denial cannot reshape metric cardinality). Moved here from the agent process in Phase 2, along with the decision itself - the metric counts the decision, which is now made here. A bundled Grafana dashboard provides:
 
 - Live approved vs. denied decision counts
 - Per-tool breakdown of policy violation rate
@@ -346,7 +360,7 @@ The same gateway binary and the same Rego evaluation engine enforce both tenants
 | Grafana | `http://localhost:3000` | Prometheus metrics dashboard |
 | Prometheus | `http://localhost:9090` | Raw metrics scrape target |
 
-The Control Plane API and OPA are not published to the host (R1, Phase 1.3 completion pass - see Residual Limits, §5): both are management or record-writing surfaces, and a host-published loopback bind does not stop `host.docker.internal` from reaching it. Reach either from inside the compose network - `docker compose exec ail-control-plane python -c "import urllib.request; print(urllib.request.urlopen('http://opa:8181/v1/data/ail/config').read().decode())"` for OPA, `docker compose exec dashboard node -e "require('http').get('http://ail-control-plane:8002/health',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>console.log(d))})"` for the control plane (or any sibling container on the same network).
+The Control Plane API, OPA, and the decision service (Phase 2) are not published to the host (R1, Phase 1.3 completion pass, extended to decision-service in Phase 2 - see Residual Limits, §5): all three are management, record-writing, or decision-making surfaces, and a host-published loopback bind does not stop `host.docker.internal` from reaching it. Since Phase 2 they are also `backend`-only on the compose network - the agent (`langgraph-demo`) is `edge`-only and cannot reach any of them directly either. Reach one from inside the compose network - `docker compose exec ail-control-plane python -c "import urllib.request; print(urllib.request.urlopen('http://opa:8181/v1/data/ail/config').read().decode())"` for OPA, `docker compose exec dashboard node -e "require('http').get('http://ail-control-plane:8002/health',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>console.log(d))})"` for the control plane - from a sibling container that is also on `backend` (`ail-control-plane` and `dashboard` both are; `langgraph-demo` is not).
 
 ### 4.7 Kubernetes Deployment (Chart Unsupported)
 
@@ -392,14 +406,16 @@ This bounds prompt injection rather than eliminating it. The guarantee is precis
 | Control plane unreachable | OPA continues serving last-loaded bundle; new requests evaluate against cached policy |
 | Bundle ETag unchanged | OPA returns 304; no re-download; policy enforcement continues uninterrupted |
 
-### Residual Limits (Observed Profile)
+### Residual Limits (Mixed Profile, Since Phase 2)
 
-This gateway operates in the `observed` conformance profile (`docs/adr/0005-outcome-taxonomy.md`): the agent independently holds every tool's real authority, and nothing here takes that away from it. The limits below are not bugs pending a patch on this architecture - they are what "observed" means, stated precisely rather than left implicit. Phase 2 of [`docs/plan/ail-roadmap.md`](docs/plan/ail-roadmap.md) is the work that would move this gateway toward `mediated`; nothing in this repository does that yet.
+Before Phase 2, this gateway operated entirely in the `observed` conformance profile (`docs/adr/0005-outcome-taxonomy.md`): the agent independently held every tool's real authority. Phase 2 (`docs/adr/0008-decision-service-boundary.md`) made profile a per-tool property. Three tools remain `observed`, by design (D15) - they are not pruned for uniformity, they are the honest illustration that authority exclusivity is a property of a tool, not a deployment. One tool, `read_vault_secret`, is `mediated`, `exclusivity: demonstrated`. The limits below are stated per tool, not as a single deployment-wide caveat, because that distinction is now real rather than aspirational.
 
-- **A compromised container evades the interceptor entirely.** §1 and §3.1 above state this directly: `intercept_tool_call` is an in-process hook, not a network perimeter. Arbitrary code execution in the agent's own process can call a tool's real backend directly, or skip the interceptor call, and no record is produced either way - a bypassed call is, by construction, a call this gateway never saw.
-- **OPA's management API, the verifier's `/write` and `/verify`, ImmuDB's own ports, the control plane's record-writing routes, Envoy's admin API, and SPIRE's management API are not published to the host at all in the deployment compose (`docker-compose.yml`, R1, Phase 1.3 completion pass).** The previous fix (P13-1, P13-2) bound OPA and the verifier to `127.0.0.1` rather than every interface. That bind does not hold: `host.docker.internal` reaches a loopback-bound port from any container on the Docker host, including one on a network sharing nothing with this compose project - live-demonstrated against both OPA and the verifier in `docs/reports/phase-1-3-complete.md` (R1), and closed only by removing the publish entirely, which `tests/test_host_port_bindings.py` now enforces for the full set. This closes off-host and cross-container-on-the-host reach for the deployment compose. It does **not** close reach from anything inside the compose network itself, including the agent container: OPA's Data API and its unauthenticated management endpoints (`/v1/policies`, `/v1/data/system/bundles/*`), and the verifier's unauthenticated `/write` and `/verify`, are all still reachable by compose DNS name from any container on the same network. Phase 2's removal of the agent's own network path to these services is what actually closes that. `docker-compose.test.yml` still publishes OPA and the verifier to the host, loopback-bound, and ImmuDB and the control plane without even a loopback restriction - deliberately, so the integration suite can reach them from the host - and is never a deployment target.
-- **Tamper-evidence is not forgery-resistance.** The property ImmuDB's inclusion and consistency proofs actually provide protects a record already written from being modified without detection. It does not protect against a record being forged in the first place: **any party that can reach the verifier's network position can write arbitrary records to the ledger, and those records will carry valid inclusion proofs.** A forged `content_erasure` tombstone is one demonstrated instance of this (`docs/reports/phase-1-2-redteam.md`, U5); it is not the only shape a forged record could take. A record forged this way that omits the `profile` field renders as `"unknown"`, not as a genuine `"observed"` record (R3, Phase 1.3 completion pass) - this narrows what a forgery can pass off as, but a forger who includes a `profile` field is unaffected.
+- **The three `observed` tools (`provision_cloud_server`, `query_database`, `deploy_to_production`) are unaffected by Phase 2.** Their "execution" is a dummy function inside `framework_integration/langgraph_demo.py` itself - the agent's own container can call it directly, or call the decision service for evaluation and then act on a different decision entirely (the send-one-execute-another gap `docs/adr/0008-decision-service-boundary.md` states explicitly for D12). A bypassed call is, by construction, a call this gateway never saw; no record is produced either way. This is not a bug pending a later patch on these three tools specifically - it is what `observed` means for a tool whose authority the gateway never took away from the agent.
+- **`read_vault_secret` is different: an agent with arbitrary code execution in its own container cannot reach it.** It holds no MCP client config naming the tool, no network route to the decision service's internals or the vault server (the agent's container is on the `edge` network only; `opa`, `verifier`, `ail-control-plane`, `immudb`, and `decision-service` are all `backend`-only), and the vault server binary is never present in the agent's Docker image. The credential itself is a Compose secret attached only to the `decision-service` container, read by `vault_server.py` from a mounted file at its own startup, never handed to it by environment variable. Every bypass in the go/no-go spike's own list (`docs/reports/spike-mcp-mediation.md`, M2) fails - `tests/test_vault_tool_bypass.py` is the re-runnable form of this; `docs/reports/phase-2.md` has the live transcript.
+- **OPA's management API, the verifier's `/write` and `/verify`, ImmuDB's own ports, the control plane's record-writing routes, decision-service's own port, Envoy's admin API, and SPIRE's management API are not published to the host at all in the deployment compose (`docker-compose.yml`, R1, Phase 1.3 completion pass; extended to decision-service in Phase 2).** The previous fix (P13-1, P13-2) bound OPA and the verifier to `127.0.0.1` rather than every interface; that bind did not hold against `host.docker.internal` (R1, Phase 1.3 completion pass), closed by removing the publish entirely. Phase 2 closes the residual this section used to describe here - reach from *inside* the compose network, including the agent container: the agent no longer shares a network with any of these services at all (`edge`/`backend` split, `tests/test_decision_service_network_isolation.py`). `docker-compose.test.yml` still publishes OPA, the verifier, and decision-service to the host, loopback-bound, and ImmuDB and the control plane without even a loopback restriction - deliberately, so the integration suite can reach them from the host, and with no `edge`/`backend` split of its own (that file's own header comment explains why) - and is never a deployment target.
+- **Tamper-evidence is not forgery-resistance, for whatever can still reach the verifier.** The property ImmuDB's inclusion and consistency proofs actually provide protects a record already written from being modified without detection. It does not protect against a record being forged in the first place by anything that *can* reach the verifier's network position - which, since Phase 2, is only `decision-service` and `ail-control-plane`, not the agent. **A compromise of decision-service itself now carries the same forgery reach the agent used to have** - this is the trade Phase 2 makes explicitly (`docs/adr/0008-decision-service-boundary.md`'s Constraints section): one network-segmented, purpose-built service holding these credentials, instead of the general-purpose agent process an LLM's own tool-calling loop runs inside of. A forged `content_erasure` tombstone remains one demonstrated instance of this class (`docs/reports/phase-1-2-redteam.md`, U5). A record forged this way that omits the `profile` field renders as `"unknown"`, not as a genuine `"observed"` record (R3, Phase 1.3 completion pass); a forged record claiming `exclusivity: demonstrated` renders as `"declared"` unless its mechanism is one the gateway actually verified this boot (D13) - this narrows what a forgery can pass off as, but a forger who supplies a plausible `profile`/`exclusivity` pair reaching neither check is unaffected.
 - **Attribution has a ceiling, not a gap.** A record names a session or a process; in a future `attested` profile, a workload. It cannot name intent. A compromised agent's calls carry the same identity as its legitimate ones, because the credential authenticates the process, not the process's current loyalty - see `docs/adr/0005-outcome-taxonomy.md` and the go/no-go findings in `docs/reports/spike-mcp-mediation.md` this is drawn from. No profile this project defines changes that ceiling.
+- **`demonstrated` is a narrower claim than "the gateway checked something."** It means the gateway independently verified the specific mechanism a tool's authority rests on, at startup, this boot - not that the tool's configuration is trustworthy in general, and not that the mechanism can never be defeated by a class of attack this phase didn't consider (a decision-service host compromise with root access could, for instance, still read the mounted secret - the boundary D14 builds is specifically against the *agent's* principal, not against every conceivable attacker).
 - **`GET /tenants/{tenant_id}`, `GET /bundles/{tenant_id}` (R4, Phase 1.3 completion pass), and `POST`/`DELETE /content` are now access-controlled, but the credential they check is a single shared secret, not a per-caller identity** (ADR-0007) - this is the same authorization model the rest of the control plane already uses. OPA itself holds this credential (in `opa-config.yaml`, as an environment variable) in order to poll `GET /bundles/{tenant_id}` - a shared secret an automated poller holds is not a stronger guarantee than one a human operator holds.
 
 ---
@@ -431,6 +447,14 @@ Every intercepted call is assigned one `outcome_type` (`policy_allow`, `policy_d
 **ADR-006: Five Read-Time Verification States**
 
 A ledger entry cannot assert its own verification status - that would be self-certifying. `/audit` computes `verified`, `failed`, `unverifiable`, `asserted`, or `not_found` per entry, at request time, based on whether a `verifiedGet` was attempted and what it found; none of these states are stored in the immutable entry itself. See `docs/adr/0006-verification-states.md` for the full record.
+
+**ADR-007: Two-Tier Authorization for the Dashboard and Control Plane**
+
+Authorization splits at both layers, independently: the dashboard's own Next.js middleware requires HTTP Basic Auth (two independent read/write credential pairs) before any route handler runs, and the control plane's single API key splits into `CONTROL_PLANE_READ_KEY`/`CONTROL_PLANE_WRITE_KEY`, checked by two separate FastAPI dependencies. Neither layer implies the other - a caller reaching a mutating route must pass both checks, and each is tested independently, closing the open-relay shape red-team S6 found (an anonymous request through the dashboard's own proxy reached the control plane with no credential at all). See `docs/adr/0007-two-tier-authorization.md` for the full record.
+
+**ADR-008: The Decision Service Boundary and Per-Tool Authority Exclusivity**
+
+Phase 2 moves policy evaluation and the ledger write out of the agent process into a new `decision_service`, network-segmented from the agent (`edge`/`backend` Compose networks, bridged only by Envoy) - this makes the red-team's OPA-manifest-forgery, verifier-tombstone-forgery, and unauthenticated-policy-replacement attacks (U1, U5, U8) unrepresentable from the agent's position, not merely untested from it. Separately, the tool registry now declares an authority holder, a mechanism, and a claimed exclusivity kind per tool, and the gateway only ever records `exclusivity: demonstrated` for a mechanism it independently verified at startup - never from a tool's own configuration. One tool, `read_vault_secret`, is `mediated`: its credential is delivered to the decision service alone across an OS boundary (a Compose secret) the agent's container cannot cross. See `docs/adr/0008-decision-service-boundary.md` for the full record, including the explicit limit this does not close: an agent can still send one tool call for evaluation and execute a different one, for any tool whose authority it independently holds.
 
 ---
 

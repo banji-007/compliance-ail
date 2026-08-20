@@ -19,13 +19,18 @@ static_resources:
           route_config:
             name: local_route
             virtual_hosts:
-            - name: opa_backend
+            # Phase 2, D12: the agent no longer talks to OPA directly - it
+            # talks to the decision service, which now owns schema
+            # validation, the OPA query, and the ledger write. This is the
+            # same Stage-1 mTLS terminator retargeted at the relocated
+            # boundary, not a new identity mechanism.
+            - name: decision_service_backend
               domains: ["*"]
               routes:
               - match:
                   prefix: "/"
                 route:
-                  cluster: opa_cluster
+                  cluster: decision_service_cluster
           http_filters:
           - name: envoy.filters.http.router
             typed_config:
@@ -68,20 +73,20 @@ static_resources:
                         cluster_name: spire_agent
 
   clusters:
-  # OPA backend
-  - name: opa_cluster
+  # Decision service backend (Phase 2, D12 - retargeted from OPA).
+  - name: decision_service_cluster
     connect_timeout: 5s
     type: STRICT_DNS
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: opa_cluster
+      cluster_name: decision_service_cluster
       endpoints:
       - lb_endpoints:
         - endpoint:
             address:
               socket_address:
-                address: opa
-                port_value: 8181
+                address: decision-service
+                port_value: 8010
 
   # SPIRE Workload API (SDS source)
   - name: spire_agent

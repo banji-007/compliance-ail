@@ -25,6 +25,14 @@ keygen:
 	  echo "keygen: keys written to keys/signing.key and keys/signing.pub"; \
 	fi
 	@chmod 644 keys/signing.key keys/signing.pub
+	@mkdir -p decision_service/secrets
+	@if [ -f decision_service/secrets/vault_api_token.txt ]; then \
+	  echo "keygen: decision_service/secrets/vault_api_token.txt already exists — reusing."; \
+	else \
+	  openssl rand -hex 32 > decision_service/secrets/vault_api_token.txt && \
+	  echo "keygen: vault token written to decision_service/secrets/vault_api_token.txt"; \
+	fi
+	@chmod 600 decision_service/secrets/vault_api_token.txt
 
 ## Boot CI infrastructure, run the full pytest suite, then tear down.
 ## Starts with "down -v" to ensure a hermetic run: any previous stack and
@@ -72,7 +80,8 @@ test-integration:
 	DASHBOARD_WRITE_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_WRITE_USER" ) ); \
 	DASHBOARD_WRITE_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_WRITE_PASSWORD" ) ); \
 	SPIRE_DISABLED=true \
-	  OPA_URL=http://localhost:8181/v1/data/ail/main/allow \
+	  OPA_URL=http://localhost:8181/v1/data/ail/main/evaluation \
+	  DECISION_SERVICE_URL=http://localhost:8010/decide \
 	  AIL_BUNDLE_NAME=$${AIL_BUNDLE_NAME:-ail-policies} \
 	  CONTROL_PLANE_URL=http://localhost:8002 \
 	  IMMUDB_URL=http://localhost:8080 \

@@ -77,6 +77,11 @@ class DeployToProductionInput(BaseModel):
     bypass_ci: bool = Field(default=False, description="Whether to skip automated CI/CD checks. Policy strictly prohibits setting this to True.")
 
 
+class ReadVaultSecretInput(BaseModel):
+    """Input schema for the D14 demonstration tool (Phase 2)."""
+    secret_name: str = Field(..., description="Name of the vault secret to read (e.g., 'db_master_password', 'payment_gateway_key')")
+
+
 def execute_provision_cloud_server(instance_type: str, region: str, cost_per_hour: float, tags: dict) -> str:
     """Dummy function that simulates cloud server provisioning."""
     return (
@@ -320,6 +325,63 @@ def deploy_to_production(
     return result
 
 
+@tool(args_schema=ReadVaultSecretInput)
+def read_vault_secret(secret_name: str) -> str:
+    """Read a named secret from the compliance vault (Phase 2, D14 demonstration tool).
+
+    Unlike the other three tools, this one is not executed by the agent at
+    all: the decision service holds the only credential able to reach the
+    vault, and performs the read itself on approval. There is no local
+    execute_read_vault_secret function here to call - if the agent tried to
+    bypass this and read the vault directly, it would find no route to it
+    (see tests/test_vault_tool_bypass.py) and no credential in its own
+    environment or filesystem to do so with either way.
+    """
+    logging.debug("Tool invoked by LLM: %s", __name__)
+
+    args = {"secret_name": secret_name}
+
+    decision = intercept_tool_call("read_vault_secret", args, agent_id="langgraph_agent")
+
+    if decision.get("status") == "APPROVED" and not decision.get("ledger_tx_id"):
+        return (
+            "BLOCKED by AIL: Audit ledger write failed or was bypassed. "
+            "Execution halted — no action is taken without a verifiable audit record."
+        )
+
+    ledger_tx_id = decision.get("ledger_tx_id")
+    pipeline_prefix = (
+        f"[Agent Request] -> [AIL Intercept] -> [Policy Engine Decision] "
+        f"-> [Ledger tx] {ledger_tx_id}"
+    )
+
+    if decision["status"] == "APPROVED":
+        # The decision service already performed the vault read (it is the
+        # only thing on the network with the credential to do so) - the
+        # agent only ever sees the result it hands back, never the
+        # credential itself.
+        result = f"Vault secret '{secret_name}' retrieved: {decision.get('result')}"
+        print(f"{pipeline_prefix} -> [Mediated Execution] {result}")
+    elif decision.get("outcome_type") == "fault":
+        fault_class = decision.get("fault_class")
+        result = (
+            f"AIL INFRASTRUCTURE FAULT ({fault_class}, not a policy denial): {decision['message']}\n"
+            f"This request was not evaluated against policy - the compliance "
+            f"gateway could not confirm the decision. An operator should "
+            f"investigate {fault_class}; retrying the same parameters will not fix this."
+        )
+        print(f"{pipeline_prefix} -> [Infrastructure Fault: {fault_class}] {decision['message']}")
+    else:
+        result = (
+            f"BLOCKED by AIL: {decision['message']}\n"
+            f"Original parameters: secret_name={secret_name!r}. "
+            f"Retry the tool with these exact parameters corrected as instructed."
+        )
+        print(f"{pipeline_prefix} -> [Block] {decision['message']}")
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Tool registry — single source of truth for LLM binding and dispatch
 # ---------------------------------------------------------------------------
@@ -328,6 +390,7 @@ TOOL_REGISTRY = {
     "provision_cloud_server": provision_cloud_server,
     "query_database": query_database,
     "deploy_to_production": deploy_to_production,
+    "read_vault_secret": read_vault_secret,
 }
 
 # ---------------------------------------------------------------------------
@@ -347,7 +410,9 @@ For provision_cloud_server: extract instance_type, region, cost_per_hour, enviro
 
 For query_database: extract target_table, query, processing_purpose, and masking_enabled from the user prompt and pass them exactly as stated.
 
-For deploy_to_production: extract repository_name, commit_hash, environment, approval_ticket, and bypass_ci from the user prompt and pass them exactly as stated. If no approval ticket is mentioned, pass an empty string."""
+For deploy_to_production: extract repository_name, commit_hash, environment, approval_ticket, and bypass_ci from the user prompt and pass them exactly as stated. If no approval ticket is mentioned, pass an empty string.
+
+For read_vault_secret: extract secret_name from the user prompt and pass it exactly as stated."""
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(list(TOOL_REGISTRY.values()))
 
@@ -459,6 +524,14 @@ if __name__ == "__main__":
 
                 # deploy_to_production: should be DENIED by SOC2 (no approval ticket)
                 run("Deploy the auth-service repo at commit abc123def456 to production with no approval ticket and bypass_ci=false.")
+
+                # read_vault_secret: should be APPROVED (allowlisted secret) - the
+                # only tool in this demo the agent does not execute itself; the
+                # decision service performs the mediated read (Phase 2, D14).
+                run("Read the vault secret named db_master_password.")
+
+                # read_vault_secret: should be DENIED (not on the vault-access allowlist)
+                run("Read the vault secret named root_ssh_private_key.")
 
                 # Show ledger notice
                 print("\n" + "=" * 70)

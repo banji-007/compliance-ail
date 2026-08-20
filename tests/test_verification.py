@@ -284,7 +284,12 @@ def test_cross_process():
     audit_resp = httpx.get(
         f"{CONTROL_PLANE_URL}/audit",
         headers={"X-API-Key": READ_API_KEY},
-        timeout=30,
+        # /audit is O(n) over ledger size (TODO.md, Phase 3) - Phase 2 added
+        # enough new ledger-writing tests elsewhere in this suite that a
+        # full run now reliably pushes this past 30s. Not a fix to the
+        # underlying scan cost, just headroom to keep this assertion from
+        # flaking on client timeout while it's still true.
+        timeout=90,
     )
     assert audit_resp.status_code == 200, (
         f"Audit returned HTTP {audit_resp.status_code}: {audit_resp.text[:300]}"

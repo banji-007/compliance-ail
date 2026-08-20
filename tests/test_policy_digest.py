@@ -11,22 +11,61 @@ call denies and nothing is written to the ledger - there is no placeholder.
 
 Requires the docker-compose.test.yml stack (OPA + control plane + ImmuDB +
 verifier). SPIRE_DISABLED=true bypasses mTLS, matching Makefile:45-53.
+
+Migrated in Phase 2 (P2-1): schema validation, the OPA query, and the
+ledger write all moved from interceptor/middleware.py to
+decision_service/main.py (D12). Both tests below exercise exactly that
+internal pipeline (not the agent's mTLS client leg), so they now call
+decision_main.decide() in-process via the same `_decide()` pattern
+tests/test_outcome_types.py established, rather than
+middleware.intercept_tool_call (now just an HTTP client to
+decision_service).
 """
 
+import asyncio
 import os
 import sys
 
 import httpx
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+
+import importlib.util as _importlib_util
+
+# decision_service/main.py's own `from schemas import ...` needs this
+# directory on sys.path - loading main.py itself via spec_from_file_location
+# below (to dodge the module-name collision, see _load_decision_service_main)
+# does not add its own directory to sys.path automatically the way a normal
+# package-relative import would.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "decision_service"))
+
+
+def _load_decision_service_main():
+    """decision_service/main.py and control_plane/main.py are both named
+    main.py - a bare `import main` in one test file clobbers whichever
+    module sys.modules["main"] already held for every other test file in
+    the same pytest session (Python caches by module name, not by which
+    sys.path entry was active when the import statement ran - confirmed
+    live: test_verification.py's control-plane tests got decision_service's
+    module back instead, AttributeError on a function that only exists in
+    control_plane/main.py). Loading this one under its own explicit module
+    name sidesteps the collision instead of depending on import order."""
+    spec = _importlib_util.spec_from_file_location(
+        "decision_service_main",
+        os.path.join(os.path.dirname(__file__), "..", "decision_service", "main.py"),
+    )
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules["decision_service_main"] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
-os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
+os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluation")
 
-import middleware  # noqa: E402
+decision_main = _load_decision_service_main()
 
-OPA_BASE = os.environ["OPA_URL"].replace("/v1/data/ail/main/allow", "")
+OPA_BASE = os.environ["OPA_URL"].replace("/v1/data/ail/main/evaluation", "")
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
 READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 
@@ -41,6 +80,11 @@ _APPROVED_ARGS = {
         "project": "webapp",
     },
 }
+
+
+def _decide(tool_name, tool_args, agent_id="test_digest_agent") -> dict:
+    req = decision_main.DecideRequest(tool_name=tool_name, tool_args=tool_args, agent_id=agent_id)
+    return asyncio.run(decision_main.decide(req))
 
 
 def _opa_reachable() -> bool:
@@ -94,7 +138,7 @@ def test_recorded_digest_matches_opa_not_interceptor_belief(monkeypatch):
     _compute_policy_hash, this environment variable is exactly what
     selected which bundle's ETag got HEADed and stamped into the ledger,
     independent of what OPA was actually evaluating against. Under the
-    fix, the interceptor no longer reads AIL_TENANT_ID at all for this
+    fix, decision_service no longer reads AIL_TENANT_ID at all for this
     purpose - the assertion below is that changing it has no effect on
     the recorded digest, because the digest now comes from OPA itself.
     """
@@ -102,7 +146,7 @@ def test_recorded_digest_matches_opa_not_interceptor_belief(monkeypatch):
 
     live_revision = _opa_live_revision()
 
-    response = middleware.intercept_tool_call(
+    response = _decide(
         "provision_cloud_server", _APPROVED_ARGS, "test_digest_agent"
     )
     assert response["status"] == "APPROVED", f"Expected APPROVED, got: {response}"
@@ -138,11 +182,11 @@ def test_digest_unavailable_denies_and_writes_a_fault_record(monkeypatch):
     the query at a rule path OPA has never heard of.
     """
     monkeypatch.setattr(
-        middleware, "_OPA_EVAL_URL",
+        decision_main, "_OPA_URL",
         OPA_BASE + "/v1/data/ail/main/nonexistent_entrypoint",
     )
 
-    response = middleware.intercept_tool_call(
+    response = _decide(
         "provision_cloud_server", _APPROVED_ARGS, "test_digest_agent"
     )
 

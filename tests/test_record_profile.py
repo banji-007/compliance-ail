@@ -1,14 +1,18 @@
 """
-tests/test_record_profile.py - P13-8, Phase 1.3.
+tests/test_record_profile.py - P13-8 (Phase 1.3), extended by P2-3 (Phase 2,
+D13).
 
 Every record now carries a conformance profile, from a closed set:
 "observed" | "mediated" | "attested" (see docs/adr/0005-outcome-taxonomy.md).
-This codebase can only ever produce "observed" - the agent independently
-holds every tool's authority, so a bypass of this gateway is possible and
-would leave no record at all (see the ADR's own profile table). Checked
-against the raw ImmuDB value directly, the same way test_raw_ledger_fields.py
-checks other fields the /audit projection could silently drop or fabricate,
-and against a live /audit response for the same reason.
+Before Phase 2 this codebase could only ever produce "observed" - the agent
+independently held every tool's authority. D13/P2-3 makes profile a
+per-tool property: the three Python-function tools still produce
+"observed"; the one D14 tool (read_vault_secret) produces "mediated", with
+an accompanying "exclusivity" field the three observed tools never carry at
+all. Checked against the raw ImmuDB value directly, the same way
+test_raw_ledger_fields.py checks other fields the /audit projection could
+silently drop or fabricate, and against a live /audit response for the same
+reason.
 
 Requires the docker-compose.test.yml stack. SPIRE_DISABLED=true bypasses
 mTLS, matching Makefile:45-53.
@@ -26,7 +30,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
-os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
+os.environ.setdefault("DECISION_SERVICE_URL", "http://localhost:8010/decide")
 
 import middleware  # noqa: E402
 
@@ -139,7 +143,7 @@ def test_raw_tombstone_record_carries_observed_profile():
         f"{CONTROL_PLANE_URL}/audit",
         params={"limit": 200},
         headers={"X-API-Key": READ_API_KEY},
-        timeout=30,
+        timeout=90,  # generous: /audit is O(n) over ledger size (TODO.md, Phase 3), and this suite accumulates many entries in one session
     ).json()["entries"]
     matching = [e for e in entries if e["tx_id"] == r["ledger_tx_id"]]
     assert matching, f"tx_id {r['ledger_tx_id']} not found in /audit"
@@ -201,7 +205,7 @@ def test_audit_forged_profile_less_record_renders_as_unknown_not_observed():
         f"{CONTROL_PLANE_URL}/audit",
         params={"limit": 500},
         headers={"X-API-Key": READ_API_KEY},
-        timeout=30,
+        timeout=90,  # generous: /audit is O(n) over ledger size (TODO.md, Phase 3), and this suite accumulates many entries in one session
     ).json()["entries"]
     matching = [e for e in entries if e["agent_id"] == agent_id]
     assert matching, f"forged entry for {agent_id} not found in /audit"
@@ -231,8 +235,122 @@ def test_audit_response_carries_profile_from_closed_set():
         f"{CONTROL_PLANE_URL}/audit",
         params={"limit": 200},
         headers={"X-API-Key": READ_API_KEY},
-        timeout=30,
+        timeout=90,  # generous: /audit is O(n) over ledger size (TODO.md, Phase 3), and this suite accumulates many entries in one session
     ).json()["entries"]
     matching = [e for e in entries if e["tx_id"] == r["ledger_tx_id"]]
     assert matching, f"tx_id {r['ledger_tx_id']} not found in /audit"
     assert matching[0]["profile"] in _CLOSED_PROFILE_SET, matching[0]
+
+
+# ---------------------------------------------------------------------------
+# P2-3 (Phase 2, D13): profile is now per-tool, not a single deployment
+# constant. These tests are the phase's own "Demonstrate" criterion: one
+# installation producing "observed" records for the Python-function tools
+# and "mediated" records for the D14 tool, in the same session - plus the
+# "Enforce" criterion that no path emits a record without both fields.
+# ---------------------------------------------------------------------------
+
+@requires_stack
+def test_raw_decision_record_for_mediated_tool_carries_mediated_profile_and_demonstrated_exclusivity():
+    """
+    Mutation: restore the single-constant profile (make log_tool_call
+    ignore its profile/exclusivity parameters and always write "observed").
+    This test must fail against that mutation - the vault tool's raw record
+    would then read "observed" with no exclusivity key at all.
+    """
+    probe_agent_id = f"profile_probe_mediated_{uuid.uuid4().hex}"
+    r = middleware.intercept_tool_call(
+        "read_vault_secret", {"secret_name": "db_master_password"}, probe_agent_id,
+    )
+    assert "ledger_tx_id" in r, f"Expected a recorded, approved call, got: {r}"
+    assert r["status"] == "APPROVED", f"db_master_password is allowlisted - expected APPROVED: {r}"
+
+    entry = _find_raw_decision_by_agent_id(probe_agent_id)
+    assert entry.get("profile") == "mediated", f"Expected 'mediated': {entry}"
+    assert entry.get("exclusivity") == "demonstrated", (
+        f"Expected 'demonstrated' - decision-service's own startup check for "
+        f"mcp_stdio_secret_mount must have passed in a correctly configured stack: {entry}"
+    )
+
+
+@requires_stack
+def test_raw_decision_record_for_observed_tool_carries_no_exclusivity_key_at_all():
+    """
+    The converse of the mediated case: an "observed" record must not carry
+    an exclusivity key at all - not null-as-a-value, an actual absence, so
+    a consumer can distinguish "not applicable" from "checked and found
+    wanting".
+    """
+    probe_agent_id = f"profile_probe_observed_{uuid.uuid4().hex}"
+    r = middleware.intercept_tool_call(
+        "provision_cloud_server",
+        {
+            "instance_type": "t3.micro", "region": "us-east-1", "cost_per_hour": 5.0,
+            "tags": {"environment": "dev", "data_classification": "internal", "cost_center": "engineering", "project": "webapp"},
+        },
+        probe_agent_id,
+    )
+    assert "ledger_tx_id" in r, f"Expected a recorded call, got: {r}"
+
+    entry = _find_raw_decision_by_agent_id(probe_agent_id)
+    assert entry.get("profile") == "observed", entry
+    assert "exclusivity" not in entry, (
+        f"An 'observed' record must not carry an exclusivity key at all: {entry}"
+    )
+
+
+@requires_stack
+def test_one_session_produces_both_observed_and_mediated_records():
+    """
+    P2-3's own Demonstrate criterion, verbatim: one installation producing
+    "observed" records for the Python-function tools and "mediated" records
+    for the D14 tool, in the same session.
+    """
+    observed_agent_id = f"same_session_observed_{uuid.uuid4().hex}"
+    mediated_agent_id = f"same_session_mediated_{uuid.uuid4().hex}"
+
+    observed_r = middleware.intercept_tool_call(
+        "query_database",
+        {
+            "target_table": "orders", "query": "SELECT * FROM orders LIMIT 1",
+            "processing_purpose": "billing", "masking_enabled": True,
+        },
+        observed_agent_id,
+    )
+    mediated_r = middleware.intercept_tool_call(
+        "read_vault_secret", {"secret_name": "payment_gateway_key"}, mediated_agent_id,
+    )
+    assert "ledger_tx_id" in observed_r, observed_r
+    assert "ledger_tx_id" in mediated_r, mediated_r
+
+    observed_entry = _find_raw_decision_by_agent_id(observed_agent_id)
+    mediated_entry = _find_raw_decision_by_agent_id(mediated_agent_id)
+
+    assert observed_entry["profile"] == "observed"
+    assert "exclusivity" not in observed_entry
+    assert mediated_entry["profile"] == "mediated"
+    assert mediated_entry["exclusivity"] == "demonstrated"
+
+
+@requires_stack
+def test_audit_response_surfaces_exclusivity_for_mediated_records():
+    """The /audit projection must also surface exclusivity, not just
+    profile - same "producer forgot to read the field back out" risk
+    test_audit_response_carries_profile_from_closed_set already guards for
+    profile."""
+    probe_agent_id = f"profile_probe_audit_mediated_{uuid.uuid4().hex}"
+    r = middleware.intercept_tool_call(
+        "read_vault_secret", {"secret_name": "db_master_password"}, probe_agent_id,
+    )
+    assert "ledger_tx_id" in r, f"Expected a recorded, approved call, got: {r}"
+
+    entries = httpx.get(
+        f"{CONTROL_PLANE_URL}/audit",
+        params={"limit": 200},
+        headers={"X-API-Key": READ_API_KEY},
+        timeout=90,  # generous: /audit is O(n) over ledger size (TODO.md, Phase 3), and this suite accumulates many entries in one session
+    ).json()["entries"]
+    matching = [e for e in entries if e["tx_id"] == r["ledger_tx_id"]]
+    assert matching, f"tx_id {r['ledger_tx_id']} not found in /audit"
+    assert matching[0]["profile"] == "mediated", matching[0]
+    assert matching[0]["exclusivity"] == "demonstrated", matching[0]

@@ -585,8 +585,12 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
         verification   - {state, state_id, detail, error_class}; state is one
                           of verified | failed | unverifiable | asserted | not_found
         profile        - conformance profile this record was produced under
-                          (P13-8); "observed" is the only value that exists
-                          today. See docs/adr/0005-outcome-taxonomy.md.
+                          (P13-8): "observed" or "mediated". See
+                          docs/adr/0005-outcome-taxonomy.md.
+        exclusivity    - "demonstrated" | "declared" | null (D13, Phase 2);
+                          only ever set for a "mediated" record - the
+                          gateway's own verified answer, never the tool's
+                          config claim. null for every "observed" record.
     """
     if not IMMUDB_USER or not IMMUDB_PASSWORD:
         raise HTTPException(
@@ -733,6 +737,12 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
                 # (docs/adr/0005-outcome-taxonomy.md) so it cannot be
                 # confused with a real profile value.
                 "profile":         log_entry.get("profile", "unknown"),
+                # D13/P2-3 (Phase 2): only ever set for a mediated record -
+                # decision_service only writes this key at all when
+                # resolve_exclusivity returned non-None (immudb_ledger.py's
+                # log_tool_call omits the key entirely otherwise, so a
+                # missing key here means "not applicable", not "unknown").
+                "exclusivity":     log_entry.get("exclusivity"),
             })
         except Exception as exc:
             logger.warning("Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc)

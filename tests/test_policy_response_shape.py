@@ -10,18 +10,53 @@ revision).
 Pure unit tests - no live stack. httpx.Client is mocked entirely, matching
 the red-team's own repro style, and query_opa_policy is called directly
 (not intercept_tool_call), so no ledger/content infra is needed either.
+
+Migrated in Phase 2 (P2-1): query_opa_policy moved from
+interceptor/middleware.py to decision_service/main.py (D12) - schema
+validation and the OPA evaluation query are now decision_service's concern
+entirely, unreachable from the agent process. This file's assertions are
+unchanged in substance, only their target.
 """
 
 import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+
+import importlib.util as _importlib_util
+
+# decision_service/main.py's own `from schemas import ...` needs this
+# directory on sys.path - loading main.py itself via spec_from_file_location
+# below (to dodge the module-name collision, see _load_decision_service_main)
+# does not add its own directory to sys.path automatically the way a normal
+# package-relative import would.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "decision_service"))
+
+
+def _load_decision_service_main():
+    """decision_service/main.py and control_plane/main.py are both named
+    main.py - a bare `import main` in one test file clobbers whichever
+    module sys.modules["main"] already held for every other test file in
+    the same pytest session (Python caches by module name, not by which
+    sys.path entry was active when the import statement ran - confirmed
+    live: test_verification.py's control-plane tests got decision_service's
+    module back instead, AttributeError on a function that only exists in
+    control_plane/main.py). Loading this one under its own explicit module
+    name sidesteps the collision instead of depending on import order."""
+    spec = _importlib_util.spec_from_file_location(
+        "decision_service_main",
+        os.path.join(os.path.dirname(__file__), "..", "decision_service", "main.py"),
+    )
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules["decision_service_main"] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
-os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
+os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluation")
 
-import middleware  # noqa: E402
+decision_main = _load_decision_service_main()
 
 _VALID_ARGS = {
     "instance_type": "t3.micro",
@@ -64,8 +99,8 @@ _RESPONSE_BODY: dict = {}
 def _query_with_mocked_response(monkeypatch, body: dict) -> dict:
     global _RESPONSE_BODY
     _RESPONSE_BODY = body
-    monkeypatch.setattr(middleware.httpx, "Client", _FakeClient)
-    return middleware.query_opa_policy("provision_cloud_server", _VALID_ARGS)
+    monkeypatch.setattr(decision_main.httpx, "Client", _FakeClient)
+    return decision_main.query_opa_policy("provision_cloud_server", _VALID_ARGS)
 
 
 def test_missing_reasons_and_revision_is_a_fault(monkeypatch):

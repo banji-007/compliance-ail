@@ -24,10 +24,14 @@ load_dotenv()
 
 _VERIFIER_URL = os.getenv("VERIFIER_URL", "http://verifier:8003")
 
-# P13-8 (Phase 1.3): the only conformance profile this codebase can produce.
-# The agent independently holds every tool's authority - nothing here takes
-# that away from it - so "observed" is not a deployment choice, it is what
-# this architecture is. See docs/adr/0005-outcome-taxonomy.md.
+# P13-8 (Phase 1.3) introduced this as a single deployment-wide constant.
+# D13/P2-3 (Phase 2) makes profile a property of the tool, not the
+# deployment - log_tool_call now takes profile per call, from the caller's
+# own registry (decision_service/schemas.py::TOOL_REGISTRY). This constant
+# survives only as the default for callers that don't specify one (none do,
+# in this codebase, but the control plane's own tombstone-writing path
+# defines its own independent copy for the same reason it always has - see
+# control_plane/main.py::RECORD_PROFILE).
 RECORD_PROFILE = "observed"
 
 
@@ -57,6 +61,8 @@ class ImmuDBLedger:
         policy_revision: str | None,
         reasons: list,
         content_state: str,
+        profile: str = RECORD_PROFILE,
+        exclusivity: str | None = None,
     ) -> int:
         """
         Write an outcome record to ImmuDB via the verifier's verifiedSet.
@@ -71,6 +77,13 @@ class ImmuDBLedger:
         dict-shaped ("unavailable") - "erased" is never written here, it is
         inferred at read time from content_state plus whether the
         content-store row still exists (control_plane/main.py::get_audit).
+
+        profile and exclusivity (D13/P2-3, Phase 2) are supplied per call by
+        the caller, from decision_service/schemas.py::TOOL_REGISTRY and
+        resolve_exclusivity - never invented here, and never trusted from
+        anything the tool's own config claims about itself. exclusivity is
+        only ever non-None for a mediated tool; every record carries a
+        profile, but only a mediated one also carries an exclusivity kind.
 
         The verifier performs inclusion-proof and consistency-proof verification
         on every write. A response with verified: false or any transport error
@@ -98,8 +111,10 @@ class ImmuDBLedger:
             "policy_revision": policy_revision,
             "reasons": reasons,
             "content_state": content_state,
-            "profile": RECORD_PROFILE,
+            "profile": profile,
         }
+        if exclusivity is not None:
+            log_entry["exclusivity"] = exclusivity
         serialized  = json.dumps(log_entry, separators=(",", ":"))
         key         = f"tool_call:{agent_id}:{uuid.uuid4().hex}:{tool_name}"
         encoded_key = base64.b64encode(key.encode()).decode()

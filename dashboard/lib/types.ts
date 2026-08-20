@@ -27,22 +27,37 @@ export type TenantUpdate = Partial<Omit<Tenant, "id">>;
 export type OutcomeType = "policy_allow" | "policy_deny" | "schema_deny" | "fault";
 
 /**
- * The fault classes /audit can actually send, not the full six-member
- * closed set (docs/adr/0005-outcome-taxonomy.md). Two of the six
- * (verifier_unreachable, content_store_unreachable) are documented as
- * never producing a ledger record - each is discovered in a path that
- * itself precedes, or is, the write that would record it - so they can
- * never reach this API. R5 (Phase 1.3 completion pass, red-team V1
- * finding 3): this type previously included verifier_unreachable (which
- * cannot reach here) and omitted malformed_policy_response (which does -
- * live-forced through the real interceptor and confirmed to produce a
- * ledger entry with fault_class: "malformed_policy_response").
+ * The fault classes /audit can actually send, not the full closed set
+ * (docs/adr/0005-outcome-taxonomy.md). verifier_unreachable and
+ * content_store_unreachable are documented as never producing a ledger
+ * record - each is discovered in a path that itself precedes, or is, the
+ * write that would record it - so they can never reach this API. R5 (Phase
+ * 1.3 completion pass, red-team V1 finding 3): this type previously
+ * included verifier_unreachable (which cannot reach here) and omitted
+ * malformed_policy_response (which does - live-forced through the real
+ * interceptor and confirmed to produce a ledger entry with fault_class:
+ * "malformed_policy_response").
+ *
+ * spiffe_unavailable and decision_service_unreachable (Phase 2, D12) are
+ * now the agent's own client-leg faults (interceptor/middleware.py) - the
+ * decision service (where mTLS used to be checked, before OPA) is never
+ * even reached when either fires, so there is nothing for it to have
+ * written a ledger entry about. Same category as verifier_unreachable:
+ * never reaches here, deliberately omitted. Before Phase 2,
+ * spiffe_unavailable belonged to this set; it does not any more, because
+ * the fault now happens strictly before the network call this API's data
+ * comes from.
+ *
+ * tool_execution_failed (Phase 2, D14) is different: the decision service
+ * did reach the point of writing a ledger entry (schema validated, policy
+ * allowed, content stored) before the mediated tool call itself failed, so
+ * this one DOES reach /audit - included here for that reason.
  */
 export type FaultClass =
   | "opa_unreachable"
   | "revision_unavailable"
-  | "spiffe_unavailable"
   | "malformed_policy_response"
+  | "tool_execution_failed"
   | null;
 
 /**
@@ -134,16 +149,26 @@ export interface AuditEntry {
   payload_state: "present" | "erased" | "lost" | "unavailable" | "erasure_conflict";
   verification: Verification;
   /**
-   * Conformance profile this record was produced under (P13-8). "observed"
-   * is the only value that exists today - the agent independently holds
-   * every tool's authority, so a bypass of this gateway is possible and
-   * would leave no record at all. See docs/adr/0005-outcome-taxonomy.md.
+   * Conformance profile this record was produced under (P13-8), now
+   * per-tool rather than a single deployment constant (D13, Phase 2):
+   * "observed" for the three Python-function tools, "mediated" for the one
+   * D14 tool whose authority the gateway holds exclusively. See
+   * docs/adr/0005-outcome-taxonomy.md and
+   * docs/adr/0008-decision-service-boundary.md.
    *
    * "unknown" (R3, Phase 1.3 completion pass) is not a profile - it is
    * what /audit renders for a record that structurally lacks the field,
    * so that case is never confused with a genuine "observed" record.
    */
   profile: "observed" | "mediated" | "attested" | "unknown";
+  /**
+   * D13 (Phase 2): only ever set for a "mediated" record, and only ever
+   * the gateway's own verified answer, never a tool's config claim (see
+   * decision_service/schemas.py::resolve_exclusivity_for). null for every
+   * "observed" record - not "not applicable" rendered as a string, an
+   * actual absence of the key.
+   */
+  exclusivity: "demonstrated" | "declared" | null;
 }
 
 export interface AuditResponse {

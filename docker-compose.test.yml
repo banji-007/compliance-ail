@@ -5,20 +5,33 @@
 #   opa                — policy engine; polls bundle from control plane
 #   immudb             — tamper-evident audit ledger
 #   verifier           — isolated immudb-py (gRPC) wrapper
+#   decision-service   — Phase 2, D12: schema/OPA/ledger, moved out of the
+#                         agent process. Published to the host (unlike
+#                         docker-compose.yml's backend-only placement) for
+#                         the same "tests run on the host" reason every
+#                         other service here is.
 #   dashboard          — Next.js dashboard, for D6's caller-auth tests only
 #                         (tests/test_dashboard_auth.py); no other test
 #                         exercises it.
 #
 # SPIRE, Envoy, Grafana, and Prometheus are NOT included. Tests run with
-# SPIRE_DISABLED=true so mTLS is bypassed.
+# SPIRE_DISABLED=true so mTLS is bypassed - this file has no edge/backend
+# network split either, for the same reason: it is a flat, deliberately
+# permissive topology for pytest running on the host, not a mirror of
+# docker-compose.yml's production segmentation. P2-1's network-isolation
+# test (tests/test_decision_service_network_isolation.py) asserts the
+# segmentation statically against docker-compose.yml's own YAML, and this
+# file is deliberately excluded from that assertion - same pattern
+# tests/test_host_port_bindings.py already established for port bindings.
 #
 # Deliberately more permissive than docker-compose.yml (R1, Phase 1.3
 # completion pass): ail-control-plane (8002), immudb (3322 and 8080), opa
-# (8181, loopback-bound), and verifier (8003, loopback-bound) are all
-# published to the host here, because the test suite runs on the host and
-# needs to reach every service directly - the interceptor under test, the
-# raw ImmuDB scans in tests/test_verification.py and tests/test_record_
-# profile.py, and the direct OPA queries in tests/test_bundle_revision_
+# (8181, loopback-bound), verifier (8003, loopback-bound), and
+# decision-service (8010, loopback-bound) are all published to the host
+# here, because the test suite runs on the host and needs to reach every
+# service directly - the interceptor under test, the raw ImmuDB scans in
+# tests/test_verification.py and tests/test_record_profile.py, and the
+# direct OPA/decision-service queries in tests/test_bundle_revision_
 # attribution.py all connect over localhost. This file is not a deployment
 # target and is never published beyond CI/local test runs.
 #
@@ -136,6 +149,41 @@ services:
       retries: 6
       start_period: 20s
 
+  decision-service:
+    build:
+      context: .
+      dockerfile: decision_service/Dockerfile
+    ports:
+      # Loopback-only, same convention as opa/verifier above.
+      - "127.0.0.1:8010:8010"
+      # Prometheus metrics (moved here from the agent process, D12) -
+      # tests/test_content_states.py::_metric_total reads this from the host.
+      - "127.0.0.1:8000:8000"
+    environment:
+      - OPA_URL=http://opa:8181/v1/data/ail/main/evaluation
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
+      - VERIFIER_URL=http://verifier:8003
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY:-test-write-key}
+      - VAULT_TOKEN_PATH=/run/secrets/vault_api_token
+    secrets:
+      - source: vault_api_token
+        target: vault_api_token
+        mode: 0400
+    depends_on:
+      opa:
+        condition: service_healthy
+      verifier:
+        condition: service_healthy
+      ail-control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8010/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
   # D6 (Phase 1.1) only - dashboard/middleware.ts's own caller auth, tested
   # by tests/test_dashboard_auth.py. No other test in this suite depends on
   # this service being up.
@@ -164,6 +212,10 @@ services:
       timeout: 3s
       retries: 12
       start_period: 25s
+
+secrets:
+  vault_api_token:
+    file: ./decision_service/secrets/vault_api_token.txt
 
 volumes:
   test-control-plane-data:
