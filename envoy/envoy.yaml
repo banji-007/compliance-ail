@@ -31,6 +31,16 @@ static_resources:
                   prefix: "/"
                 route:
                   cluster: decision_service_cluster
+                  # Envoy's own default route timeout (15s) is shorter than
+                  # the D14 mediated tool's own round trip: decision-service
+                  # spawns a fresh Python interpreter for vault_server.py per
+                  # call (no persistent MCP session), which alone can take
+                  # 10+ seconds in a resource-constrained container - live-
+                  # measured at ~15.7s, confirmed against Envoy's default by
+                  # a 504 Gateway Timeout the agent's own read_vault_secret
+                  # call otherwise hit here even though decision-service
+                  # completed the call successfully just after the cutoff.
+                  timeout: 45s
           http_filters:
           - name: envoy.filters.http.router
             typed_config:
