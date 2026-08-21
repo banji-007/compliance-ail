@@ -131,4 +131,4 @@ No row cites enforcement that is absent or skipped in CI without saying so. `env
 
 ## 6. CI run id
 
-PR #8, `integration-tests` job: pending - filled in once pushed and confirmed green (see follow-up commit).
+PR #8, `integration-tests` job: **pass, 2m49s** - https://github.com/banji-007/compliance-ail/actions/runs/32479446452/job/96762480310
