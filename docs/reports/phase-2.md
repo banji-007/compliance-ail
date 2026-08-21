@@ -199,7 +199,7 @@ Same format as `docs/reports/phase-1-3-complete.md` §9.
 | README §6, ADR-0008 summary | New | `docs/adr/0008-decision-service-boundary.md` |
 | `docs/adr/0008-decision-service-boundary.md` | D12-D15 in full, including the D12 limit and the corrected D14 mechanism (read-only-mount check, not permission bits) | This report §2 (P2-4's "found and corrected live" note) |
 | `docker-compose.yml` | `edge`/`backend` networks; `decision-service` backend-only; `langgraph-demo` edge-only; `vault_api_token` secret attached only to `decision-service` | `tests/test_decision_service_network_isolation.py`; `tests/test_credential_boundary_static.py`; `tests/test_host_port_bindings.py` (decision-service added to the guarded set) |
-| `envoy/envoy.yaml` | Retargeted cluster; 45s route timeout for the mediated tool's slower round trip | Live transcript §2 above (504 before the fix, 200 after) |
+| `envoy/envoy.yaml` | Retargeted cluster; 45s route timeout for the mediated tool's slower round trip | Live transcript §2 above (504 before the fix, 200 after); `tests/test_envoy_config_boundary.py` (added in the Phase 2 completion pass B, P2-9 - see Erratum below; absent at the time this row was first written) |
 | `decision_service/main.py`, `schemas.py` | `TOOL_REGISTRY`, `resolve_exclusivity_for`, `_verify_mcp_stdio_secret_mount` | `tests/test_exclusivity_verification.py`; `tests/test_outcome_types.py`; `tests/test_response_contract.py` |
 | `decision_service/mcp_tools/vault_server.py` | Reads its own token from a file, never an env var | `tests/test_credential_boundary_static.py` |
 | `interceptor/middleware.py` | `intercept_tool_call` is now a client; `_spire_absent_exit` is its own guard | `tests/test_spire_absent_guard.py`; `tests/test_outcome_types.py::test_fault_spiffe_unavailable`/`test_fault_decision_service_unreachable` |
@@ -232,3 +232,54 @@ Same format as `docs/reports/phase-1-3-complete.md` §9.
 PR #8, `integration-tests` job: **pass, 2m56s** - https://github.com/banji-007/compliance-ail/actions/runs/32396033248/job/96512953206
 
 (Local runs against this same suite took much longer over the course of this session - up to several hours on one run - purely from sustained Docker Desktop resource contention on the Windows dev host after many consecutive builds; CI, on a clean Linux runner, completed in under three minutes. Noted so a reader comparing timings isn't misled by the local transcripts in §2 above, which were captured for their outcomes, not their wall-clock time.)
+
+## 7. Erratum (added by the Phase 2 completion pass B, P2-11)
+
+`docs/reports/phase-2-redteam.md` (W8) found a direct contradiction inside
+this report as originally written: §4's pre-registered negative stated,
+unconditionally, *"Any item met by live evidence alone with no test
+enforcing it... Every item above has both a live transcript and a
+committed, named, mutation-tested test."* §3's own mapping table, one row
+above, showed the `envoy/envoy.yaml` row citing only a live transcript -
+"Live transcript §2 above (504 before the fix, 200 after)" - no test, none
+existed. Both statements cannot be true at once; §4 was wrong.
+
+**What was actually true at the time this report was written:** no
+committed test parsed `envoy/envoy.yaml`'s content at all - confirmed
+independently by the red-team's own `grep`/`pytest --collect-only` sweep
+(W2) and, decisively, by a live mutation: retargeting Envoy's cluster
+directly at OPA passed the full committed no-stack-required suite (29 of
+29) while reproducing a complete, unmediated read of OPA's management API
+(`GET /v1/data/system/bundles/ail-policies/manifest/revision -> 200`)
+through the agent's own authenticated mTLS channel - exactly the surface
+P2-1 exists to close. §4's negative was asserted against the six items in
+§1's verdict table, not derived from §3's own row-by-row citations; the one
+row where the two disagreed was never individually checked before §4 was
+written down.
+
+**Corrected:** the `envoy/envoy.yaml` mapping row in §3 now also cites
+`tests/test_envoy_config_boundary.py` (P2-9, Phase 2 completion pass B) -
+static YAML assertions on every cluster's upstream host/port, that no
+cluster targets a backend service other than the decision service, the
+route table's destinations, and the mTLS validation context's excluded
+root identity. Mutation-tested against the red-team's own mutation 4
+(`docs/reports/phase-2-completion-b.md` §2). The body of this report is
+otherwise unchanged - this section documents the correction rather than
+silently rewriting §3/§4 as if the gap had never existed.
+
+**Every other row in §3 checked against the same negative, individually:**
+every one either cites a test that is not stack-gated at all (a static
+parse - `test_decision_service_network_isolation.py`,
+`test_credential_boundary_static.py`, `test_host_port_bindings.py`,
+`test_outcome_types.py::test_dashboard_fault_class_type_matches_reachable_set`,
+`test_spire_absent_guard.py`) or a test that requires the
+`docker-compose.test.yml` stack `make test-integration` itself brings up in
+CI (`test_exclusivity_verification.py`, `test_record_profile.py`,
+`test_outcome_types.py`, `test_response_contract.py`) - none of these are
+skipped in the `integration-tests` CI job. The one test in this phase's own
+suite that *is* permanently skipped there, `test_vault_tool_bypass.py`
+(needs the real `docker-compose.yml` agent container, which
+`docker-compose.test.yml` never provides), is not cited by any §3 mapping
+row as its citation - the `decision_service/mcp_tools/vault_server.py` row
+cites `test_credential_boundary_static.py` only, which is not stack-gated.
+No other row claims enforcement that is absent or skipped in CI.

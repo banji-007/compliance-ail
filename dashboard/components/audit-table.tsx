@@ -28,6 +28,33 @@ const OUTCOME_VARIANT: Record<OutcomeType, NonNullable<BadgeProps["variant"]>> =
 };
 
 /**
+ * P2-10 (Phase 2 completion pass B, red-team W7): a record's `profile` used
+ * to render as plain, uniform, muted text regardless of value - a forged
+ * `profile: "unknown"` (or any value) looked identical to a genuine
+ * `observed`/`mediated` record, unlike the rich per-state treatment
+ * VerificationCell already gives verification.state. "unknown" is the one
+ * value that must never be mistaken for a normal one: it means the record
+ * structurally lacks a profile key at all (R3, Phase 1.3 completion pass) -
+ * exactly what a forger supplying a plausible-looking payload would produce.
+ * "attested" is defined (docs/adr/0005-outcome-taxonomy.md) but not yet
+ * producible by any code path; included here so the map stays exhaustive
+ * over AuditEntry["profile"] rather than needing a runtime fallback.
+ */
+const PROFILE_LABEL: Record<AuditEntry["profile"], string> = {
+  observed: "OBSERVED",
+  mediated: "MEDIATED",
+  attested: "ATTESTED",
+  unknown: "UNKNOWN",
+};
+
+const PROFILE_VARIANT: Record<AuditEntry["profile"], NonNullable<BadgeProps["variant"]>> = {
+  observed: "muted",
+  mediated: "approved",
+  attested: "approved",
+  unknown: "warning",
+};
+
+/**
  * Renders a badge distinguishing all four outcome_types (P1-7) — a policy
  * denial (a real compliance violation), a schema rejection (the LLM's
  * payload was malformed, never reached policy), and an infrastructure
@@ -61,11 +88,18 @@ function DecisionCell({ entry }: { entry: AuditEntry }) {
       )}
       {/* P13-8/D13: every record declares the conformance profile it was
           produced under, now per-tool (Phase 2) rather than a single
-          deployment constant. */}
-      <span className="text-[10px] text-muted-foreground/70 font-mono uppercase">
-        profile: {entry.profile}
-        {entry.exclusivity ? ` (${entry.exclusivity})` : ""}
-      </span>
+          deployment constant. P2-10: badged, not plain text - see
+          PROFILE_LABEL/PROFILE_VARIANT above. */}
+      <div className="flex items-center gap-1">
+        <Badge variant={PROFILE_VARIANT[entry.profile]} className="w-fit text-[9px] px-1.5 py-0">
+          {PROFILE_LABEL[entry.profile]}
+        </Badge>
+        {entry.exclusivity && (
+          <span className="text-[10px] text-muted-foreground/70 font-mono uppercase">
+            ({entry.exclusivity})
+          </span>
+        )}
+      </div>
       {/* D16: "unknown" is the one execution_state worth calling out visually
           - it means a mediated call executed but its outcome was never
           durably recorded. "n/a" and "completed" are the ordinary cases and
