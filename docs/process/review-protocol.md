@@ -22,6 +22,8 @@ Every instruction carries a unique run id. A session's first reported action sta
 
 Before deleting a branch, enumerate what is unique to it and confirm each item either exists on the target branch or is intentionally discarded. Use git diff --stat against the target, not a recollection of what was ported.
 
+Tearing down Docker state is not tearing down the session. A session that creates a scratch clone or worktree removes the directory itself before reporting, and states in its report what it removed. Scratch clones under Claude Code's Temp session storage count; six sessions left 1.16G of them behind before anyone noticed. If a session cannot remove its own directory because a file handle is held, it says so in its report rather than leaving it silently.
+
 ---
 
 ## 2. Writing acceptance criteria
