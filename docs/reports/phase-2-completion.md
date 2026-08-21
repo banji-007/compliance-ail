@@ -86,4 +86,4 @@ Same format as `docs/reports/phase-2.md` §3 / `docs/reports/phase-1-3-complete.
 
 ## 6. CI run id
 
-Recorded after push; see the follow-up commit in this same PR (#8) for the run URL.
+PR #8, `integration-tests` job: **pass, 2m40s** - https://github.com/banji-007/compliance-ail/actions/runs/32473837505/job/96746008139
