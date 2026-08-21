@@ -50,7 +50,13 @@ for _ledger_candidate in (
     if os.path.isdir(_ledger_candidate):
         sys.path.append(_ledger_candidate)
 
-from schemas import TOOL_REGISTRY, resolve_exclusivity, mark_mechanism_verified  # noqa: E402
+from schemas import (  # noqa: E402
+    TOOL_REGISTRY,
+    resolve_exclusivity,
+    register_mechanism_verifier,
+    run_verification_pass,
+    get_verified_tools,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -69,6 +75,11 @@ FAULT_VERIFIER_UNREACHABLE = "verifier_unreachable"
 FAULT_MALFORMED_POLICY_RESPONSE = "malformed_policy_response"
 FAULT_CONTENT_STORE_UNREACHABLE = "content_store_unreachable"
 FAULT_TOOL_EXECUTION_FAILED = "tool_execution_failed"
+# D16 (Phase 2 completion pass): the intent write (see log_tool_intent) is
+# attempted before a mediated tool's own execution and gates it - if this
+# fails, execution never happens at all, so this fault class never coexists
+# with an orphaned intent record (there is no intent record for this call).
+FAULT_INTENT_WRITE_FAILED = "intent_write_failed"
 
 CONTENT_PRESENT = "present"
 CONTENT_UNAVAILABLE = "unavailable"
@@ -139,6 +150,12 @@ def _verify_mcp_stdio_secret_mount() -> bool:
     return False
 
 
+# D17: registering the callable is cheap (no I/O) and safe at import time;
+# actually running it stays inside run_verification_pass(), called once
+# from lifespan below, same as the old direct call was.
+register_mechanism_verifier("mcp_stdio_secret_mount", _verify_mcp_stdio_secret_mount)
+
+
 def _fetch_opa_bundle_revision() -> str | None:
     url = _OPA_URL.replace(
         "/v1/data/ail/main/evaluation", f"/v1/data/system/bundles/{_BUNDLE_NAME}/manifest/revision"
@@ -185,9 +202,8 @@ def _verify_bundle_loaded_at_startup(timeout_seconds: float = 30, poll_interval:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    verified = _verify_mcp_stdio_secret_mount()
-    mark_mechanism_verified("mcp_stdio_secret_mount", verified)
-    logging.info("Startup check: mcp_stdio_secret_mount verified=%s", verified)
+    run_verification_pass()
+    logging.info("Startup check: per-tool verification results=%s", get_verified_tools())
     # Raising here (rather than logging and continuing) stops uvicorn from
     # ever starting the ASGI app - the same severity as the old agent-side
     # sys.exit(1), just expressed through this process's own lifecycle
@@ -408,17 +424,6 @@ async def decide(req: DecideRequest):
     else:
         content_state = CONTENT_UNAVAILABLE
 
-    result_payload = None
-    if outcome_type == OUTCOME_POLICY_ALLOW and tool_name == "read_vault_secret" and content_state is not None:
-        try:
-            result_payload = await _execute_vault_tool(tool_args)
-        except Exception as e:
-            logging.error("Mediated tool execution failed for call_id=%s: %s", call_id, e)
-            outcome_type = OUTCOME_FAULT
-            fault_class = FAULT_TOOL_EXECUTION_FAILED
-            policy_revision = None
-            reasons = []
-
     # "unknown" (R3, Phase 1.3) is reserved for the read-time fallback a
     # structurally profile-less (forged) record gets in
     # control_plane/main.py::get_audit - not for a genuine record this
@@ -428,6 +433,46 @@ async def decide(req: DecideRequest):
     reg = TOOL_REGISTRY.get(tool_name)
     profile = reg.profile if reg else "observed"
     exclusivity = resolve_exclusivity(tool_name)
+
+    result_payload = None
+    if outcome_type == OUTCOME_POLICY_ALLOW and tool_name == "read_vault_secret" and content_state is not None:
+        # D16 (Phase 2 completion pass): the intent record - "approved,
+        # under this policy revision, about to execute" - is written before
+        # _execute_vault_tool is ever called, not after. Execution and this
+        # write cannot be made atomic across two separate systems (this
+        # process and ImmuDB, via the verifier); rather than pretend
+        # otherwise, a failed intent write refuses execution outright. A
+        # successful intent write with no matching completion record (the
+        # "decision" record below fails to write after execution already
+        # ran) is the honest, detectable residual: control_plane/main.py::
+        # get_audit surfaces it as execution_state "unknown", never as a
+        # silently-missing entry.
+        try:
+            from immudb_ledger import get_ledger
+            get_ledger().log_tool_intent(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                call_id=call_id,
+                policy_revision=policy_revision,
+                input_sha256=input_sha256,
+                content_state=content_state,
+                profile=profile,
+            )
+        except Exception as e:
+            logging.error("Intent write failed for call_id=%s: %s - execution refused", call_id, e)
+            outcome_type = OUTCOME_FAULT
+            fault_class = FAULT_INTENT_WRITE_FAILED
+            policy_revision = None
+            reasons = []
+        else:
+            try:
+                result_payload = await _execute_vault_tool(tool_args)
+            except Exception as e:
+                logging.error("Mediated tool execution failed for call_id=%s: %s", call_id, e)
+                outcome_type = OUTCOME_FAULT
+                fault_class = FAULT_TOOL_EXECUTION_FAILED
+                policy_revision = None
+                reasons = []
 
     ledger_tx_id = None
     if content_state is not None:

@@ -141,6 +141,77 @@ class ImmuDBLedger:
             logging.error("Verifier write failed for agent=%s tool=%s: %s", agent_id, tool_name, exc)
             raise
 
+    def log_tool_intent(
+        self,
+        agent_id: str,
+        tool_name: str,
+        call_id: str,
+        policy_revision: str,
+        input_sha256: str,
+        content_state: str,
+        profile: str,
+    ) -> int:
+        """
+        D16 (Phase 2 completion pass): written before a mediated tool's own
+        execution runs, never after. record_type "decision_intent" is a
+        distinct key namespace (tool_call_intent:, not tool_call:) from the
+        completion record log_tool_call writes for the same call - the
+        prefix is a scan partition only, the same discipline D11 already
+        established for content_erasure: keys; classification still goes
+        through record_type, not key shape alone.
+
+        decision_service/main.py calls this immediately before
+        _execute_vault_tool and refuses to execute at all if this raises -
+        that refusal is enforced by the caller, not this method. A
+        successful intent write followed by a completion write that later
+        fails leaves an intent record with no matching completion record
+        for its call_id - control_plane/main.py::get_audit detects that at
+        read time (the same read-time-inference discipline content_state/
+        payload_state already use) and surfaces it as execution_state
+        "unknown": executed, outcome not durably recorded, rather than
+        silently absent from /audit.
+
+        Returns the ImmuDB transaction ID on success; raises on any
+        failure, exactly like log_tool_call.
+        """
+        timestamp = datetime.utcnow().isoformat()
+        log_entry = {
+            "record_type": "decision_intent",
+            "agent_id": agent_id,
+            "timestamp": timestamp,
+            "tool_name": tool_name,
+            "call_id": call_id,
+            "input_sha256": input_sha256,
+            "policy_revision": policy_revision,
+            "content_state": content_state,
+            "profile": profile,
+        }
+        serialized  = json.dumps(log_entry, separators=(",", ":"))
+        key         = f"tool_call_intent:{agent_id}:{uuid.uuid4().hex}:{tool_name}"
+        encoded_key = base64.b64encode(key.encode()).decode()
+        encoded_val = base64.b64encode(serialized.encode()).decode()
+
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.post(
+                    f"{self.verifier_url}/write",
+                    json={"key": encoded_key, "value": encoded_val},
+                )
+                resp.raise_for_status()
+
+            result = resp.json()
+            if not result.get("verified"):
+                detail = result.get("detail", "no detail")
+                raise RuntimeError(f"Intent write not verified by SDK: {detail}")
+
+            tx_id = result["tx_id"]
+            logging.info("Intent write verified: tx=%d call_id=%s", tx_id, call_id)
+            return tx_id
+
+        except Exception as exc:
+            logging.error("Verifier intent-write failed for agent=%s tool=%s call_id=%s: %s", agent_id, tool_name, call_id, exc)
+            raise
+
 
 _ledger_instance = None
 

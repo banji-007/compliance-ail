@@ -1,5 +1,6 @@
 """
-tests/test_exclusivity_verification.py - P2-2 (Phase 2, D13).
+tests/test_exclusivity_verification.py - P2-2 (Phase 2, D13) and D17 (Phase 2
+completion pass).
 
 The registry declares an authority holder, a mechanism, and a claimed
 exclusivity kind per tool - but the gateway never records "demonstrated" on
@@ -8,9 +9,11 @@ resolve_exclusivity_for is the one function that decides what actually gets
 written to a ledger record, and it answers only from two things it can
 itself check: whether the tool's mechanism is one this gateway knows how to
 verify at all (schemas._VERIFIABLE_MECHANISMS, a closed set with exactly
-one member today), and whether that mechanism's own startup check actually
-ran and passed (schemas._MECHANISM_VERIFIED, populated only by
-decision_service/main.py actually running the check - never by config).
+one member today), and whether THAT SPECIFIC TOOL's own name is present in
+schemas._TOOL_VERIFIED with a True result - populated only by
+run_verification_pass() actually invoking the mechanism's check once per
+tool that claims it, never by config, and never inherited from another
+tool sharing the same mechanism string (D17).
 
 The planted case below is the spike's A5b shape (docs/reports/
 spike-mcp-mediation.md): a tool whose real authority is an ambient shared
@@ -28,6 +31,12 @@ import schemas  # noqa: E402
 
 def _dummy_validator(tool_args):
     return True, None
+
+
+def _reset_verification_state():
+    schemas._TOOL_VERIFIED.clear()
+    schemas._MECHANISM_VERIFIERS.clear()
+    schemas._VERIFICATION_PASS_COMPLETE = False
 
 
 def test_ambient_resource_claiming_demonstrated_is_recorded_declared():
@@ -50,18 +59,18 @@ def test_ambient_resource_claiming_demonstrated_is_recorded_declared():
         profile="mediated",
         claimed_exclusivity="demonstrated",
     )
-    assert schemas.resolve_exclusivity_for(ambient_resource_tool) == "declared"
+    assert schemas.resolve_exclusivity_for("ambient_resource_tool", ambient_resource_tool) == "declared"
 
 
 def test_verifiable_mechanism_not_yet_verified_is_also_declared():
     """
     Naming the right mechanism string is necessary but not sufficient - the
-    gateway must have actually run and passed that mechanism's own check
-    this boot. Before decision_service/main.py's startup check runs (or if
-    it ran and failed), even the one real verifiable mechanism records
-    "declared", not "demonstrated".
+    gateway must have actually run and passed that mechanism's own check,
+    for THIS tool, this boot. Before decision_service/main.py's startup
+    check runs (or if it ran and failed for this tool), even the one real
+    verifiable mechanism records "declared", not "demonstrated".
     """
-    schemas.mark_mechanism_verified("mcp_stdio_secret_mount", False)
+    saved = dict(schemas._TOOL_VERIFIED)
     try:
         real_tool = schemas.ToolRegistration(
             validator=_dummy_validator,
@@ -70,15 +79,14 @@ def test_verifiable_mechanism_not_yet_verified_is_also_declared():
             profile="mediated",
             claimed_exclusivity="demonstrated",
         )
-        assert schemas.resolve_exclusivity_for(real_tool) == "declared"
+        schemas._TOOL_VERIFIED["real_tool"] = False
+        assert schemas.resolve_exclusivity_for("real_tool", real_tool) == "declared"
 
-        schemas.mark_mechanism_verified("mcp_stdio_secret_mount", True)
-        assert schemas.resolve_exclusivity_for(real_tool) == "demonstrated"
+        schemas._TOOL_VERIFIED["real_tool"] = True
+        assert schemas.resolve_exclusivity_for("real_tool", real_tool) == "demonstrated"
     finally:
-        # Leave global verification state as this module's own startup
-        # would set it, so other tests in the same process aren't affected
-        # by whichever branch ran last.
-        schemas.mark_mechanism_verified("mcp_stdio_secret_mount", False)
+        schemas._TOOL_VERIFIED.clear()
+        schemas._TOOL_VERIFIED.update(saved)
 
 
 def test_tool_with_no_exclusivity_claim_resolves_to_none():
@@ -94,7 +102,7 @@ def test_tool_with_no_exclusivity_claim_resolves_to_none():
         mechanism="in_process_function",
         profile="observed",
     )
-    assert schemas.resolve_exclusivity_for(observed_tool) is None
+    assert schemas.resolve_exclusivity_for("observed_tool", observed_tool) is None
 
 
 def test_the_three_python_function_tools_are_registered_observed_with_no_claim():
@@ -110,3 +118,108 @@ def test_read_vault_secret_is_registered_mediated_with_the_verifiable_mechanism(
     assert reg.profile == "mediated"
     assert reg.mechanism in schemas._VERIFIABLE_MECHANISMS
     assert reg.claimed_exclusivity == "demonstrated"
+
+
+# ---------------------------------------------------------------------------
+# D17 (Phase 2 completion pass): verification is keyed by tool, not by
+# mechanism string.
+# ---------------------------------------------------------------------------
+
+def test_two_tools_sharing_a_mechanism_are_each_independently_verified():
+    """
+    Before D17, _MECHANISM_VERIFIED was a boolean keyed on the mechanism
+    string - a check run for one tool populated a value a second tool
+    naming the same mechanism would read directly, without its own
+    verification ever running. run_verification_pass() must invoke the
+    mechanism's check once per tool that claims it, not once per mechanism
+    - proven here by call count, since the check itself has no per-tool
+    parameter and so can't be distinguished by differing return values
+    alone.
+
+    Mutation (D17's named mutation): cache the check's result the first
+    time a mechanism is seen and reuse it for subsequent tools naming the
+    same mechanism, instead of invoking it again. This drops the call count
+    from 2 to 1 and fails this test directly.
+    """
+    saved_registry = dict(schemas.TOOL_REGISTRY)
+    saved_verified = dict(schemas._TOOL_VERIFIED)
+    saved_verifiers = dict(schemas._MECHANISM_VERIFIERS)
+    saved_complete = schemas._VERIFICATION_PASS_COMPLETE
+    call_count = {"n": 0}
+
+    def _fake_check():
+        call_count["n"] += 1
+        return True
+
+    try:
+        schemas._TOOL_VERIFIED.clear()
+        schemas._MECHANISM_VERIFIERS.clear()
+        schemas.register_mechanism_verifier("mcp_stdio_secret_mount", _fake_check)
+
+        schemas.TOOL_REGISTRY.clear()
+        schemas.TOOL_REGISTRY["tool_a"] = schemas.ToolRegistration(
+            validator=_dummy_validator,
+            authority_holder="decision-service (vault_server.py subprocess, secret-mounted)",
+            mechanism="mcp_stdio_secret_mount",
+            profile="mediated",
+            claimed_exclusivity="demonstrated",
+        )
+        schemas.TOOL_REGISTRY["tool_b"] = schemas.ToolRegistration(
+            validator=_dummy_validator,
+            authority_holder="decision-service (a second, unrelated subprocess)",
+            mechanism="mcp_stdio_secret_mount",
+            profile="mediated",
+            claimed_exclusivity="demonstrated",
+        )
+
+        schemas.run_verification_pass()
+
+        assert call_count["n"] == 2, (
+            f"expected the check to run once per tool (2 tools sharing the "
+            f"mechanism), ran {call_count['n']} times - a shared cache is "
+            f"letting one tool's verification stand in for the other's"
+        )
+        assert schemas._TOOL_VERIFIED["tool_a"] is True
+        assert schemas._TOOL_VERIFIED["tool_b"] is True
+    finally:
+        schemas.TOOL_REGISTRY.clear()
+        schemas.TOOL_REGISTRY.update(saved_registry)
+        schemas._TOOL_VERIFIED.clear()
+        schemas._TOOL_VERIFIED.update(saved_verified)
+        schemas._MECHANISM_VERIFIERS.clear()
+        schemas._MECHANISM_VERIFIERS.update(saved_verifiers)
+        schemas._VERIFICATION_PASS_COMPLETE = saved_complete
+
+
+def test_tool_registered_after_the_verification_pass_never_gets_demonstrated():
+    """
+    D17's second half: a tool added to TOOL_REGISTRY after
+    run_verification_pass() has already completed must never resolve to
+    "demonstrated", even if it declares a mechanism that verified True for
+    every tool checked during that pass. There is no dynamic registration
+    API in this codebase today, but the refusal must hold structurally -
+    from an absent dict key defaulting to "not verified" - not from a
+    special case that a future registration path could omit.
+
+    Mutation: have resolve_exclusivity_for fall back to True whenever ANY
+    tool sharing the mechanism has been verified (e.g. checking
+    `mechanism in _VERIFIABLE_MECHANISMS and any(_TOOL_VERIFIED.values())`
+    instead of the specific tool's own key). This test must fail against
+    that mutation.
+    """
+    saved_verified = dict(schemas._TOOL_VERIFIED)
+    try:
+        schemas._TOOL_VERIFIED.clear()
+        schemas._TOOL_VERIFIED["some_other_tool"] = True
+
+        late_tool = schemas.ToolRegistration(
+            validator=_dummy_validator,
+            authority_holder="decision-service (registered after boot)",
+            mechanism="mcp_stdio_secret_mount",
+            profile="mediated",
+            claimed_exclusivity="demonstrated",
+        )
+        assert schemas.resolve_exclusivity_for("late_tool", late_tool) == "declared"
+    finally:
+        schemas._TOOL_VERIFIED.clear()
+        schemas._TOOL_VERIFIED.update(saved_verified)

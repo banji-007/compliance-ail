@@ -11,6 +11,7 @@ see resolve_exclusivity_for below, which is the only function allowed to
 produce the value a ledger record actually carries.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 from pydantic import BaseModel, Field, ValidationError
@@ -165,29 +166,83 @@ class ToolRegistration:
 
 # Mechanisms this gateway actually knows how to check, not just name. A
 # mechanism string appearing here is necessary but not sufficient for
-# "demonstrated" - see _MECHANISM_VERIFIED below, populated only by main.py
-# actually running that mechanism's own startup check.
+# "demonstrated" - see _TOOL_VERIFIED below, populated only by
+# run_verification_pass() actually running that mechanism's own check,
+# once per tool that claims it.
 _VERIFIABLE_MECHANISMS = frozenset({"mcp_stdio_secret_mount"})
 
-# Populated at decision-service startup, once, after each verifiable
-# mechanism's own check has actually run. Never set from config.
-_MECHANISM_VERIFIED: Dict[str, bool] = {}
+# D17 (Phase 2 completion pass): mechanism name -> the callable that checks
+# it, registered by main.py at import time (registration is cheap; running
+# the check is not, and stays confined to run_verification_pass()).
+_MECHANISM_VERIFIERS: Dict[str, Callable[[], bool]] = {}
+
+# D17: keyed by TOOL NAME, not by mechanism string. Before this, a single
+# mechanism-keyed cache meant a second tool declaring the identical
+# mechanism string as an already-verified tool would inherit that result
+# without the check ever running again in that tool's own name - config
+# alone would then be enough to make it "demonstrated" for a tool the
+# gateway never actually checked, which is exactly what D13 forbids.
+# Populated only by run_verification_pass(); never set from config, and
+# never assumed for a tool absent from this dict (see the late-registration
+# note below).
+_TOOL_VERIFIED: Dict[str, bool] = {}
+
+# Set to True only once run_verification_pass() has iterated every tool
+# present in TOOL_REGISTRY at that moment. A tool appended to TOOL_REGISTRY
+# after that point (there is no runtime registration API today, but nothing
+# stops one being added later) is never a key in _TOOL_VERIFIED, and
+# resolve_exclusivity_for's dict lookup already treats an absent key as
+# unverified - so such a tool is refused "demonstrated" unconditionally,
+# structurally, not by an extra check that could itself be forgotten.
+_VERIFICATION_PASS_COMPLETE = False
 
 
-def mark_mechanism_verified(mechanism: str, verified: bool) -> None:
-    _MECHANISM_VERIFIED[mechanism] = verified
+def register_mechanism_verifier(mechanism: str, verify_fn: Callable[[], bool]) -> None:
+    _MECHANISM_VERIFIERS[mechanism] = verify_fn
 
 
-def resolve_exclusivity_for(reg: ToolRegistration) -> Optional[str]:
+def run_verification_pass() -> None:
+    """
+    D17: called once, at decision-service startup, before the app accepts
+    traffic. For every tool currently in TOOL_REGISTRY whose mechanism is
+    verifiable, this independently invokes that mechanism's own check and
+    stores the result under the TOOL's name - even if two tools name the
+    identical mechanism string, each one triggers its own call, so neither
+    can inherit the other's result.
+
+    Mutation (D17's named mutation): cache the check's result per mechanism
+    and skip re-invoking it for a second tool sharing that mechanism string
+    (the old behavior). tests/test_exclusivity_verification.py asserts the
+    verifier callable is invoked once per verifiable tool, not once total -
+    this mutation drops that count and fails the test directly.
+    """
+    global _VERIFICATION_PASS_COMPLETE
+    for tool_name, reg in TOOL_REGISTRY.items():
+        if reg.mechanism not in _VERIFIABLE_MECHANISMS:
+            continue
+        verify_fn = _MECHANISM_VERIFIERS.get(reg.mechanism)
+        result = bool(verify_fn()) if verify_fn is not None else False
+        _TOOL_VERIFIED[tool_name] = result
+        logging.info("Verification pass: tool=%s mechanism=%s verified=%s", tool_name, reg.mechanism, result)
+    _VERIFICATION_PASS_COMPLETE = True
+
+
+def get_verified_tools() -> Dict[str, bool]:
+    return dict(_TOOL_VERIFIED)
+
+
+def resolve_exclusivity_for(tool_name: str, reg: ToolRegistration) -> Optional[str]:
     """
     D13's own rule, as code: a record's exclusivity kind is never read off
-    a tool's config. It is "demonstrated" only if the tool's mechanism is
-    one this gateway knows how to verify AND that verification actually ran
-    and passed this boot - otherwise "declared", regardless of what the
-    config claims. This is what catches the spike's A5b case: a tool whose
-    real authority is an ambient shared resource (mechanism outside
-    _VERIFIABLE_MECHANISMS) cannot be recorded "demonstrated" no matter what
-    its own config says.
+    a tool's config. It is "demonstrated" only if this specific tool's own
+    name is present in _TOOL_VERIFIED with a True result - never inferred
+    from another tool, never from the mechanism string alone. This is what
+    catches the spike's A5b case (a tool whose real authority is an ambient
+    shared resource, mechanism outside _VERIFIABLE_MECHANISMS, cannot be
+    recorded "demonstrated" no matter what its own config says) and D17's
+    own case (a tool sharing a verified tool's mechanism string is not
+    itself verified merely by that coincidence, and a tool added after
+    run_verification_pass() already ran is never verified at all).
 
     Returns None for a tool with no exclusivity claim at all (the three
     observed, Python-function tools - profile is "observed" for these, and
@@ -195,7 +250,7 @@ def resolve_exclusivity_for(reg: ToolRegistration) -> Optional[str]:
     """
     if reg.claimed_exclusivity is None:
         return None
-    if reg.mechanism in _VERIFIABLE_MECHANISMS and _MECHANISM_VERIFIED.get(reg.mechanism):
+    if _TOOL_VERIFIED.get(tool_name) is True:
         return "demonstrated"
     return "declared"
 
@@ -204,7 +259,7 @@ def resolve_exclusivity(tool_name: str) -> Optional[str]:
     reg = TOOL_REGISTRY.get(tool_name)
     if reg is None:
         return None
-    return resolve_exclusivity_for(reg)
+    return resolve_exclusivity_for(tool_name, reg)
 
 
 # Registry used by main.py for dict-based routing.

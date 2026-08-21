@@ -66,6 +66,19 @@ function DecisionCell({ entry }: { entry: AuditEntry }) {
         profile: {entry.profile}
         {entry.exclusivity ? ` (${entry.exclusivity})` : ""}
       </span>
+      {/* D16: "unknown" is the one execution_state worth calling out visually
+          - it means a mediated call executed but its outcome was never
+          durably recorded. "n/a" and "completed" are the ordinary cases and
+          stay in the same quiet, low-emphasis style as profile/exclusivity. */}
+      {entry.execution_state === "unknown" ? (
+        <span className="text-[10px] font-mono uppercase text-amber-600 dark:text-amber-400">
+          execution: unknown outcome
+        </span>
+      ) : (
+        <span className="text-[10px] text-muted-foreground/70 font-mono uppercase">
+          execution: {entry.execution_state}
+        </span>
+      )}
     </div>
   );
 }

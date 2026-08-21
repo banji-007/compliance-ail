@@ -306,6 +306,7 @@ def test_metric_label_set_matches_closed_collection():
         "", decision_main.FAULT_OPA_UNREACHABLE, decision_main.FAULT_REVISION_UNAVAILABLE,
         decision_main.FAULT_VERIFIER_UNREACHABLE, decision_main.FAULT_MALFORMED_POLICY_RESPONSE,
         decision_main.FAULT_CONTENT_STORE_UNREACHABLE, decision_main.FAULT_TOOL_EXECUTION_FAILED,
+        decision_main.FAULT_INTENT_WRITE_FAILED,
     }
     allowed_statuses = {"APPROVED", "DENIED"}
 
@@ -327,7 +328,10 @@ def test_metric_label_set_matches_closed_collection():
 # produce a ledger record - each is discovered in a path that itself
 # precedes, or is, the ledger write. Phase 2 adds tool_execution_failed
 # (D14) to the reachable set: the ledger write already succeeded by the
-# point the mediated tool call itself can fail.
+# point the mediated tool call itself can fail. The Phase 2 completion pass
+# adds intent_write_failed (D16), for the same reason: the intent write is a
+# separate, earlier ledger write than the completion record documenting its
+# own failure.
 # ---------------------------------------------------------------------------
 
 _NEVER_REACHES_LEDGER = {
@@ -342,6 +346,7 @@ _ALL_FAULT_CLASSES = {
     decision_main.FAULT_MALFORMED_POLICY_RESPONSE,
     decision_main.FAULT_CONTENT_STORE_UNREACHABLE,
     decision_main.FAULT_TOOL_EXECUTION_FAILED,
+    decision_main.FAULT_INTENT_WRITE_FAILED,
 }
 
 _REACHES_AUDIT = _ALL_FAULT_CLASSES - _NEVER_REACHES_LEDGER

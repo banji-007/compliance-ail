@@ -52,12 +52,19 @@ export type OutcomeType = "policy_allow" | "policy_deny" | "schema_deny" | "faul
  * did reach the point of writing a ledger entry (schema validated, policy
  * allowed, content stored) before the mediated tool call itself failed, so
  * this one DOES reach /audit - included here for that reason.
+ *
+ * intent_write_failed (D16, Phase 2 completion pass) is the same category
+ * as tool_execution_failed: the write-ahead intent write for a mediated
+ * tool call failed, so execution was refused - but the completion record
+ * documenting that refusal is still written normally (content was already
+ * stored, schema/policy already resolved), so this DOES reach /audit too.
  */
 export type FaultClass =
   | "opa_unreachable"
   | "revision_unavailable"
   | "malformed_policy_response"
   | "tool_execution_failed"
+  | "intent_write_failed"
   | null;
 
 /**
@@ -169,6 +176,26 @@ export interface AuditEntry {
    * actual absence of the key.
    */
   exclusivity: "demonstrated" | "declared" | null;
+  /**
+   * D16 (Phase 2 completion pass): a mediated tool call's execution and its
+   * own durable recording cannot be made atomic across two separate
+   * systems (decision-service's own process, and ImmuDB via the verifier).
+   * A write-ahead intent record is written before execution, and refuses
+   * execution outright if it fails; execution_state reports the honest
+   * result of that protocol at read time:
+   *   completed - both the intent record and its completion record exist.
+   *   unknown   - an intent record exists with no matching completion
+   *               record - the tool executed but its outcome was never
+   *               durably recorded (e.g. the ledger became unreachable
+   *               between the intent write and the completion write). This
+   *               is the entire point of D16: made visible, not silently
+   *               missing.
+   *   n/a       - this call was never subject to the intent/completion
+   *               protocol at all (every "observed" record, and any
+   *               mediated call denied or faulted before reaching the
+   *               intent write).
+   */
+  execution_state: "completed" | "unknown" | "n/a";
 }
 
 export interface AuditResponse {
