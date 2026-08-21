@@ -1,0 +1,17 @@
+{
+  "source_state": {
+    "db": "defaultdb",
+    "txId": 2,
+    "txHash_hex": "9ade617c8ad399fca979dc2b1eb42877e13a4845200633df4bdd1cbea98efd3f",
+    "publicKey_hex": "0426435c7e65ffbaafd972ea736789d553d42c1072f400231e715e89bfe11b665152d5c475205ce58b6fd6444cb2f0889c66baa2c51be199931595596125ba24dd",
+    "signature_hex": "3044022051c005c5dd7581d97ef7c20b40be29301dfeb905f592fcee49c54145a2b5f72b022078cab97267a6da7d28a9c856db796fa5e6a316a666fd8fcb52f2167f71470824"
+  },
+  "entry1_tx": 1,
+  "entry2_tx": 2,
+  "ventry_serialized_len": 794,
+  "live_verifiedGet": {
+    "id": 1,
+    "verified": true,
+    "timestamp": 1787324205
+  }
+}

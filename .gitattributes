@@ -1,2 +1,9 @@
 # Set default line ending behavior
 * text=auto eol=lf
+
+# Captured ImmuDB proof material and evidence-bundle fixtures are verified
+# byte-for-byte. Any line-ending normalisation would change the bytes that
+# feed the SDK's digest and signature checks, so these are never treated as
+# text, whatever their content happens to look like.
+spikes/offline-verify/material/** -text
+tests/fixtures/evidence_bundles/** -text
