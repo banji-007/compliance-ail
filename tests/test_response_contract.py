@@ -10,11 +10,10 @@ other 29.
 
 This test closes that gap by construction rather than by a maintained list:
 
-  1. Dynamic ground truth - drive intercept_tool_call live through each
-     outcome_type (policy_allow, policy_deny, schema_deny, fault) against
-     the real test stack, and take the union of keys actually present in
-     the returned dicts. If a producer renames a key, that key simply is
-     not in this set.
+  1. Dynamic ground truth - drive the decision through each outcome_type
+     (policy_allow, policy_deny, schema_deny, fault) against the real test
+     stack, and take the union of keys actually present in the returned
+     dicts. If a producer renames a key, that key simply is not in this set.
   2. Static scan - walk every file in the tree that calls
      intercept_tool_call and assigns its result to a variable, and collect
      every string-literal key that variable is ever read with (.get("k"),
@@ -24,9 +23,26 @@ The contract: every key ever read (2) must be a subset of the keys the
 function can actually produce (1). A rename in the producer shrinks (1)
 without touching (2), so the assertion fails - this is what makes the test
 load-bearing rather than incidental.
+
+Migrated in Phase 2 (P2-1) from interceptor/middleware.py to
+decision_service/main.py: D12 moved schema validation, the OPA query, the
+content-store write, and the ledger write into decision_service - the
+response dict interceptor/middleware.py::intercept_tool_call returns is now
+just decision_service's /decide response, passed through unchanged (see
+decision_service/main.py::decide's own docstring). Part (1)'s dynamic ground
+truth therefore now comes from decision_main.decide() directly, the actual
+producer of the shape - the client leg (middleware.intercept_tool_call) only
+ever narrows that shape further (its own client-side faults,
+spiffe_unavailable/decision_service_unreachable, are a strict subset of the
+keys decide() already produces: status, message, outcome_type, fault_class,
+policy_revision - never ledger_tx_id or result), so it adds nothing this
+dynamic scan would miss. Part (2)'s static scan is unchanged: consumers
+still call middleware.intercept_tool_call by that name, so the AST scan
+still looks for exactly that call.
 """
 
 import ast
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -34,12 +50,45 @@ from pathlib import Path
 import httpx
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+
+import importlib.util as _importlib_util
+
+# decision_service/main.py's own `from schemas import ...` needs this
+# directory on sys.path - loading main.py itself via spec_from_file_location
+# below (to dodge the module-name collision, see _load_decision_service_main)
+# does not add its own directory to sys.path automatically the way a normal
+# package-relative import would.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "decision_service"))
+
+
+def _load_decision_service_main():
+    """decision_service/main.py and control_plane/main.py are both named
+    main.py - a bare `import main` in one test file clobbers whichever
+    module sys.modules["main"] already held for every other test file in
+    the same pytest session (Python caches by module name, not by which
+    sys.path entry was active when the import statement ran - confirmed
+    live: test_verification.py's control-plane tests got decision_service's
+    module back instead, AttributeError on a function that only exists in
+    control_plane/main.py). Loading this one under its own explicit module
+    name sidesteps the collision instead of depending on import order."""
+    spec = _importlib_util.spec_from_file_location(
+        "decision_service_main",
+        os.path.join(os.path.dirname(__file__), "..", "decision_service", "main.py"),
+    )
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules["decision_service_main"] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
-os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
+os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluation")
+os.environ.setdefault("DECISION_SERVICE_URL", "http://localhost:8010/decide")
 
-import middleware  # noqa: E402
+decision_main = _load_decision_service_main()
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+import middleware  # noqa: E402 - real HTTP client, needed for the read_vault_secret call below
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -56,6 +105,15 @@ _DENIED_ARGS = {
     "cost_per_hour": 50.0,
     "tags": {"environment": "dev", "data_classification": "internal", "cost_center": "engineering", "project": "webapp"},
 }
+
+
+def _decide(tool_name, tool_args, agent_id="contract_test") -> dict:
+    """Call decision_service/main.py's /decide route function directly -
+    the actual producer of the response shape intercept_tool_call now just
+    passes through unchanged. See tests/test_outcome_types.py's identical
+    helper."""
+    req = decision_main.DecideRequest(tool_name=tool_name, tool_args=tool_args, agent_id=agent_id)
+    return asyncio.run(decision_main.decide(req))
 
 
 def _opa_reachable() -> bool:
@@ -87,9 +145,21 @@ requires_stack = pytest.mark.skipif(
 
 def _live_response_keys(monkeypatch) -> set[str]:
     responses = [
-        middleware.intercept_tool_call("provision_cloud_server", _APPROVED_ARGS, "contract_test"),
-        middleware.intercept_tool_call("provision_cloud_server", _DENIED_ARGS, "contract_test"),
-        middleware.intercept_tool_call("hallucinated_tool", {"anything": "goes"}, "contract_test"),
+        _decide("provision_cloud_server", _APPROVED_ARGS),
+        _decide("provision_cloud_server", _DENIED_ARGS),
+        _decide("hallucinated_tool", {"anything": "goes"}),
+        # D14: the one tool that produces a "result" key - approved so it's
+        # actually present in this call's response, not just theoretically
+        # possible. framework_integration/langgraph_demo.py reads this key;
+        # without a call that actually produces it, this contract test
+        # would flag a real, used key as "never produced". Uses the real
+        # HTTP client (middleware), not the in-process _decide() helper:
+        # vault_server.py resolves its token from a fixed default path
+        # (/run/secrets/vault_api_token) that only exists inside
+        # decision-service's own container - the MCP SDK's stdio spawn does
+        # not inherit this test process's environment, so an in-process
+        # call on the host cannot reach the vault at all.
+        middleware.intercept_tool_call("read_vault_secret", {"secret_name": "db_master_password"}, "contract_test"),
     ]
 
     with monkeypatch.context() as m:
@@ -98,12 +168,10 @@ def _live_response_keys(monkeypatch) -> set[str]:
         # same undefined-/evaluation-result response shape by pointing at a
         # rule path OPA has never heard of instead.
         m.setattr(
-            middleware, "_OPA_EVAL_URL",
-            middleware._OPA_URL.replace("/v1/data/ail/main/allow", "/v1/data/ail/main/nonexistent_entrypoint"),
+            decision_main, "_OPA_URL",
+            "http://localhost:8181/v1/data/ail/main/nonexistent_entrypoint",
         )
-        responses.append(
-            middleware.intercept_tool_call("provision_cloud_server", _APPROVED_ARGS, "contract_test")
-        )
+        responses.append(_decide("provision_cloud_server", _APPROVED_ARGS))
 
     keys: set[str] = set()
     for r in responses:

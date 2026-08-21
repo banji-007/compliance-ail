@@ -32,10 +32,14 @@ finalized in `intercept_tool_call`):
 | `fault` | The call could not be evaluated | one of four below | `null` |
 
 `fault_class` is one of: `opa_unreachable`, `revision_unavailable`,
-`verifier_unreachable`, `spiffe_unavailable`, `malformed_policy_response`
-(Phase 1.1, P11-3), `content_store_unreachable` (Phase 1.1, D7). Nothing
-downstream re-derives `outcome_type` or `fault_class` from message text -
-`_render_message` in `interceptor/middleware.py` goes the other direction,
+`verifier_unreachable`, `malformed_policy_response` (Phase 1.1, P11-3),
+`content_store_unreachable` (Phase 1.1, D7), `tool_execution_failed`
+(Phase 2, D14 - `spiffe_unavailable` occupied this slot before Phase 2
+moved the mTLS handshake to the agent's own client leg, where it produces
+no ledger entry at all; see the Documented Boundary section below),
+`intent_write_failed` (D16, Phase 2 completion pass). Nothing downstream
+re-derives `outcome_type` or `fault_class` from message text -
+`_render_message` in `decision_service/main.py` goes the other direction,
 from the already-decided type to presentational text.
 
 `malformed_policy_response` covers a 200 response from OPA's `/evaluation`
@@ -207,24 +211,45 @@ a ceiling on what attribution can ever mean here, not a gap particular to
 
 ## Documented boundary
 
-Four of the six fault classes (`opa_unreachable`, `revision_unavailable`,
-`spiffe_unavailable`, `malformed_policy_response`) still produce a ledger
-record - the call could not be evaluated, but the fact of that failure can
-still be durably recorded. The other two cannot, for the same underlying
-reason: each is discovered in a path that itself precedes, or is, the write
-that would record it, and a fault in the recording path cannot be recorded
-through that same path.
+Five of the seven fault classes (`opa_unreachable`, `revision_unavailable`,
+`malformed_policy_response`, `tool_execution_failed`, `intent_write_failed`)
+still produce a ledger record - the call could not be evaluated, or its
+mediated execution or the write-ahead intent gating it failed, but the fact
+of that failure can still be durably recorded. The other two cannot, for the
+same underlying reason: each is discovered in a path that itself precedes,
+or is, the write that would record it, and a fault in the recording path
+cannot be recorded through that same path.
 
 `verifier_unreachable` is discovered when the ledger write itself fails.
 `content_store_unreachable` (D7, Phase 1.1) is discovered one step earlier -
 the content write, which now happens *before* the ledger write, fails - and
-`intercept_tool_call` skips the ledger write entirely rather than record an
-entry whose `content_state` it cannot yet describe. Both cases: `outcome_type:
-fault` and the fault class are returned to the caller and to Prometheus, but
-`ledger_tx_id` is omitted entirely - there is no ledger entry to point to, in
-either case. This is a structural limit, not an oversight: nothing can write
-a durable record of "the durable-record writer is down," or of "the store
-this record's content_state would name is itself down."
+`decide()` (`decision_service/main.py`, D12) skips the ledger write entirely
+rather than record an entry whose `content_state` it cannot yet describe.
+Both cases: `outcome_type: fault` and the fault class are returned to the
+caller and to Prometheus, but `ledger_tx_id` is omitted entirely - there is
+no ledger entry to point to, in either case. This is a structural limit, not
+an oversight: nothing can write a durable record of "the durable-record
+writer is down," or of "the store this record's content_state would name is
+itself down."
+
+`intent_write_failed` (D16, Phase 2 completion pass) is a different case
+again, and deliberately not grouped with `verifier_unreachable` above even
+though both name the same underlying ledger-write path: the write-ahead
+intent write (`ledger/immudb_ledger.py::log_tool_intent`, called
+immediately before a mediated tool's own execution) is a *separate* write
+from the completion record documenting its own failure. When the intent
+write fails, execution is refused outright - see `docs/adr/0009-write-ahead-
+intent-and-per-tool-verification.md` - and the completion write that follows
+(content already stored, policy already resolved) succeeds normally,
+producing a real, ledger-verified record with `fault_class:
+intent_write_failed`. The genuinely undocumentable case is the opposite
+ordering: an intent write that *succeeds*, followed by a completion write
+that fails. That case produces no `fault` record at all - by the same
+structural limit as `verifier_unreachable` - but it is not silent: D16 makes
+it detectable at read time as `execution_state: "unknown"` in `/audit`
+(`control_plane/main.py::get_audit`), the one place in this taxonomy where a
+gap in the record is itself turned into a recorded, closed-set state rather
+than an absence.
 
 This is the one place in the whole system where "the record tells the
 truth" cannot mean "there is always a record." It means the caller and the

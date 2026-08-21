@@ -35,6 +35,11 @@ COPY --from=builder /install /usr/local
 
 # Bake application source into the image layer.
 # Only the directories the agent runtime needs — keeps the image lean.
+#
+# ledger/ is deliberately NOT copied here (Phase 2, D12): the agent process
+# holds no verifier credential and no ledger path any more. The ledger write
+# (and the schema/OPA evaluation that used to live in interceptor/) now runs
+# in decision_service/, a separate container the agent has no network route
+# to (see docker-compose.yml's edge/backend network split).
 COPY interceptor/   ./interceptor/
 COPY framework_integration/ ./framework_integration/
-COPY ledger/        ./ledger/

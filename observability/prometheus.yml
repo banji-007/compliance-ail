@@ -18,10 +18,12 @@ scrape_configs:
     # OPA natively exposes Prometheus metrics for policy decisions,
     # bundle loading, and performance telemetry
     
-  # AIL Interceptor middleware metrics
-  - job_name: 'ail-middleware'
+  # AIL decision-service metrics (Phase 2, D12: moved here from the agent
+  # process - langgraph-demo no longer runs a metrics server at all, since
+  # it no longer makes the decision this metric counts).
+  - job_name: 'ail-decision-service'
     static_configs:
-      - targets: ['langgraph-demo:8000']
+      - targets: ['decision-service:8000']
     scrape_interval: 5s
 
   # Prometheus self-monitoring

@@ -39,8 +39,9 @@ import yaml
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 _GUARDED = {
-    "opa": "8181",       # P13-1: OPA's Data + management API, same listener
-    "verifier": "8003",  # P13-2: the verifier's /write and /verify
+    "opa": "8181",               # P13-1: OPA's Data + management API, same listener
+    "verifier": "8003",          # P13-2: the verifier's /write and /verify
+    "decision-service": "8010",  # P2-1 (Phase 2): schema/OPA/ledger, moved out of the agent
 }
 
 # R1: every surface that can change policy or write a record, across every
@@ -56,6 +57,10 @@ _MANAGEMENT_OR_RECORD_PORTS = {
     "verifier": ["8003"],
     "spire-server": ["8081"],
     "envoy": ["9901"],
+    # P2-1 (Phase 2): decision-service holds the same reach opa/verifier/
+    # ail-control-plane do (it is the only thing that talks to all three) -
+    # never published to the host in the deployment compose either.
+    "decision-service": ["8010"],
 }
 
 _DEPLOYMENT_COMPOSE = "docker-compose.yml"

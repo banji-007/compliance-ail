@@ -585,8 +585,24 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
         verification   - {state, state_id, detail, error_class}; state is one
                           of verified | failed | unverifiable | asserted | not_found
         profile        - conformance profile this record was produced under
-                          (P13-8); "observed" is the only value that exists
-                          today. See docs/adr/0005-outcome-taxonomy.md.
+                          (P13-8): "observed" or "mediated". See
+                          docs/adr/0005-outcome-taxonomy.md.
+        exclusivity    - "demonstrated" | "declared" | null (D13, Phase 2);
+                          only ever set for a "mediated" record - the
+                          gateway's own verified answer, never the tool's
+                          config claim. null for every "observed" record.
+        execution_state - "completed" | "unknown" | "n/a" (D16, Phase 2
+                          completion pass): "unknown" means a write-ahead
+                          intent record exists for this call_id with no
+                          matching completion record - the mediated tool
+                          executed but its outcome was never durably
+                          recorded (e.g. the ledger became unreachable
+                          between the intent write and the completion
+                          write). "completed" means both records exist.
+                          "n/a" means this call was never subject to the
+                          intent/completion protocol at all (every
+                          "observed" record, and any mediated call denied
+                          or faulted before reaching the intent write).
     """
     if not IMMUDB_USER or not IMMUDB_PASSWORD:
         raise HTTPException(
@@ -640,6 +656,25 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             tombstone_scan_resp.raise_for_status()
             raw_tombstones = tombstone_scan_resp.json().get("entries", [])
 
+            # D16 (Phase 2 completion pass): a third scan, over
+            # tool_call_intent: keys - the write a mediated tool's execution
+            # is gated behind (ledger/immudb_ledger.py::log_tool_intent),
+            # never tool_call:. Joined against the decision entries below by
+            # call_id, the same way tombstones are joined, so an intent with
+            # no matching completion record can be surfaced instead of
+            # silently missing from this response.
+            intent_scan_resp = client.post(
+                f"{IMMUDB_URL}/api/v2/db/scan",
+                json={
+                    "prefix": base64.b64encode(b"tool_call_intent:").decode(),
+                    "desc": True,
+                    "limit": limit,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            intent_scan_resp.raise_for_status()
+            raw_intents = intent_scan_resp.json().get("entries", [])
+
     except httpx.HTTPStatusError as exc:
         logger.error("ImmuDB HTTP error during audit scan: %s", exc)
         raise HTTPException(status_code=502, detail=f"ImmuDB returned {exc.response.status_code}")
@@ -655,6 +690,24 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
                 tombstoned_call_ids.add(value["call_id"])
         except Exception as exc:
             logger.warning("Skipping malformed tombstone entry: %s", exc)
+            continue
+
+    # D16: intent records keyed by call_id, for the completion join below.
+    # A record_type check (not just the key prefix) mirrors D11's own
+    # tombstone-classification discipline.
+    intent_by_call_id: dict[str, dict] = {}
+    for raw in raw_intents:
+        try:
+            value = json.loads(base64.b64decode(raw["value"]).decode())
+            if value.get("record_type") != "decision_intent" or not value.get("call_id"):
+                continue
+            intent_by_call_id[value["call_id"]] = {
+                **value,
+                "tx_id": int(raw.get("tx", 0)),
+                "encoded_key": raw.get("key", ""),
+            }
+        except Exception as exc:
+            logger.warning("Skipping malformed intent entry: %s", exc)
             continue
 
     # --- Verify each entry via the verifier service; join content by call_id ---
@@ -733,9 +786,85 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
                 # (docs/adr/0005-outcome-taxonomy.md) so it cannot be
                 # confused with a real profile value.
                 "profile":         log_entry.get("profile", "unknown"),
+                # D13/P2-3 (Phase 2): only ever set for a mediated record -
+                # decision_service only writes this key at all when
+                # resolve_exclusivity returned non-None (immudb_ledger.py's
+                # log_tool_call omits the key entirely otherwise, so a
+                # missing key here means "not applicable", not "unknown").
+                "exclusivity":     log_entry.get("exclusivity"),
+                # D16 (Phase 2 completion pass): "completed" if a
+                # tool_call_intent: record exists for this call_id (the
+                # normal case whenever this completion record itself
+                # exists) - "n/a" if none does, meaning this call was never
+                # subject to the write-ahead-intent protocol at all (every
+                # "observed" tool call, and any read_vault_secret call that
+                # was denied or faulted before reaching the intent write).
+                # "unknown" is never assigned here - it only ever appears on
+                # the synthesized entries below, for an intent with no
+                # completion record at all.
+                "execution_state": "completed" if call_id in intent_by_call_id else "n/a",
             })
         except Exception as exc:
             logger.warning("Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc)
+            continue
+
+    # D16: any intent record whose call_id never showed up as a completion
+    # entry above executed (the intent write only happens right before
+    # _execute_vault_tool, and a failed intent write never produces an
+    # intent record at all - see decision_service/main.py) but never got a
+    # durable outcome recorded. Synthesized here, from the intent record's
+    # own fields, rather than silently omitted - this is the entire point
+    # of D16: the gap between execution and recording becomes visible
+    # instead of just absent from /audit.
+    completed_call_ids = {e["call_id"] for e in entries if e["call_id"]}
+    for call_id, intent in intent_by_call_id.items():
+        if call_id in completed_call_ids:
+            continue
+        try:
+            encoded_key = intent.get("encoded_key", "")
+            try:
+                with httpx.Client(timeout=10.0) as vc:
+                    vr = vc.post(f"{VERIFIER_URL}/verify", json={"key": encoded_key})
+                if vr.status_code == 200:
+                    verification = _verification_from_200(vr.json())
+                else:
+                    verification = {
+                        "state": "unverifiable", "state_id": None,
+                        "detail": f"verifier returned HTTP {vr.status_code}", "error_class": None,
+                    }
+            except Exception as vexc:
+                verification = {
+                    "state": "unverifiable", "state_id": None,
+                    "detail": str(vexc), "error_class": None,
+                }
+
+            content_row = db.query(CallContent).filter_by(call_id=call_id).first()
+            has_tombstone = call_id in tombstoned_call_ids
+            payload_state, payload = _payload_state(intent.get("content_state"), content_row, has_tombstone)
+
+            entries.append({
+                "tx_id":           intent["tx_id"],
+                "call_id":         call_id,
+                "agent_id":        intent.get("agent_id"),
+                "timestamp":       intent.get("timestamp"),
+                "tool_name":       intent.get("tool_name"),
+                # This is what the intent recorded: approved, about to
+                # execute. It is not a claim about what actually happened -
+                # execution_state "unknown" is the honest signal for that.
+                "outcome_type":    "policy_allow",
+                "fault_class":     None,
+                "policy_revision": intent.get("policy_revision"),
+                "reasons":         [],
+                "input_sha256":    intent.get("input_sha256"),
+                "payload":         payload,
+                "payload_state":   payload_state,
+                "verification":    verification,
+                "profile":         intent.get("profile", "unknown"),
+                "exclusivity":     None,
+                "execution_state": "unknown",
+            })
+        except Exception as exc:
+            logger.warning("Skipping malformed intent entry for call_id=%s: %s", call_id, exc)
             continue
 
     logger.info(

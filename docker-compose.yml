@@ -38,6 +38,11 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    # P2-1 (Phase 2): backend-only. Never reachable from the agent
+    # (langgraph-demo, edge-only) - see the networks: block at the bottom
+    # of this file and docs/adr/0008-decision-service-boundary.md.
+    networks:
+      - backend
 
   opa:
     image: openpolicyagent/opa:1.14.1
@@ -84,6 +89,11 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    # P2-1: backend-only, same reasoning as ail-control-plane above. This is
+    # the surface U1/U8 (docs/reports/phase-1-2-redteam.md) used when the
+    # agent shared this network - it no longer does.
+    networks:
+      - backend
 
   immudb:
     image: codenotary/immudb:1.9.5
@@ -116,11 +126,16 @@ services:
       retries: 5
       start_period: 15s
     restart: unless-stopped
+    networks:
+      - backend
 
   # AIL Verifier — isolated immudb-py (gRPC) wrapper.
   # Keeps the SDK's protobuf dependency out of the interceptor process so
-  # SPIFFE mTLS is not compromised (see ADR-0001). Both the interceptor and
-  # the control plane call this service for all verified writes and reads.
+  # SPIFFE mTLS is not compromised (see ADR-0001). The decision service and
+  # the control plane call this service for all verified writes and reads
+  # (Phase 2, D12 - the agent's own interceptor process used to call it
+  # directly; it no longer holds VERIFIER_URL or any route to this network
+  # segment at all).
   verifier:
     build:
       context: ./verifier
@@ -129,11 +144,13 @@ services:
     # showed host.docker.internal reaches a loopback-bound port from any
     # container on the Docker host, so binding alone does not close this -
     # /write and /verify carry no authentication of their own (the exact
-    # surface red-team U5 used to forge a tombstone). Residual: anything
-    # inside the compose network, including the agent container, still
-    # reaches both endpoints unauthenticated - see docs/reports/
-    # phase-1-3-complete.md. The test stack still publishes this port,
-    # loopback-bound, deliberately - see docker-compose.test.yml.
+    # surface red-team U5 used to forge a tombstone). P2-1 (Phase 2) closes
+    # the residual this comment used to describe (the agent container
+    # sharing this network): the agent is edge-only now and this service is
+    # backend-only, so the agent has no route here at all, mutation-tested
+    # in tests/test_decision_service_network_isolation.py. The test stack
+    # still publishes this port, loopback-bound, deliberately - see
+    # docker-compose.test.yml.
     environment:
       - IMMUDB_ADDR=immudb:3322
       - IMMUDB_USER=${IMMUDB_USER}
@@ -158,6 +175,8 @@ services:
       retries: 5
       start_period: 20s
     restart: unless-stopped
+    networks:
+      - backend
 
   spire-server:
     image: ghcr.io/spiffe/spire-server:1.11.1
@@ -180,6 +199,8 @@ services:
       start_period: 20s
     restart: unless-stopped
     command: ["/opt/spire/bin/spire-server", "run", "-config", "/opt/spire/conf/server/server.conf"]
+    networks:
+      - backend
 
   spire-agent:
     image: ghcr.io/spiffe/spire-agent:1.11.1
@@ -206,6 +227,8 @@ services:
     # token is never re-used, which is what caused the crash-loop.
     restart: "no"
     command: ["/opt/spire/bin/spire-agent", "run", "-config", "/opt/spire/conf/agent/agent.conf"]
+    networks:
+      - backend
 
   spire-agent-watchdog:
     image: docker:cli
@@ -222,6 +245,8 @@ services:
       - ./scripts/spire-watchdog.sh:/opt/spire/watchdog.sh:ro
     entrypoint: ["/bin/sh", "/opt/spire/watchdog.sh"]
     restart: unless-stopped
+    networks:
+      - backend
 
   envoy:
     image: envoyproxy/envoy:v1.27.7
@@ -237,10 +262,19 @@ services:
     depends_on:
       spire-agent:
         condition: service_started
-      opa:
+      decision-service:
         condition: service_healthy
     restart: always
     command: ["/usr/local/bin/envoy", "-c", "/etc/envoy/envoy.yaml"]
+    # P2-1 (Phase 2): the only dual-homed service. edge, to accept the
+    # agent's mTLS connection; backend, to reach decision-service (its
+    # retargeted upstream cluster - see envoy/envoy.yaml). This mirrors the
+    # segmented-HTTP topology docs/reports/spike-mcp-mediation.md confirmed
+    # safe: a client on edge alone cannot resolve or route to anything on
+    # backend directly, only through this proxy.
+    networks:
+      - edge
+      - backend
 
   python-mtls-test:
     image: python:3.11-slim
@@ -259,6 +293,11 @@ services:
         condition: service_started
       workload-registrar:
         condition: service_completed_successfully
+    # Diagnostic smoke test for the Envoy mTLS handshake only - talks to
+    # envoy, nothing on backend. edge is sufficient and keeps this test
+    # container out of the segment P2-1 is protecting.
+    networks:
+      - edge
 
   workload-registrar:
     image: docker:cli
@@ -273,6 +312,60 @@ services:
         condition: service_healthy
     restart: "no"
     entrypoint: ["/bin/sh", "/opt/register.sh"]
+    networks:
+      - backend
+
+  # AIL Decision Service (Phase 2, D12) — owns schema validation, the OPA
+  # query, the ledger write, and the D14 mediated tool's execution. The
+  # agent sends one request to POST /decide and gets back a verdict; this
+  # is the only thing on the network that can reach opa, verifier,
+  # ail-control-plane, or immudb.
+  decision-service:
+    build:
+      context: .
+      dockerfile: decision_service/Dockerfile
+    environment:
+      - OPA_URL=http://opa:8181/v1/data/ail/main/evaluation
+      - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
+      - VERIFIER_URL=http://verifier:8003
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      # Content-store writes (D5, D7) - moved here from the agent's own env
+      # (D12). Write-scoped key, never the read key (D6).
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
+      - VAULT_TOKEN_PATH=/run/secrets/vault_api_token
+    secrets:
+      # D14: attached only here, never to langgraph-demo - this container
+      # attachment is the primary boundary. mode: 0400 is declared for
+      # Swarm-mode compatibility but plain `docker compose` ignores it
+      # (Compose says so directly at startup); decision_service/main.py's
+      # own startup check (_verify_mcp_stdio_secret_mount) does not rely on
+      # it either - it confirms the mount is read-only to the container
+      # itself before recording exclusivity: demonstrated for
+      # read_vault_secret. This is the credential-delivery boundary
+      # tests/test_credential_boundary_static.py asserts statically and
+      # tests/test_vault_tool_bypass.py exercises live from inside the
+      # agent container.
+      - source: vault_api_token
+        target: vault_api_token
+        mode: 0400
+    depends_on:
+      opa:
+        condition: service_healthy
+      verifier:
+        condition: service_healthy
+      ail-control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8010/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    # backend-only: reached exclusively through envoy's retargeted mTLS
+    # listener (envoy/envoy.yaml). No edge membership, ever.
+    networks:
+      - backend
 
   langgraph-demo:
     build:
@@ -282,18 +375,14 @@ services:
     tty: true
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # Interceptor writes go to verifier (SDK-verified writes), not direct REST.
-      - VERIFIER_URL=http://verifier:8003
-      - IMMUDB_USER=${IMMUDB_USER}
-      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD}
       - SPIFFE_ENDPOINT_SOCKET=unix:///tmp/spire-sockets/workload_api.sock
-      - OPA_URL=https://envoy:8443/v1/data/ail/main/allow
+      # D12 (Phase 2): the agent's only outbound target for anything AIL-
+      # related. It holds no VERIFIER_URL, no IMMUDB_USER/PASSWORD, no
+      # CONTROL_PLANE_URL/WRITE_KEY, and no direct OPA_URL any more - see
+      # docs/adr/0008-decision-service-boundary.md and
+      # tests/test_decision_service_network_isolation.py.
+      - DECISION_SERVICE_URL=https://envoy:8443/decide
       - SPIRE_DISABLED=false
-      - CONTROL_PLANE_URL=http://ail-control-plane:8002
-      # Content-store writes (D5, D7) go straight to the control plane, not
-      # through the verifier - POST /content is a mutating route, so this
-      # uses the write-scoped key, never the read key (D6).
-      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}
       - AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}
     volumes:
@@ -311,14 +400,20 @@ services:
     depends_on:
       spire-agent:
         condition: service_started
-      opa:
-        condition: service_healthy
-      verifier:
-        condition: service_healthy
       envoy:
         condition: service_started
+      decision-service:
+        condition: service_healthy
       policy-validator:
         condition: service_completed_successfully
+    # P2-1 (Phase 2), the exit criterion's own mechanism: edge-only. No
+    # route to opa, verifier, ail-control-plane, or immudb exists from this
+    # container at all - not authenticated-away, structurally absent. See
+    # tests/test_decision_service_network_isolation.py, which asserts this
+    # by inspecting the running container's actual network attachments, and
+    # tests/test_vault_tool_bypass.py, which confirms it live.
+    networks:
+      - edge
 
   # Epic 4: Observability & Telemetry
   prometheus:
@@ -336,6 +431,8 @@ services:
       - "--storage.tsdb.retention.time=200h"
       - "--web.enable-lifecycle"
     restart: unless-stopped
+    networks:
+      - backend
 
   grafana:
     image: grafana/grafana:10.4.2
@@ -354,6 +451,8 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
+    networks:
+      - backend
 
   token-generator:
     image: docker:cli
@@ -437,6 +536,8 @@ services:
         } > /opt/spire/agent-config/agent.conf
         echo "agent.conf written"
         echo "=== Token generation complete ==="
+    networks:
+      - backend
 
   # Validates all Rego policies (core + all packs) compile cleanly before
   # the agent starts. Checks the full source tree regardless of which packs
@@ -482,6 +583,27 @@ services:
       ail-control-plane:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - backend
+
+networks:
+  # P2-1 (Phase 2): the agent's only network. It can resolve and route to
+  # envoy (dual-homed below) and nothing else in this file - opa, verifier,
+  # ail-control-plane, and immudb all live on backend only.
+  edge:
+  # Everything the agent must never reach directly. envoy is the sole
+  # bridge (dual-homed). This is what makes U1's manifest forgery, U5's
+  # forged tombstone, and U8's unauthenticated policy replacement
+  # (docs/reports/phase-1-2-redteam.md) unrepresentable from the agent's
+  # network position, not just untested from it.
+  backend:
+
+secrets:
+  # D14 demonstration credential. Generated by "make keygen" (gitignored,
+  # never committed - see .gitignore). Attached only to decision-service,
+  # below.
+  vault_api_token:
+    file: ./decision_service/secrets/vault_api_token.txt
 
 volumes:
   spire-server-data:

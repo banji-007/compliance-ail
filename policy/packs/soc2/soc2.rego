@@ -48,3 +48,19 @@ deny contains msg if {
     payload.bypass_ci == true
     msg := "SOC2 CC8.1 Violation: Bypassing CI/CD pipeline checks is strictly prohibited."
 }
+
+# --- read_vault_secret rules (Phase 2, D14 demonstration tool) ---
+
+# SOC2 CC6.1: least-privilege secret access - only a fixed allowlist of
+# operational secrets may be read through this tool, regardless of who is
+# asking. Genuine policy evaluation, not a rubber stamp: this is what lets
+# the Phase 2 demonstration show both an APPROVED and a DENIED mediated
+# call in the same session (docs/reports/phase-2.md, P2-3).
+_approved_vault_secrets := {"db_master_password", "payment_gateway_key"}
+
+deny contains msg if {
+    input.tool_name == "read_vault_secret"
+    payload := input.tool_args
+    not _approved_vault_secrets[payload.secret_name]
+    msg := sprintf("DENIED: SOC2 Least-Privilege Violation. Secret '%v' is not in the approved vault-access allowlist.", [object.get(payload, "secret_name", "")])
+}

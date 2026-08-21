@@ -30,20 +30,48 @@ mTLS, matching Makefile:45-53. Assumes tenant_default's seeded config
 (control_plane/main.py's lifespan seeding): approved_regions =
 "eu-central-1,us-east-1", approved_purposes = "customer_support,billing",
 allowed_cost_centers = "engineering,marketing,finance,operations".
+
+Migrated in Phase 2 (P2-1): query_opa_policy moved from
+interceptor/middleware.py to decision_service/main.py (D12). The exact
+denial strings asserted here come from the Rego policy itself, unaffected
+by which process calls OPA, so only the import target changes.
 """
 
+import importlib.util as _importlib_util
 import os
 import sys
 
 import httpx
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+# decision_service/main.py's own `from schemas import ...` needs this
+# directory on sys.path - loading main.py itself via spec_from_file_location
+# below (to dodge the module-name collision, see _load_decision_service_main)
+# does not add its own directory to sys.path automatically the way a normal
+# package-relative import would.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "decision_service"))
+
+
+def _load_decision_service_main():
+    """decision_service/main.py and control_plane/main.py are both named
+    main.py - a bare `import main` clobbers sys.modules["main"] for every
+    other test file in the same pytest session regardless of which
+    sys.path entry was active when the import ran. Loading this one under
+    its own explicit module name sidesteps the collision."""
+    spec = _importlib_util.spec_from_file_location(
+        "decision_service_main",
+        os.path.join(os.path.dirname(__file__), "..", "decision_service", "main.py"),
+    )
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules["decision_service_main"] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
-os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
+os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluation")
 
-from middleware import query_opa_policy  # noqa: E402
+query_opa_policy = _load_decision_service_main().query_opa_policy
 
 
 def _opa_reachable() -> bool:

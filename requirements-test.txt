@@ -12,6 +12,16 @@
 #                        _verification_from_200/_payload_state (P11-8) without
 #                        needing a fabricated key that is both scanned by
 #                        ImmuDB and never written
+#   mcp                — decision_service/main.py is imported directly (Phase 2,
+#                        P2-1, same reason as control_plane/main.py above) by
+#                        several tests (test_outcome_types.py and others) -
+#                        pinned to match decision_service/requirements.txt's
+#                        resolved version exactly, and starlette pinned
+#                        explicitly below it: mcp's own dependency chain
+#                        (via sse-starlette) resolves a starlette newer than
+#                        fastapi==0.115.6 tolerates if left unconstrained -
+#                        confirmed live, this exact conflict broke test
+#                        collection until pinned.
 pytest==8.3.5
 httpx==0.28.1
 pydantic==2.12.5
@@ -19,8 +29,11 @@ prometheus-client==0.21.1
 openai==2.26.0
 python-dotenv==1.2.2
 fastapi==0.115.6
+starlette==0.41.3
 sqlalchemy==2.0.36
-# PyYAML - tests/test_host_port_bindings.py parses docker-compose.yml and
-#          docker-compose.test.yml the same way Compose itself does
-#          (P13-1, P13-2, Phase 1.3)
+mcp==1.12.4
+# PyYAML - tests/test_host_port_bindings.py and
+#          tests/test_decision_service_network_isolation.py parse
+#          docker-compose.yml and docker-compose.test.yml the same way
+#          Compose itself does (P13-1, P13-2, Phase 1.3; P2-1, Phase 2)
 PyYAML==6.0.3
