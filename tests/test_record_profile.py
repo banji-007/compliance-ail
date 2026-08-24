@@ -39,6 +39,10 @@ READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 IMMUDB_URL = os.getenv("IMMUDB_URL", "http://localhost:8080")
 IMMUDB_USER = os.getenv("IMMUDB_USER", "immudb")
 IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD", "immudb")
+# D21 (Phase 3a completion): this file's own direct forged-record write below
+# needs the verifier's write-scoped credential now - see
+# docs/adr/0011-verifier-authentication.md.
+VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 
 _CLOSED_PROFILE_SET = {"observed", "mediated", "attested"}
 
@@ -196,6 +200,7 @@ def test_audit_forged_profile_less_record_renders_as_unknown_not_observed():
     write_resp = httpx.post(
         f"{os.getenv('VERIFIER_URL', 'http://localhost:8003')}/write",
         json={"key": b64(key), "value": b64(json.dumps(entry))},
+        headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=15,
     )
     write_resp.raise_for_status()

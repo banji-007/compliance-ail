@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-08-21T15:56:43.004371Z",
+  "generated_by": "tools/export_evidence_fixtures.py",
+  "agent_id": "p3a_fixture_96d87a2f",
+  "signing_key_fingerprint": "sha256:cc837c537fe429fa4c565919004bd8a799a55e525aa639a669052647b719d6f8",
+  "record_types": [
+    "content_erasure",
+    "fault",
+    "policy_allow",
+    "policy_deny"
+  ]
+}

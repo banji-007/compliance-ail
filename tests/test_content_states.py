@@ -101,6 +101,10 @@ READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 WRITE_API_KEY = os.getenv("CONTROL_PLANE_WRITE_KEY", "test-write-key")
 VERIFIER_URL = os.getenv("VERIFIER_URL", "http://localhost:8003")
 VERIFIER_HEALTH_URL = VERIFIER_URL + "/health"
+# D21 (Phase 3a completion): _write_tombstone_directly below forges a
+# tombstone straight against the verifier's /write and now needs its
+# write-scoped credential - see docs/adr/0011-verifier-authentication.md.
+VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = "docker-compose.test.yml"
 
@@ -495,11 +499,12 @@ def test_erasure_tombstone_not_a_second_decision_entry():
 def _write_tombstone_directly(call_id: str) -> None:
     """
     Forge a content_erasure tombstone via the verifier's own /write, the
-    same way red-team U4/U5 did - bypassing DELETE /content/{call_id}, the
-    control plane, and any auth entirely. Used here to construct
-    combination 1 (a tombstone with the row still present), which the real
-    endpoint's own ordering (tombstone, then delete) cannot produce on its
-    own.
+    same way red-team U4/U5 did - bypassing DELETE /content/{call_id} and
+    the control plane's own tombstone-conflict logic entirely. Since D21
+    (Phase 3a completion) this needs the verifier's write-scoped credential
+    (a caller who could reach this network position without it is refused,
+    see docs/adr/0011-verifier-authentication.md); it still bypasses every
+    check the real endpoint layers on top of a bare write.
     """
     tombstone = {
         "record_type": "content_erasure",
@@ -515,6 +520,7 @@ def _write_tombstone_directly(call_id: str) -> None:
             "key": base64.b64encode(key.encode()).decode(),
             "value": base64.b64encode(serialized.encode()).decode(),
         },
+        headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=15,
     )
     resp.raise_for_status()

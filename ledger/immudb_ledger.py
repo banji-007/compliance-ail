@@ -8,6 +8,10 @@ interceptor process and preserving the SPIFFE mTLS posture (ADR-0001).
 Fail-closed: if the verifier is unreachable or returns verified: false, this
 module raises, causing the middleware to return DENY rather than allowing
 execution without a durable, verified audit record.
+
+D21 (Phase 3a completion): every write carries VERIFIER_WRITE_KEY
+(docs/adr/0011-verifier-authentication.md) - an unset or wrong key fails the
+same way any other verifier error does (raises here, DENY at the middleware).
 """
 
 import base64
@@ -23,6 +27,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _VERIFIER_URL = os.getenv("VERIFIER_URL", "http://verifier:8003")
+
+# D21 (Phase 3a completion): the verifier's own write-scoped credential
+# (docs/adr/0011-verifier-authentication.md), independent of
+# CONTROL_PLANE_WRITE_KEY. decision-service is provisioned with this key
+# only, never VERIFIER_READ_KEY - the ledger client here only ever writes.
+_VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "")
 
 # P13-8 (Phase 1.3) introduced this as a single deployment-wide constant.
 # D13/P2-3 (Phase 2) makes profile a property of the tool, not the
@@ -125,6 +135,7 @@ class ImmuDBLedger:
                 resp = client.post(
                     f"{self.verifier_url}/write",
                     json={"key": encoded_key, "value": encoded_val},
+                    headers={"X-API-Key": _VERIFIER_WRITE_KEY},
                 )
                 resp.raise_for_status()
 
@@ -196,6 +207,7 @@ class ImmuDBLedger:
                 resp = client.post(
                     f"{self.verifier_url}/write",
                     json={"key": encoded_key, "value": encoded_val},
+                    headers={"X-API-Key": _VERIFIER_WRITE_KEY},
                 )
                 resp.raise_for_status()
 
