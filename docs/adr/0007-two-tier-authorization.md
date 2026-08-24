@@ -134,3 +134,6 @@ just the layer where the regression happened to land.
   `::test_control_plane_get_bundle_rejected_with_wrong_key`,
   `::test_control_plane_get_bundle_accepted_with_read_key`,
   `::test_opa_still_loads_bundle_through_the_now_credentialed_poll` (R4)
+- `docs/adr/0011-verifier-authentication.md` (D21, Phase 3a completion) -
+  extends this same two-tier pattern to a third service, `verifier/main.py`,
+  with its own independent credential pair

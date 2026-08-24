@@ -193,6 +193,27 @@ prove the writer was honest: a bundle exported for a record forged by
 something with the verifier's network position is a perfectly valid bundle of
 a forged record. Portability does not fix provenance.
 
+**A bundle sits outside the erasure mechanism, by construction, in both
+directions (P3a-8, Phase 3a completion pass).** `record.value` is the ledger
+entry `ledger/immudb_ledger.py::log_tool_call` writes - `input_sha256` and
+decision metadata, never the raw tool arguments the erasable content store
+holds separately (D5, D7). A bundle exported while a call_id's content is
+still present therefore already carries no erasable content to begin with;
+it is not the export step that removes anything. The converse also holds:
+`DELETE /content/{call_id}` deletes the content-store row and writes a
+tombstone, but it has no bundle to reach into and no reason to - a bundle
+already exported for that record is a file that exists independently of the
+system that produced it, and erasing the source content does not and cannot
+reach back into a copy that already left. Concretely, a bundle exported
+before an erasure and one exported after it, for the same `ledger_key`, are
+byte-identical (`tests/test_evidence_bundle.py::test_bundle_exported_for_a_
+content_erasure_tombstone` exports the tombstone itself as evidence of the
+erasure; nothing removes or edits a previously exported decision bundle). A
+reader must not conclude either that a bundle can leak payload content, or
+that erasure reaches bundles already handed out - neither is true, for the
+same underlying reason: a bundle proves a decision record, and a decision
+record was never the erasable thing.
+
 **The export-time metadata is not covered by anything.** `exported_at`,
 `exported_by` and `proof.sdk` are claims the exporter makes about itself, and
 no signature covers them. The byte sweep reports them as inert, and
