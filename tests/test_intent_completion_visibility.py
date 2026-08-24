@@ -69,6 +69,10 @@ IMMUDB_URL = os.getenv("IMMUDB_URL", "http://localhost:8080")
 VERIFIER_URL = os.getenv("VERIFIER_URL", "http://localhost:8003")
 IMMUDB_USER = os.getenv("IMMUDB_USER", "immudb")
 IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD", "immudb")
+# D21 (Phase 3a completion): this file's own direct forged-intent write
+# below needs the verifier's write-scoped credential now - see
+# docs/adr/0011-verifier-authentication.md.
+VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 
 
 def _opa_reachable() -> bool:
@@ -248,6 +252,7 @@ def test_orphaned_intent_with_no_completion_surfaces_as_unknown():
     write_resp = httpx.post(
         f"{VERIFIER_URL}/write",
         json={"key": b64(key), "value": b64(json.dumps(entry))},
+        headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=15,
     )
     write_resp.raise_for_status()

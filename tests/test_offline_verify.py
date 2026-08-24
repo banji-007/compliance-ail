@@ -22,7 +22,10 @@ import ast
 import base64
 import importlib.util as _importlib_util
 import json
+import re
 import socket
+import subprocess
+import sys
 from pathlib import Path
 
 import ecdsa
@@ -682,3 +685,57 @@ def test_load_bundle_refuses_an_unknown_proof_format(tmp_path):
     with pytest.raises(checker.BundleCheckFailed) as excinfo:
         checker.load_bundle(path)
     assert excinfo.value.result_class == checker.MALFORMED_BUNDLE
+
+
+# ---------------------------------------------------------------------------
+# P3a-9 (Phase 3a completion pass): the README §3.4.1 command block, run as
+# a real subprocess rather than a library call.
+#
+# docs/reports/phase-3a.md's own mapping table cited this claim ("the
+# ail_verify_bundle.py command block") against a live transcript only - no
+# committed test invoked the CLI/argparse entry point (main(), the
+# `if __name__ == "__main__"` branch, sys.argv parsing) as opposed to the
+# library functions (check(), verify_bundle()) every other test in this file
+# calls directly. This test closes that gap: a real subprocess, the exact
+# command README.md §3.4.1 documents, checked byte-for-byte against the
+# fixture path and flag spelling in the README's own code block rather than
+# a paraphrase of it.
+# ---------------------------------------------------------------------------
+
+def test_readme_command_block_is_exactly_reproducible():
+    """
+    Extracts the literal `python tools/ail_verify_bundle.py ...` command from
+    readME.md §3.4.1's own fenced code block and runs it as a real
+    subprocess (network untouched - the socket block this file's own module
+    import installs is process-local and does not follow into the child).
+    A change to either the README's command or the CLI's argument parsing
+    that broke the other would fail here; nothing here is paraphrased from
+    the README, it is read from it.
+    """
+    readme_text = (REPO_ROOT / "readME.md").read_text(encoding="utf-8")
+    section = readme_text.split("### 3.4.1 Portable Evidence Bundles", 1)[1]
+    section = section.split("### 3.5", 1)[0]
+    code_block = re.search(r"```bash\n(.*?)```", section, re.DOTALL)
+    assert code_block, "README §3.4.1 no longer has a ```bash command block to extract"
+    # The README wraps the command across two lines with a shell line-
+    # continuation backslash; join those first so a lone "\" doesn't survive
+    # into argv as a literal (bogus) argument.
+    joined = code_block.group(1).replace("\\\n", " ")
+    command_line = " ".join(joined.split())
+    assert command_line.startswith("python tools/ail_verify_bundle.py "), (
+        f"README §3.4.1's command block no longer starts as expected: {command_line!r}"
+    )
+
+    argv = command_line.split()[1:]  # drop the leading "python"
+    result = subprocess.run(
+        [sys.executable] + argv,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"README §3.4.1's own command exited {result.returncode}: "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "OK [verified]" in result.stdout, result.stdout

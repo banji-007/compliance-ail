@@ -50,6 +50,14 @@ CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
 VERIFIER_URL = os.getenv("VERIFIER_URL", "http://localhost:8003")
 READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 WRITE_API_KEY = os.getenv("CONTROL_PLANE_WRITE_KEY", "test-write-key")
+# D21 (Phase 3a completion): the verifier's own credential pair, independent
+# of CONTROL_PLANE_READ_KEY/WRITE_KEY above - see
+# docs/adr/0011-verifier-authentication.md. This file's own live helpers
+# (_write, _verify) call the verifier directly and need these; _export below
+# goes through the control plane, which holds these itself and needs none of
+# this file's own credentials.
+VERIFIER_READ_KEY = os.getenv("VERIFIER_READ_KEY", "test-verifier-read-key")
+VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
 
@@ -182,6 +190,7 @@ def _write(key: bytes, value: bytes) -> dict:
             "key": base64.b64encode(key).decode(),
             "value": base64.b64encode(value).decode(),
         },
+        headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=30,
     )
     resp.raise_for_status()
@@ -192,6 +201,7 @@ def _verify(key: bytes) -> dict:
     resp = httpx.post(
         f"{VERIFIER_URL}/verify",
         json={"key": base64.b64encode(key).decode()},
+        headers={"X-API-Key": VERIFIER_READ_KEY},
         timeout=30,
     )
     resp.raise_for_status()

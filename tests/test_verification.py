@@ -13,6 +13,8 @@ Environment variables (all default to docker-compose.test.yml values):
   IMMUDB_PASSWORD       immudb
   CONTROL_PLANE_URL       http://localhost:8002
   CONTROL_PLANE_READ_KEY  test-read-key
+  VERIFIER_READ_KEY       test-verifier-read-key   (D21, Phase 3a completion)
+  VERIFIER_WRITE_KEY      test-verifier-write-key  (D21, Phase 3a completion)
 
 Test map:
   1. test_parity         - Criterion 1: state_id from verifier matches what
@@ -45,6 +47,10 @@ IMMUDB_USER       = os.getenv("IMMUDB_USER",           "immudb")
 IMMUDB_PASSWORD   = os.getenv("IMMUDB_PASSWORD",       "immudb")
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL",       "http://localhost:8002")
 READ_API_KEY      = os.getenv("CONTROL_PLANE_READ_KEY",  "test-read-key")
+# D21 (Phase 3a completion): the verifier's own credential pair, independent
+# of CONTROL_PLANE_READ_KEY above - see docs/adr/0011-verifier-authentication.md.
+VERIFIER_READ_KEY  = os.getenv("VERIFIER_READ_KEY",  "test-verifier-read-key")
+VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 
 
 def b64(s: str) -> str:
@@ -55,6 +61,7 @@ def verifier_write(key_raw: str, value_raw: str) -> dict:
     resp = httpx.post(
         f"{VERIFIER_URL}/write",
         json={"key": b64(key_raw), "value": b64(value_raw)},
+        headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=15,
     )
     resp.raise_for_status()
@@ -65,6 +72,7 @@ def verifier_verify(key_raw: str) -> dict:
     resp = httpx.post(
         f"{VERIFIER_URL}/verify",
         json={"key": b64(key_raw)},
+        headers={"X-API-Key": VERIFIER_READ_KEY},
         timeout=15,
     )
     resp.raise_for_status()
