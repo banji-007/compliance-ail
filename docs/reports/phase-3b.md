@@ -525,10 +525,112 @@ All false. Confirmed individually, derived per row.
 
 ## Cleanup
 
-CLEANUP_PLACEHOLDER
+**Working directory.** A `git worktree` of this repository at
+`<scratchpad>/p3b-provenance`, on branch `phase-3b-provenance` - not the
+primary working directory. Everything below was done from there and pushed
+from there; the worktree itself is removed with `git worktree remove` as the
+last action of this phase, after this report is committed and pushed. The
+branch and its commits live in the repository, not in the scratch directory.
+
+**Scratch directory.** Removed in full. It held, and no longer holds:
+
+- `tuf-out/` and `tuf-out;C/` - the first TUF fetch of `trusted_root.json`
+  and `signing_config.json`, plus an empty directory created by a
+  mis-quoted Docker bind-mount path on the first attempt. The trust root
+  that matters is committed under `spikes/signing-anchor/` and
+  `tests/fixtures/evidence_bundles/`; these were the scratch copies.
+- `insert.md` and `patch_sweep.py` - two throwaway scripts used to splice
+  text into `docs/reports/spike-signing-anchor.md` and
+  `tools/bundle_byte_sweep.py`. Their output is committed; the scripts were
+  never part of the deliverable.
+- `sweep-full.txt` and `full-suite.txt` - captured stdout from the byte
+  sweep and the local suite run. The numbers that matter are transcribed
+  into this report; both are reproducible with the commands quoted above.
+
+**Docker.** The `p3b-bundle` compose project (used to generate the fixtures,
+including the live anchoring run) and the `p3b-provenance` compose project
+(used for the CI-equivalent suite run) were both torn down with `down -v`,
+removing their containers, volumes and networks. A third, `p3b-cfgcheck`,
+was only ever used for `docker compose config` and created nothing. Ten
+images were removed: the four per-service images of each compose project,
+plus `p3b-sigstore` (a throwaway image for running the spike's offline
+checkers) and `ail-anchor-oneshot` (built by the fixture exporter to make
+the live submission). `docker ps -a` and `docker images` both report zero
+matching entries afterwards.
+
+**Host Python environment.** This session installed `sigstore==4.5.0` into
+the host's global environment to run the offline anchor checks outside a
+container, which upgraded `cryptography` from 46.0.5 to 50.0.0 and broke
+`spiffe==0.2.5`'s own pin (`cryptography<47,>=45`) while it was installed.
+Both were reverted: `sigstore` and `sigstore-models` uninstalled,
+`cryptography` reinstalled at 46.0.5. `import spiffe, immudb, ecdsa`
+succeeds afterwards. This is the same detour and the same repair
+`docs/reports/spike-signing-anchor.md` records for the same reason.
+
+One `pip check` complaint remains and is **not** claimed as clean:
+`pyopenssl 26.4.0 has requirement cryptography<51,>=49.0.0, but you have
+cryptography 46.0.5`. Nothing in this project imports pyOpenSSL (the only
+`OpenSSL` string in the source is `cryptography`'s own
+`PrivateFormat.TraditionalOpenSSL` enum), and nothing requires it other than
+as an optional extra of `google-auth` and `pem`. Whether that version
+pre-dates this session or arrived with a sigstore install is not something
+this session can distinguish - the earlier spike made the same install and
+the same revert - so it is reported rather than guessed at, and nothing was
+uninstalled on a guess. The second `pip check` line
+(`sse-starlette` wanting a newer `starlette` than `requirements-test.txt`
+pins) is pre-existing and documented in that file's own comments.
 
 ---
 
 ## CI
 
-CI_PLACEHOLDER
+**Green.** Run id `32785456278`, job `97616336081`, conclusion `success`,
+3m9s, on `6fc2f9f71926ca96c10562f80ac2f41ac0cca4c4` (the branch head), PR
+[#10](https://github.com/banji-007/compliance-ail/pull/10).
+
+```
+$ gh run list --branch phase-3b-provenance --limit 1 --json status,conclusion,databaseId
+[{"conclusion":"success","databaseId":32785456278,"status":"completed"}]
+```
+
+CI runs `make test-integration`, which brings up `docker-compose.test.yml`
+and runs the whole suite. Two things about that are worth stating rather
+than leaving implicit.
+
+`requirements-test.txt` gained `sigstore==4.5.0`, so the offline anchor
+checks run in CI rather than only locally. The combined install was checked
+before adding it (`pip install -r requirements-test.txt && pip install
+immudb-py==1.5.0 && pip check` in a clean `python:3.11-slim`, reporting "No
+broken requirements found"), because that file is installed alongside
+`immudb-py` and a resolver conflict there would have been a wall of
+unrelated failures.
+
+`anchor-service` is not in that compose file, so **CI never touches a public
+transparency log**. The entire suite runs with external anchoring broken,
+which is what makes P3b-5's fail-open demonstration a property of every
+green run rather than something staged once.
+
+The same suite was also run locally against a fresh stack under an explicit
+`-p p3b-provenance`, matching CI's own conditions:
+
+```
+$ docker compose -p p3b-provenance -f docker-compose.test.yml down -v
+$ docker compose -p p3b-provenance -f docker-compose.test.yml up -d --build --wait
+$ COMPOSE_PROJECT_NAME=p3b-provenance ... python -m pytest tests/ -q
+286 passed, 9 skipped, 1 warning in 755.50s (0:12:35)
+```
+
+295 tests collected, up from 206 before this phase; the 9 skips are the same
+9 that were skipping before it (environment-gated tests that name their own
+condition), and no test this phase added is among them.
+
+`COMPOSE_PROJECT_NAME` has to be set for that local run and is worth
+recording, because getting it wrong looks exactly like a regression.
+`tests/test_content_states.py` derives the project it shells out to from
+Compose's own default, which is the *directory name* - and this phase's work
+happened in a `git worktree` whose directory is not the one the stack was
+brought up under. Two tests then fail with `service "ail-control-plane" is
+not running`, which reads as a broken erasure path rather than as a
+mismatched project name. CI is unaffected: it runs `make test-integration`
+from the repository root with no `-p`, so the default and the actual project
+are the same string.
