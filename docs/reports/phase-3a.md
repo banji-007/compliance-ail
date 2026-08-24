@@ -23,11 +23,22 @@ Implements D18, D19 and D20 from `phase-3a-instruction.md`, grounded in
 | P3a-5. The key is independent of the bundle | **Met** |
 | P3a-6. Documentation and claim mapping | **Met** |
 
-Test totals at the end of the pass: `tests/test_evidence_bundle.py` (17) and
-`tests/test_offline_verify.py` (35) both green, and the full `tests/` suite
-green against a live `p3a-bundle` stack. The full-suite figure matters
-because of the defect recorded in section 8.1, which the two new files alone
-would not have surfaced.
+Test totals at the end of the pass: `tests/test_evidence_bundle.py` (17,
+needs the stack) and `tests/test_offline_verify.py` (35, needs nothing), both
+green. CI on the PR: **199 passed, 9 skipped, 0 failed**. The full-suite
+figure matters because of the defect recorded in section 8.1, which the two
+new files alone would not have surfaced.
+
+Two `tests/test_content_states.py` tests fail *locally* and pass on CI. They
+shell out to `docker compose` under a project name derived from the repository
+directory basename (`_default_compose_project_name()`), which in this worktree
+is `agent-a582614fcd7624bfe`, while this phase's standing rule requires every
+compose invocation to pass `-p p3a-bundle`. They therefore look for containers
+in a project that does not exist and report `service "ail-control-plane" is not
+running`. Confirmed unrelated to this changeset: both pass on CI (8/8 in
+`test_content_states.py`), where the project name matches the checkout
+directory. Recorded rather than silently attributed to the environment,
+because "it passes on CI" is exactly the claim that needs evidence.
 
 ---
 
@@ -616,7 +627,53 @@ because fixing it would be a design change outside this phase's scope.
 
 ## 9. P3a-3 demonstration: verification with the stack torn down
 
-_(This section is completed after the Docker stack is removed; see below.)_
+Reproducing the spike's method. The stack was removed, not merely stopped:
+
+```
+docker compose -p p3a-bundle -f docker-compose.test.yml down -v
+ Volume p3a-bundle_test-control-plane-data Removed
+ Volume p3a-bundle_test-immudb-data Removed
+ Volume p3a-bundle_test-verifier-state Removed
+ Network p3a-bundle_default Removed
+
+docker ps -a --filter "name=p3a-bundle" --format "{{.Names}}"
+(no output, no containers exist)
+```
+
+All four fixture bundles then verified, with `socket.socket.connect`
+replaced by a raiser inside the checking process:
+
+```
+--- policy_allow ---
+OK [verified]
+  ledger key   : tool_call:p3a_fixture_96d87a2f:199954d3aedf4c86aede93da9da23fe8:provision_cloud_server
+  record type  : policy_allow
+  transaction  : 1 (proven against trust anchor at tx 4)
+  signing key  : sha256:cc837c537fe429fa4c565919004bd8a799a55e525aa639a669052647b719d6f8
+EXIT=0
+--- policy_deny ---
+OK [verified]  record type: policy_deny   transaction: 2 (anchor tx 4)   EXIT=0
+--- fault ---
+OK [verified]  record type: fault         transaction: 3 (anchor tx 4)   EXIT=0
+--- content_erasure ---
+OK [verified]  record type: content_erasure  transaction: 4 (anchor tx 4)  EXIT=0
+
+### offline suite, stack removed ###
+35 passed, 1 warning in 4.46s
+```
+
+Each record is proven against a trust anchor at a later transaction, so the
+dual consistency proof is exercised rather than skipped. The whole suite runs
+in under five seconds with no stack in existence.
+
+The CLI also prints the scope of what it just proved, so a reader of the
+output cannot come away with a larger claim than the evidence supports:
+
+```
+This bundle proves the record above was committed to the ledger and has
+not been altered since. It does not prove the policy that produced the
+record was correct, nor that the writer was honest. See readME.md 3.4.
+```
 
 ---
 
@@ -743,4 +800,19 @@ Honest limits of this pass.
 
 ## 12. CI
 
-_(Filled in after the PR is opened.)_
+**PR:** https://github.com/banji-007/compliance-ail/pull/9
+**CI run id:** `32718536458`
+(https://github.com/banji-007/compliance-ail/actions/runs/32718536458)
+**Result: green.** `199 passed, 9 skipped, 1 warning in 37.36s`
+
+The run exercises both new files against a stack built from scratch
+(`make test-integration` does `down -v`, `make keygen`, `up -d --build
+--wait`), so the fixtures are verified against a signing key CI generated
+fresh and which is *not* the key the fixtures were exported against. That is
+the point of committing `tests/fixtures/evidence_bundles/signing.pub`
+alongside them: the offline tests use the fixture key, and the live tests use
+`keys/signing.pub`, and the two never have to be the same. A bundle
+outliving the key of the system that is running today is the ordinary case
+for an auditor, not an edge case.
+
+The PR is left open for human review and was not merged.
