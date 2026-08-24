@@ -80,7 +80,7 @@ coin flip.
 **Why not the SVID.** SPIFFE answers *who is connecting right now*, with a
 credential deliberately designed to expire. Durable evidence answers *who
 wrote this*, checkable years later. Those are opposite key-lifetime
-requirements and the roadmap conflated them. The spike measured the
+requirements, and `docs/plan/ail-roadmap.md` conflated them. The spike measured the
 consequence rather than arguing it: a bundle whose only attribution is an
 SVID signature becomes cryptographically uncheckable roughly one day after
 it was created. `spikes/signing-anchor/leaf_cert.pem` is committed with that
