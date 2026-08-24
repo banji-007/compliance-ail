@@ -519,7 +519,8 @@ changed - the check is doing its job, and the same pattern already happened
 inside Phase 3a's own history (`docs/reports/phase-3a.md`'s own final commit,
 `f1fe9ee`, exists for the identical reason).
 
-This commit adds this report itself to the tree, closing that gap. CI run
-for this commit: [to be confirmed]. If green, no further action; the report
-below this line is otherwise unchanged from the version CI run 32764990412
-evaluated.
+This commit (`3c835c8`) adds this report itself to the tree, closing that
+gap. CI run
+[32765365505](https://github.com/banji-007/compliance-ail/actions/runs/32765365505):
+green, all steps passed, `integration-tests` in 2m50s. The report below this
+line is otherwise unchanged from the version CI run 32764990412 evaluated.
