@@ -1,7 +1,11 @@
 services:
   ail-control-plane:
     build:
-      context: ./control_plane
+      # D22 (Phase 3b): built from the repo root so the image can carry
+      # provenance/ - the canonicalization rule this service shares with
+      # every other writer of a ledger record.
+      context: .
+      dockerfile: control_plane/Dockerfile
     # No host port published (R1, Phase 1.3 completion pass, red-team V2):
     # this is a record-writing surface (PUT /tenants, POST/DELETE /content) -
     # host.docker.internal reaches a loopback-bound port from any container
@@ -34,9 +38,15 @@ services:
       # See docs/adr/0011-verifier-authentication.md.
       - VERIFIER_READ_KEY=${VERIFIER_READ_KEY}
       - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY}
+      # D22 (Phase 3b): this service's OWN writer key, not the decision
+      # service's. It signs exactly one kind of record, the erasure
+      # tombstone, and a bundle's writer_key_fingerprint names which of the
+      # two wrote the record it carries.
+      - AIL_WRITER_SIGNING_KEY=/keys/writer-control-plane.key
     volumes:
       # policy/ mounted at runtime — changes on tenant config updates.
       - ./policy:/policy:ro
+      - ./keys:/keys:ro
       - control-plane-data:/data
     working_dir: /app
     healthcheck:
@@ -355,7 +365,15 @@ services:
       # calls verifier /verify, so it is never provisioned with
       # VERIFIER_READ_KEY (control_plane/main.py holds that one).
       - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY}
+      # D22 (Phase 3b): the decision service's own long-lived writer key,
+      # mounted read-only. Deliberately NOT its SPIFFE SVID - Question A of
+      # docs/reports/spike-signing-anchor.md returned NO-GO because an
+      # SVID-signed record stops verifying once the leaf's 24-hour TTL
+      # expires, and this signature has to outlive the process by years.
+      - AIL_WRITER_SIGNING_KEY=/keys/writer-decision.key
       - VAULT_TOKEN_PATH=/run/secrets/vault_api_token
+    volumes:
+      - ./keys:/keys:ro
     secrets:
       # D14: attached only here, never to langgraph-demo - this container
       # attachment is the primary boundary. mode: 0400 is declared for
@@ -607,6 +625,55 @@ services:
       - DASHBOARD_WRITE_USER=${DASHBOARD_WRITE_USER}
       - DASHBOARD_WRITE_PASSWORD=${DASHBOARD_WRITE_PASSWORD}
     depends_on:
+      ail-control-plane:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - backend
+
+  # D23 (Phase 3b): the periodic external anchoring job.
+  #
+  # This is the one service in this file that is expected to reach the
+  # public internet, and the one whose failure denies nothing. It asks the
+  # verifier for ImmuDB's current signed state, submits that state's
+  # canonical payload to a Rekor v2 instance discovered from Sigstore's own
+  # TUF-distributed configuration, and records the accepted entry in the
+  # control plane's anchor store. If any of that fails, it logs and waits -
+  # writes continue, decisions continue, and the next bundle exported for an
+  # un-covered record says not_anchored in an explicit field rather than
+  # omitting one. See docs/adr/0012-writer-signing-and-external-anchoring.md.
+  #
+  # backend-only, like every other non-agent service: it calls out, and
+  # nothing calls it. It publishes no port because it is a loop, not a
+  # server, which is also why it has no healthcheck - there is nothing to
+  # probe, and a probe that always passed would say less than nothing.
+  #
+  # Deliberately absent from docker-compose.test.yml: the integration suite
+  # must not depend on a shared public service or on CI having egress, and
+  # P3b-4 records the live submission as a command-backed claim rather than
+  # a test. Its absence there is itself the P3b-5 demonstration - the whole
+  # suite runs with anchoring entirely broken.
+  anchor-service:
+    build:
+      context: .
+      dockerfile: anchor_service/Dockerfile
+    environment:
+      - VERIFIER_URL=http://verifier:8003
+      - CONTROL_PLANE_URL=http://ail-control-plane:8002
+      # Read-scoped on the verifier (it only reads /state), write-scoped on
+      # the control plane (it only writes /anchors). Neither is a new
+      # credential and neither widens what this key already authorizes.
+      - VERIFIER_READ_KEY=${VERIFIER_READ_KEY}
+      - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
+      # Self-managed, never Fulcio: a keyless flow would put an OIDC
+      # identity on the public record where a bare P-256 point suffices.
+      - AIL_ANCHOR_SIGNING_KEY=/keys/anchor-signing.key
+      - AIL_ANCHOR_INTERVAL_SECONDS=${AIL_ANCHOR_INTERVAL_SECONDS:-300}
+    volumes:
+      - ./keys:/keys:ro
+    depends_on:
+      verifier:
+        condition: service_healthy
       ail-control-plane:
         condition: service_healthy
     restart: unless-stopped

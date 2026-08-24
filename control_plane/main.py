@@ -12,12 +12,15 @@ Endpoints:
   GET  /bundles/{tenant_id}     — OPA Bundle API (ETag-aware)
   GET  /audit                   — proxy to ImmuDB; returns decoded ledger entries
   GET  /audit/bundle            - one record's portable evidence bundle (D19)
+  POST /anchors                 - record an externally anchored checkpoint (D23)
+  GET  /anchors/latest          - the newest anchored checkpoint, if any (D23)
 """
 
 import base64
 import json
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -30,7 +33,23 @@ from sqlalchemy.orm import Session
 
 from bundle import generate_bundle
 from database import Base, engine, get_db
-from models import CallContent, Tenant
+from models import CallContent, StateAnchor, Tenant
+
+# provenance/ is copied into this service's image alongside its own source
+# (control_plane/Dockerfile builds from the repo root for this reason) and
+# sits at the repo root in a checkout. Both are tried, the same way
+# ledger/immudb_ledger.py resolves it, so this module imports identically
+# in the container and under pytest.
+for _provenance_parent in (
+    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+):
+    if os.path.isdir(os.path.join(_provenance_parent, "provenance")):
+        if _provenance_parent not in sys.path:
+            sys.path.insert(0, _provenance_parent)
+        break
+
+from provenance.record_signature import load_signing_key, sign_record  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,7 +67,42 @@ RECORD_PROFILE = "observed"
 # field is added, removed, or reinterpreted, so tools/ail_verify_bundle.py
 # can refuse a bundle it does not understand instead of guessing.
 # docs/adr/0010-portable-evidence-bundles.md.
-EVIDENCE_BUNDLE_FORMAT = "ail-evidence-bundle/1"
+# Bumped to /2 by D22/D23 (Phase 3b): a bundle now carries an
+# external_anchor section, its record carries a writer signature, and its
+# proof material is anchored at a published checkpoint rather than at
+# whatever this deployment's verifier held. A /1 checker reading a /2 bundle
+# would skip all three, which is exactly what this string exists to refuse.
+EVIDENCE_BUNDLE_FORMAT = "ail-evidence-bundle/2"
+
+# D22 (Phase 3b): this service writes exactly one kind of ledger record, the
+# erasure tombstone, and it signs that record with its OWN writer key - not
+# the decision service's. The two are separate long-lived pairs so a bundle's
+# writer_key_fingerprint names which service wrote the record, and so one
+# writer can be put on a checker's deny-list without revoking the other.
+# See docs/adr/0012-writer-signing-and-external-anchoring.md.
+_WRITER_SIGNING_KEY_PATH = os.getenv("AIL_WRITER_SIGNING_KEY", "")
+
+_writer_keys = None
+
+
+def get_writer_keys():
+    """Load (signing key, verifying key) once, or raise.
+
+    Fail-closed, like every write path in this project except the one D23
+    names. An unsigned tombstone is not a weaker tombstone: it is one
+    tools/ail_verify_bundle.py refuses, so the erasure it records would have
+    no verifiable evidence behind it.
+    """
+    global _writer_keys
+    if _writer_keys is None:
+        if not _WRITER_SIGNING_KEY_PATH or not os.path.exists(_WRITER_SIGNING_KEY_PATH):
+            raise RuntimeError(
+                "AIL_WRITER_SIGNING_KEY is unset or points at a missing file; this "
+                "service cannot sign the tombstone it is about to write (D22)."
+            )
+        _writer_keys = load_signing_key(_WRITER_SIGNING_KEY_PATH)
+        logger.info("Writer signing key loaded from %s", _WRITER_SIGNING_KEY_PATH)
+    return _writer_keys
 
 # Two scoped keys, not one shared key (D6, Phase 1.1). CONTROL_PLANE_READ_KEY
 # authorizes GET /audit only; CONTROL_PLANE_WRITE_KEY authorizes every
@@ -399,7 +453,12 @@ def _write_tombstone(call_id: str) -> None:
         "actor": "control-plane-write-key",
         "profile": RECORD_PROFILE,
     }
-    serialized = json.dumps(tombstone, separators=(",", ":"))
+    # D22: signed before serialization, so the signature is a field in the
+    # record and the inclusion proof covers it like every other byte.
+    signing_key, verifying_key = get_writer_keys()
+    serialized = json.dumps(
+        sign_record(tombstone, signing_key, verifying_key), separators=(",", ":")
+    )
     key = f"content_erasure:{call_id}"
     encoded_key = base64.b64encode(key.encode()).decode()
     encoded_val = base64.b64encode(serialized.encode()).decode()
@@ -946,8 +1005,188 @@ def _record_type_of(raw_value: bytes) -> str:
     return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# D23 (Phase 3b): the anchor store.
+#
+# anchor_service/ is the only writer. It submits a checkpoint to a public
+# transparency log first and records it here second, so a row means the
+# submission was accepted - never that one was attempted. GET /audit/bundle
+# reads this store to decide whether a bundle may claim external
+# corroboration, and that decision has to be a fact about the outside world
+# rather than about this deployment's intentions.
+# ---------------------------------------------------------------------------
+
+class AnchorCheckpoint(BaseModel):
+    db: str
+    tx_id: int
+    tx_hash: str        # base64
+    signature: str      # base64, DER ECDSA, the ImmuDB server's own
+
+
+class AnchorExternal(BaseModel):
+    log_url: str
+    log_url_source: str
+    log_index: str
+    anchor_key_fingerprint: str
+    anchor_payload_format: str
+    transparency_log_entry: dict
+
+
+class AnchorRequest(BaseModel):
+    checkpoint: AnchorCheckpoint
+    external: AnchorExternal
+
+
+@app.post("/anchors", status_code=201)
+def record_anchor(
+    payload: AnchorRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_write_key),
+):
+    """
+    Record one externally anchored checkpoint (D23).
+
+    Write-scoped (ADR-0007), the same credential that already authorizes
+    every other record this service writes. That is deliberately not a new
+    grant: anything holding this key can already write an erasure tombstone
+    the verifier treats as authentic (readME.md §5's
+    tamper-evidence-is-not-forgery-resistance bullet), so accepting anchors
+    from it adds no reach. What stops a forged anchor from becoming a
+    forged claim is not this gate: the verifier refuses a checkpoint ImmuDB
+    did not sign before using it as a proof source, and
+    tools/ail_verify_bundle.py re-verifies the whole Rekor chain offline
+    against a trust root the checker holds. A forged row yields a bundle
+    that fails offline, which is where it should fail.
+
+    Idempotent by transaction id. Re-anchoring the same checkpoint is a
+    no-op rather than an error, so a submitter that crashed between the log
+    accepting an entry and this call landing can simply run again.
+    """
+    tx_id = int(payload.checkpoint.tx_id)
+    existing = db.query(StateAnchor).filter_by(checkpoint_tx_id=tx_id).first()
+    if existing:
+        logger.info("Anchor for tx=%d already recorded; leaving it as it stands", tx_id)
+        return {"recorded": False, "checkpoint_tx_id": tx_id, "detail": "already recorded"}
+
+    db.add(StateAnchor(
+        checkpoint_tx_id=tx_id,
+        checkpoint_db=payload.checkpoint.db,
+        checkpoint_tx_hash=payload.checkpoint.tx_hash,
+        checkpoint_signature=payload.checkpoint.signature,
+        log_url=payload.external.log_url,
+        log_url_source=payload.external.log_url_source,
+        log_index=str(payload.external.log_index),
+        anchor_key_fingerprint=payload.external.anchor_key_fingerprint,
+        anchor_payload_format=payload.external.anchor_payload_format,
+        entry_json=json.dumps(payload.external.transparency_log_entry, separators=(",", ":")),
+    ))
+    db.commit()
+    logger.info(
+        "Anchored checkpoint tx=%d in %s at log index %s",
+        tx_id, payload.external.log_url, payload.external.log_index,
+    )
+    return {"recorded": True, "checkpoint_tx_id": tx_id}
+
+
+def _latest_anchor(db: Session):
+    """The newest anchored checkpoint, or None.
+
+    Newest is always the best choice: a checkpoint covers every transaction
+    at or below its own, so the highest one covers the most records, and
+    an older one covers a strict subset. There is no case where reaching
+    past the newest anchor finds a better one.
+    """
+    return db.query(StateAnchor).order_by(StateAnchor.checkpoint_tx_id.desc()).first()
+
+
+def _anchor_as_dict(anchor: StateAnchor) -> dict:
+    return {
+        "checkpoint": {
+            "db": anchor.checkpoint_db,
+            "tx_id": anchor.checkpoint_tx_id,
+            "tx_hash": anchor.checkpoint_tx_hash,
+            "signature": anchor.checkpoint_signature,
+        },
+        "external": {
+            "log_url": anchor.log_url,
+            "log_url_source": anchor.log_url_source,
+            "log_index": anchor.log_index,
+            "anchor_key_fingerprint": anchor.anchor_key_fingerprint,
+            "anchor_payload_format": anchor.anchor_payload_format,
+            "transparency_log_entry": json.loads(anchor.entry_json),
+        },
+    }
+
+
+@app.get("/anchors/latest")
+def get_latest_anchor(db: Session = Depends(get_db), _: None = Depends(_require_read_key)):
+    """The newest anchored checkpoint, or an explicit statement that there is none.
+
+    Read-scoped, the same credential GET /audit already requires: this
+    returns a public Merkle root and a public log entry, both of which are
+    already world-readable in the transparency log itself.
+
+    Answers with anchored: false rather than 404 for the same reason a
+    bundle states its lack of corroboration in a field rather than omitting
+    one - "no anchor exists" and "this route is missing" are different
+    facts and a caller has to be able to tell them apart.
+    """
+    anchor = _latest_anchor(db)
+    if anchor is None:
+        return {"anchored": False, "detail": "no checkpoint has been anchored yet"}
+    return {"anchored": True, **_anchor_as_dict(anchor)}
+
+
+ANCHOR_STATE_ANCHORED = "anchored"
+ANCHOR_STATE_NOT_ANCHORED = "not_anchored"
+
+
+def _external_anchor_section(anchor) -> dict:
+    """The bundle's external-corroboration section. Never omitted.
+
+    D23's precise rule is fail-open on the write path, fail-closed on the
+    claim: anchoring never blocks a write, but a bundle for a record no
+    checkpoint covers cannot claim corroboration. It states that in a field
+    rather than by leaving one out, the same discipline
+    docs/adr/0006-verification-states.md applies to the read-time states -
+    a reader must never have to infer a fact from a missing key.
+
+    When anchored, the section carries the log entry exactly as the log
+    returned it. The checkpoint itself is deliberately NOT duplicated here:
+    it is already proof.source_state, because it is the transaction the dual
+    proof runs to. Carrying a second copy would create two fields that could
+    disagree without consequence, which
+    tools/bundle_byte_sweep.py found in Phase 3a and ADR-0010 records as the
+    reason proof.signing_key_fingerprint is now compared rather than
+    ignored. The checker recomputes the anchored payload from
+    proof.source_state and binds it to the log entry's digest.
+    """
+    if anchor is None:
+        return {
+            "state": ANCHOR_STATE_NOT_ANCHORED,
+            "detail": (
+                "no checkpoint covering this record has been submitted to a public "
+                "transparency log, so this bundle makes no claim of external "
+                "corroboration. The local proof chain above is unaffected."
+            ),
+        }
+    return {
+        "state": ANCHOR_STATE_ANCHORED,
+        "log_url": anchor.log_url,
+        "log_url_source": anchor.log_url_source,
+        "log_index": anchor.log_index,
+        "anchor_key_fingerprint": anchor.anchor_key_fingerprint,
+        "anchor_payload_format": anchor.anchor_payload_format,
+        "transparency_log_entry": json.loads(anchor.entry_json),
+    }
+
+
 @app.get("/audit/bundle")
-def get_audit_bundle(key: str, _: None = Depends(_require_read_key)):
+def get_audit_bundle(
+    key: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_read_key),
+):
     """
     Export one record's portable evidence bundle (D19, Phase 3a).
 
@@ -985,18 +1224,59 @@ def get_audit_bundle(key: str, _: None = Depends(_require_read_key)):
     if not raw_key:
         raise HTTPException(status_code=400, detail="key must not be empty")
 
-    try:
-        with httpx.Client(timeout=30.0) as vc:
-            vr = vc.post(
-                f"{VERIFIER_URL}/verify",
-                json={"key": key},
-                headers={"X-API-Key": _VERIFIER_READ_KEY},
-            )
-        vr.raise_for_status()
-        vdata = vr.json()
-    except Exception as exc:
-        logger.error("Verifier unreachable during bundle export: %s", exc)
-        raise HTTPException(status_code=503, detail=f"Verifier unavailable: {exc}")
+    # D23/P3b-1: ask for the proof to run to the newest anchored checkpoint,
+    # not to whatever this deployment's verifier happens to hold. A proof
+    # anchored at an internal state is unfalsifiable to an outside party -
+    # they have no independent way to learn what that state was. A proof
+    # anchored at a checkpoint that is in a public transparency log is not.
+    anchor = _latest_anchor(db)
+
+    def _call_verifier(anchor_payload):
+        body = {"key": key}
+        if anchor_payload is not None:
+            body["anchor"] = anchor_payload
+        try:
+            with httpx.Client(timeout=30.0) as vc:
+                vr = vc.post(
+                    f"{VERIFIER_URL}/verify",
+                    json=body,
+                    headers={"X-API-Key": _VERIFIER_READ_KEY},
+                )
+            vr.raise_for_status()
+            return vr.json()
+        except Exception as exc:
+            logger.error("Verifier unreachable during bundle export: %s", exc)
+            raise HTTPException(status_code=503, detail=f"Verifier unavailable: {exc}")
+
+    anchored = False
+    if anchor is not None:
+        vdata = _call_verifier({
+            "db": anchor.checkpoint_db,
+            "tx_id": anchor.checkpoint_tx_id,
+            "tx_hash": anchor.checkpoint_tx_hash,
+            "signature": anchor.checkpoint_signature,
+        })
+        if vdata.get("verified"):
+            anchored = True
+        elif vdata.get("error_class") == "anchor_precedes_record":
+            # The record is newer than every anchored checkpoint. Not a
+            # failure: it is the ordinary state of a record written since
+            # the last anchoring cycle, and D23 is explicit that anchoring
+            # is asynchronous and off the hot path. Export it, and say in
+            # the bundle that no external corroboration exists.
+            logger.info("Record is newer than the newest anchor (tx=%d); exporting unanchored",
+                        anchor.checkpoint_tx_id)
+            anchor = None
+            vdata = _call_verifier(None)
+        else:
+            # Any other refusal is about the record or the anchor's own
+            # signature, and is handled by the shared not-verified branch
+            # below rather than papered over by silently re-exporting
+            # unanchored - that would turn a rejected anchor into a bundle
+            # that merely looks uncorroborated.
+            pass
+    else:
+        vdata = _call_verifier(None)
 
     if not vdata.get("verified"):
         raise HTTPException(
@@ -1035,6 +1315,12 @@ def get_audit_bundle(key: str, _: None = Depends(_require_read_key)):
         "proof": proof,
         # Fingerprint only. See this function's docstring and ADR-0010.
         "signing_key": {"fingerprint": proof.get("signing_key_fingerprint")},
+        # D23: always present, always stating which of the two states it is.
+        # A bundle that simply omitted this section when nothing anchored the
+        # record would make "not corroborated" and "exported by a build that
+        # predates anchoring" the same bytes, and would make absence of
+        # evidence look like evidence of absence. It says so instead.
+        "external_anchor": _external_anchor_section(anchor if anchored else None),
     }
 
     filename = f"ail-evidence-tx{vdata.get('tx_id')}.json"

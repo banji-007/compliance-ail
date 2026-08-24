@@ -14,6 +14,16 @@
 #                         (tests/test_dashboard_auth.py); no other test
 #                         exercises it.
 #
+# anchor-service (D23, Phase 3b) is NOT included either, and its absence is
+# load-bearing rather than an omission. Anchoring is the project's one
+# deliberately fail-open subsystem, so the whole integration suite runs with
+# it entirely broken: every bundle this stack exports says not_anchored, and
+# every write still succeeds. That is the P3b-5 demonstration, run on every
+# CI job rather than staged once. It is also why no test here submits to a
+# public transparency log: the live submission is a command-backed claim
+# (docs/reports/phase-3b.md), never a CI test that would make this suite
+# depend on a shared public service and on CI having egress.
+#
 # SPIRE, Envoy, Grafana, and Prometheus are NOT included. Tests run with
 # SPIRE_DISABLED=true so mTLS is bypassed - this file has no edge/backend
 # network split either, for the same reason: it is a flat, deliberately
@@ -42,7 +52,11 @@ services:
 
   ail-control-plane:
     build:
-      context: ./control_plane
+      # D22 (Phase 3b): built from the repo root so the image can carry
+      # provenance/ - the canonicalization rule this service shares with
+      # every other writer of a ledger record.
+      context: .
+      dockerfile: control_plane/Dockerfile
     ports:
       - "8002:8002"
     environment:
@@ -57,8 +71,12 @@ services:
       # see docker-compose.yml's ail-control-plane service for the reasoning.
       - VERIFIER_READ_KEY=${VERIFIER_READ_KEY:-test-verifier-read-key}
       - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY:-test-verifier-write-key}
+      # D22 (Phase 3b): this service's own writer key - see
+      # docker-compose.yml's ail-control-plane service for why there are two.
+      - AIL_WRITER_SIGNING_KEY=/keys/writer-control-plane.key
     volumes:
       - ./policy:/policy:ro
+      - ./keys:/keys:ro
       - test-control-plane-data:/data
     working_dir: /app
     healthcheck:
@@ -176,7 +194,11 @@ services:
       # D21 (Phase 3a completion): write-scoped only - see docker-compose.yml's
       # decision-service for why it never holds VERIFIER_READ_KEY.
       - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY:-test-verifier-write-key}
+      # D22 (Phase 3b): the decision service's own writer key.
+      - AIL_WRITER_SIGNING_KEY=/keys/writer-decision.key
       - VAULT_TOKEN_PATH=/run/secrets/vault_api_token
+    volumes:
+      - ./keys:/keys:ro
     secrets:
       - source: vault_api_token
         target: vault_api_token

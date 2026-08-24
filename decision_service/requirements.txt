@@ -5,3 +5,7 @@ httpx==0.27.2
 prometheus-client
 python-dotenv==1.2.2
 mcp>=1.2.0,<2.0.0
+# D22 (Phase 3b): the writer signature over every record this service
+# writes. Same library the ImmuDB state signatures already go through, so
+# this project has one ECDSA implementation rather than two.
+ecdsa==0.19.2
