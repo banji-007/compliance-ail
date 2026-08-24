@@ -585,13 +585,21 @@ pins) is pre-existing and documented in that file's own comments.
 ## CI
 
 **Green.** Run id `32785456278`, job `97616336081`, conclusion `success`,
-3m9s, on `6fc2f9f71926ca96c10562f80ac2f41ac0cca4c4` (the branch head), PR
-[#10](https://github.com/banji-007/compliance-ail/pull/10).
+3m9s, on `6fc2f9f71926ca96c10562f80ac2f41ac0cca4c4`. That commit carries all
+of this phase's code, tests and fixtures, so it is the run that establishes
+the work. PR [#10](https://github.com/banji-007/compliance-ail/pull/10).
 
 ```
 $ gh run list --branch phase-3b-provenance --limit 1 --json status,conclusion,databaseId
 [{"conclusion":"success","databaseId":32785456278,"status":"completed"}]
 ```
+
+Run `32786753257` is green as well, on `52a3702939eeb47e991736375f3fcd8e02216f77`,
+the documentation-only commit that filled in this report's sweep, CI and
+cleanup sections. A report cannot contain the id of the run triggered by the
+commit that adds that id, so the last such run is linked from the PR rather
+than transcribed here; both ids above are stated so the chain is followable
+rather than ending in a claim about itself.
 
 CI runs `make test-integration`, which brings up `docker-compose.test.yml`
 and runs the whole suite. Two things about that are worth stating rather
