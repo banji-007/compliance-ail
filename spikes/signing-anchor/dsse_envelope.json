@@ -1,0 +1,9 @@
+{
+  "payloadType": "application/vnd.ail.spike.merkle-root+json",
+  "payload": "eyJtZXJrbGVfcm9vdCI6ImZkYjM4MzRmZDU4ZmE5ZDU2ZjlhYmY1Yzc1NTI2YjRiY2Y2OTNhNzI4NWUzZmQzYTQzYTA2NWFjYmZlNDdjYjciLCJub3RlIjoic3ludGhldGljIHJvb3QgZm9yIHNwaWtlLXNpZ25pbmctYW5jaG9yIEIyLCBub3QgYSByZWFsIEFJTCBsZWRnZXIgY2hlY2twb2ludCIsInRyZWVfc2l6ZSI6MX0=",
+  "signatures": [
+    {
+      "sig": "MEQCICrIU+vTRzhvW6tb42U1LtrsQIrE18avW7CrK4K/Q2pKAiAvjruUnt7lcNTjclcbWOiwnf2fBt+1mYNe1qgJ8ZhOIg=="
+    }
+  ]
+}

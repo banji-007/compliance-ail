@@ -1,0 +1,14 @@
+{
+  "hashedRekordRequestV002": {
+    "digest": "L2JI3SPJxtrFnigtn9TVpynHb73GeDY6RMoRusL/2nI=",
+    "signature": {
+      "content": "MEQCICrIU+vTRzhvW6tb42U1LtrsQIrE18avW7CrK4K/Q2pKAiAvjruUnt7lcNTjclcbWOiwnf2fBt+1mYNe1qgJ8ZhOIg==",
+      "verifier": {
+        "publicKey": {
+          "rawBytes": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDepj4HDq0Tvv1BWaonWibpYGOv4EY0OBHh+m5mRPbjWW+bEEqwe0BMWpBDylNUq+FhT2JDwzAhfY8eBjvS/4Ww=="
+        },
+        "keyDetails": "PKIX_ECDSA_P256_SHA_256"
+      }
+    }
+  }
+}

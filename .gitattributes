@@ -7,3 +7,4 @@
 # text, whatever their content happens to look like.
 spikes/offline-verify/material/** -text
 tests/fixtures/evidence_bundles/** -text
+spikes/signing-anchor/*.bin -text
