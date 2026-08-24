@@ -11,6 +11,7 @@ Endpoints:
   PUT  /tenants/{tenant_id}     — update tenant config (triggers new bundle ETag)
   GET  /bundles/{tenant_id}     — OPA Bundle API (ETag-aware)
   GET  /audit                   — proxy to ImmuDB; returns decoded ledger entries
+  GET  /audit/bundle            - one record's portable evidence bundle (D19)
 """
 
 import base64
@@ -41,6 +42,13 @@ DEFAULT_TENANT_ID = "tenant_default"
 # writes its own record (the erasure tombstone) rather than importing the
 # interceptor's ledger module.
 RECORD_PROFILE = "observed"
+
+# D19 (Phase 3a): the wire format of an evidence bundle. One file, per
+# record, self-describing, verifiable with no network. Bumped only when a
+# field is added, removed, or reinterpreted, so tools/ail_verify_bundle.py
+# can refuse a bundle it does not understand instead of guessing.
+# docs/adr/0010-portable-evidence-bundles.md.
+EVIDENCE_BUNDLE_FORMAT = "ail-evidence-bundle/1"
 
 # Two scoped keys, not one shared key (D6, Phase 1.1). CONTROL_PLANE_READ_KEY
 # authorizes GET /audit only; CONTROL_PLANE_WRITE_KEY authorizes every
@@ -558,6 +566,8 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
     Each entry:
         tx_id, call_id, agent_id, timestamp, tool_name  - as recorded; call_id
                           is the key erasure targets (DELETE /content/{call_id})
+        ledger_key     - base64 raw ImmuDB key for this record; the
+                          identifier GET /audit/bundle takes (P3a-2)
         outcome_type   - policy_allow | policy_deny | schema_deny | fault
         fault_class    - null, or the closed-set fault reason
         policy_revision - the bundle revision that produced the decision, or null
@@ -763,6 +773,12 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
 
             entries.append({
                 "tx_id":           tx_id,
+                # P3a-2: the base64 raw ImmuDB key for this record - the
+                # identifier GET /audit/bundle takes. The key carries a
+                # random uuid (ledger/immudb_ledger.py::log_tool_call), so it
+                # cannot be derived from call_id; without it here, a reader
+                # of /audit has no way to name the record they just read.
+                "ledger_key":      encoded_key,
                 "call_id":         call_id,
                 "agent_id":        log_entry.get("agent_id"),
                 "timestamp":       log_entry.get("timestamp"),
@@ -844,6 +860,7 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
 
             entries.append({
                 "tx_id":           intent["tx_id"],
+                "ledger_key":      encoded_key,
                 "call_id":         call_id,
                 "agent_id":        intent.get("agent_id"),
                 "timestamp":       intent.get("timestamp"),
@@ -878,3 +895,130 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
         sum(1 for e in entries if e["verification"]["state"] == "not_found"),
     )
     return {"entries": entries, "total": len(entries)}
+
+
+def _record_type_of(raw_value: bytes) -> str:
+    """
+    Name the shape of a stored record for the bundle's own description.
+
+    Discriminates on fields inside the record, never on the ImmuDB key
+    prefix - the same discipline D11 applies to tombstone classification in
+    get_audit above. A record that carries none of the fields this project
+    writes is "unknown", deliberately outside every closed set
+    (docs/adr/0005-outcome-taxonomy.md), so a forged or foreign record
+    cannot be described by a bundle as a genuine outcome type it never
+    claimed. This is a label on the bundle, not an input to any proof.
+    """
+    try:
+        value = json.loads(raw_value.decode())
+    except Exception:
+        return "unknown"
+    if not isinstance(value, dict):
+        return "unknown"
+    record_type = value.get("record_type")
+    if record_type in ("content_erasure", "decision_intent"):
+        return record_type
+    outcome_type = value.get("outcome_type")
+    if outcome_type in ("policy_allow", "policy_deny", "schema_deny", "fault"):
+        return outcome_type
+    return "unknown"
+
+
+@app.get("/audit/bundle")
+def get_audit_bundle(key: str, _: None = Depends(_require_read_key)):
+    """
+    Export one record's portable evidence bundle (D19, Phase 3a).
+
+    `key` is the base64-encoded raw ImmuDB key, exactly the identifier
+    GET /audit reports as `ledger_key` for every entry and exactly what the
+    verifier's own /verify takes. Taking the raw key rather than a call_id
+    is what makes this work uniformly for every record shape this project
+    writes - tool_call: decisions (policy_allow, policy_deny, schema_deny,
+    fault), content_erasure: tombstones, and tool_call_intent: records -
+    with no per-type branch that could be gotten wrong for one of them.
+
+    Authorization is Depends(_require_read_key): the same read-scoped
+    credential GET /audit itself requires (ADR-0007), not a third key and
+    not a more permissive path. A bundle contains the record and its proof;
+    anyone who can read the record through /audit can already see both, so
+    granting bundle export to that same credential adds no reach, while
+    leaving it ungated would hand the audit trail to an unauthenticated
+    caller.
+
+    The bundle carries no key material. It names the ECDSA public key it
+    expects by fingerprint only; the checker holds that key independently
+    (D18, and the spike's state.publicKey finding). A bundle that shipped
+    its own key would verify against itself.
+
+    Returns 404 when the record cannot be verified - a bundle is evidence
+    that a record was committed and its proofs checked out, so there is no
+    honest bundle for a key that was never written, or whose proof was
+    rejected. The verifier's error_class is passed through in the detail so
+    the two cases stay distinguishable to the caller.
+    """
+    try:
+        raw_key = base64.b64decode(key, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="key must be base64-encoded raw ImmuDB key bytes")
+    if not raw_key:
+        raise HTTPException(status_code=400, detail="key must not be empty")
+
+    try:
+        with httpx.Client(timeout=30.0) as vc:
+            vr = vc.post(f"{VERIFIER_URL}/verify", json={"key": key})
+        vr.raise_for_status()
+        vdata = vr.json()
+    except Exception as exc:
+        logger.error("Verifier unreachable during bundle export: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Verifier unavailable: {exc}")
+
+    if not vdata.get("verified"):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No verified record for this key "
+                f"(error_class={vdata.get('error_class')}): {vdata.get('detail')}"
+            ),
+        )
+
+    proof = vdata.get("proof_material")
+    if not proof:
+        # The verifier verified the record but returned no material. That is
+        # a verifier too old for D18, not a tampered record - fail loudly
+        # rather than emitting a bundle with an empty proof section that
+        # would look like evidence and check out as nothing.
+        logger.error("Verifier returned no proof_material for a verified record")
+        raise HTTPException(
+            status_code=503,
+            detail="Verifier returned no proof material; it predates D18 (see ADR-0010)",
+        )
+
+    raw_value = base64.b64decode(vdata["value"])
+
+    bundle = {
+        "bundle_format": EVIDENCE_BUNDLE_FORMAT,
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "exported_by": "ail-control-plane",
+        "record": {
+            "ledger_key": key,
+            "value": vdata["value"],
+            "tx_id": vdata.get("tx_id"),
+            "timestamp": vdata.get("timestamp"),
+            "record_type": _record_type_of(raw_value),
+        },
+        "proof": proof,
+        # Fingerprint only. See this function's docstring and ADR-0010.
+        "signing_key": {"fingerprint": proof.get("signing_key_fingerprint")},
+    }
+
+    filename = f"ail-evidence-tx{vdata.get('tx_id')}.json"
+    logger.info(
+        "Exported evidence bundle for tx=%s record_type=%s",
+        vdata.get("tx_id"),
+        bundle["record"]["record_type"],
+    )
+    return Response(
+        content=json.dumps(bundle, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
