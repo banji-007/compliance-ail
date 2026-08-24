@@ -56,7 +56,8 @@ keygen:
 ##
 ## docker compose auto-loads a root .env regardless of -f, so the control
 ## plane, dashboard, and immudb containers enforce whatever IMMUDB_USER,
-## IMMUDB_PASSWORD, CONTROL_PLANE_READ_KEY/WRITE_KEY, and
+## IMMUDB_PASSWORD, CONTROL_PLANE_READ_KEY/WRITE_KEY,
+## VERIFIER_READ_KEY/WRITE_KEY (D21, Phase 3a completion), and
 ## DASHBOARD_READ/WRITE_USER/PASSWORD are in .env if one exists. pytest must
 ## authenticate with those same values, so each is read from .env in its own
 ## isolated subshell if present, falling back to the prior default otherwise.
@@ -75,6 +76,8 @@ test-integration:
 	IMMUDB_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$IMMUDB_PASSWORD" ) ); \
 	CONTROL_PLANE_READ_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_READ_KEY" ) ); \
 	CONTROL_PLANE_WRITE_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$CONTROL_PLANE_WRITE_KEY" ) ); \
+	VERIFIER_READ_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$VERIFIER_READ_KEY" ) ); \
+	VERIFIER_WRITE_KEY_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$VERIFIER_WRITE_KEY" ) ); \
 	DASHBOARD_READ_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_READ_USER" ) ); \
 	DASHBOARD_READ_PASSWORD_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_READ_PASSWORD" ) ); \
 	DASHBOARD_WRITE_USER_ENV=$$( [ -f .env ] && ( set -a; . ./.env; set +a; echo "$$DASHBOARD_WRITE_USER" ) ); \
@@ -90,6 +93,8 @@ test-integration:
 	  VERIFIER_URL=http://localhost:8003 \
 	  CONTROL_PLANE_READ_KEY=$${CONTROL_PLANE_READ_KEY_ENV:-$${CONTROL_PLANE_READ_KEY:-test-read-key}} \
 	  CONTROL_PLANE_WRITE_KEY=$${CONTROL_PLANE_WRITE_KEY_ENV:-$${CONTROL_PLANE_WRITE_KEY:-test-write-key}} \
+	  VERIFIER_READ_KEY=$${VERIFIER_READ_KEY_ENV:-$${VERIFIER_READ_KEY:-test-verifier-read-key}} \
+	  VERIFIER_WRITE_KEY=$${VERIFIER_WRITE_KEY_ENV:-$${VERIFIER_WRITE_KEY:-test-verifier-write-key}} \
 	  DASHBOARD_URL=http://localhost:3001 \
 	  DASHBOARD_READ_USER=$${DASHBOARD_READ_USER_ENV:-$${DASHBOARD_READ_USER:-test-dashboard-reader}} \
 	  DASHBOARD_READ_PASSWORD=$${DASHBOARD_READ_PASSWORD_ENV:-$${DASHBOARD_READ_PASSWORD:-test-dashboard-read-pw}} \

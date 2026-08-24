@@ -40,6 +40,9 @@ CONTROL_PLANE = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
 VERIFIER = os.getenv("VERIFIER_URL", "http://localhost:8003")
 READ_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 WRITE_KEY = os.getenv("CONTROL_PLANE_WRITE_KEY", "test-write-key")
+# D21 (Phase 3a completion): ledger/immudb_ledger.py, loaded in-process below
+# via decision_service/main.py, now needs this to write through the verifier.
+VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 
 # This script loads the decision service in-process on the host, while the
 # stack it drives runs in compose. decision_service/main.py,
@@ -55,6 +58,7 @@ os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluat
 os.environ.setdefault("VERIFIER_URL", VERIFIER)
 os.environ.setdefault("CONTROL_PLANE_URL", CONTROL_PLANE)
 os.environ.setdefault("CONTROL_PLANE_WRITE_KEY", WRITE_KEY)
+os.environ.setdefault("VERIFIER_WRITE_KEY", VERIFIER_WRITE_KEY)
 
 sys.path.insert(0, str(REPO_ROOT / "decision_service"))
 sys.path.insert(0, str(REPO_ROOT / "ledger"))

@@ -90,6 +90,15 @@ IMMUDB_USER  = os.getenv("IMMUDB_USER")
 IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD")
 VERIFIER_URL = os.getenv("VERIFIER_URL", "http://verifier:8003")
 
+# D21 (Phase 3a completion): the verifier's own credential pair
+# (docs/adr/0011-verifier-authentication.md), independent of
+# CONTROL_PLANE_READ_KEY/WRITE_KEY - the control plane is a caller of the
+# verifier, not the verifier itself, so it holds both: READ for every
+# /verify call below (get_audit, get_audit_bundle, _has_tombstone), WRITE
+# for the one /write call (_write_tombstone).
+_VERIFIER_READ_KEY  = os.getenv("VERIFIER_READ_KEY", "")
+_VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -315,7 +324,11 @@ def _has_tombstone(call_id: str) -> bool:
     encoded_key = base64.b64encode(key.encode()).decode()
     try:
         with httpx.Client(timeout=15) as client:
-            resp = client.post(f"{VERIFIER_URL}/verify", json={"key": encoded_key})
+            resp = client.post(
+                f"{VERIFIER_URL}/verify",
+                json={"key": encoded_key},
+                headers={"X-API-Key": _VERIFIER_READ_KEY},
+            )
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
@@ -395,6 +408,7 @@ def _write_tombstone(call_id: str) -> None:
         resp = client.post(
             f"{VERIFIER_URL}/write",
             json={"key": encoded_key, "value": encoded_val},
+            headers={"X-API-Key": _VERIFIER_WRITE_KEY},
         )
         resp.raise_for_status()
 
@@ -737,7 +751,11 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             else:
                 try:
                     with httpx.Client(timeout=10.0) as vc:
-                        vr = vc.post(f"{VERIFIER_URL}/verify", json={"key": encoded_key})
+                        vr = vc.post(
+                            f"{VERIFIER_URL}/verify",
+                            json={"key": encoded_key},
+                            headers={"X-API-Key": _VERIFIER_READ_KEY},
+                        )
                     if vr.status_code == 200:
                         verification = _verification_from_200(vr.json())
                         if verification["state"] == "failed":
@@ -840,7 +858,11 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             encoded_key = intent.get("encoded_key", "")
             try:
                 with httpx.Client(timeout=10.0) as vc:
-                    vr = vc.post(f"{VERIFIER_URL}/verify", json={"key": encoded_key})
+                    vr = vc.post(
+                        f"{VERIFIER_URL}/verify",
+                        json={"key": encoded_key},
+                        headers={"X-API-Key": _VERIFIER_READ_KEY},
+                    )
                 if vr.status_code == 200:
                     verification = _verification_from_200(vr.json())
                 else:
@@ -965,7 +987,11 @@ def get_audit_bundle(key: str, _: None = Depends(_require_read_key)):
 
     try:
         with httpx.Client(timeout=30.0) as vc:
-            vr = vc.post(f"{VERIFIER_URL}/verify", json={"key": key})
+            vr = vc.post(
+                f"{VERIFIER_URL}/verify",
+                json={"key": key},
+                headers={"X-API-Key": _VERIFIER_READ_KEY},
+            )
         vr.raise_for_status()
         vdata = vr.json()
     except Exception as exc:

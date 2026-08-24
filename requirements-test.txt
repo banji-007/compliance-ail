@@ -22,6 +22,15 @@
 #                        fastapi==0.115.6 tolerates if left unconstrained -
 #                        confirmed live, this exact conflict broke test
 #                        collection until pinned.
+#   uvicorn            — verifier/main.py is imported directly (D21, Phase 3a
+#                        completion pass) by tests/test_verifier_auth.py's
+#                        missing-env-var 503 tests, the same in-process
+#                        pattern already used for control_plane/main.py and
+#                        decision_service/main.py above. grpc and ecdsa (also
+#                        imported by verifier/main.py) need no separate entry
+#                        here - both already arrive as immudb-py's own
+#                        transitive dependencies, installed by CI's dedicated
+#                        "pip install immudb-py==1.5.0" step.
 pytest==8.3.5
 httpx==0.28.1
 pydantic==2.12.5
@@ -32,6 +41,7 @@ fastapi==0.115.6
 starlette==0.41.3
 sqlalchemy==2.0.36
 mcp==1.12.4
+uvicorn==0.34.0
 # PyYAML - tests/test_host_port_bindings.py and
 #          tests/test_decision_service_network_isolation.py parse
 #          docker-compose.yml and docker-compose.test.yml the same way

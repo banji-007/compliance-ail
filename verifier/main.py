@@ -24,6 +24,17 @@ redo the same check offline: the prior trust anchor, the raw VerifiableEntry
 protobuf, and the transaction identifiers. The public key is deliberately not
 part of that material (see the ProofMaterial docstring and
 docs/adr/0010-portable-evidence-bundles.md).
+
+D21 (Phase 3a completion): /verify and /write now require a credential.
+Phase 1.3 deferred authenticating this service, reasoning that Phase 2 would
+remove the agent's direct network path here (it did) and Phase 3 would
+reshape the record sink (it did not - D18 instead made /verify return
+exportable proof material). Red-team X5 showed the consequence: an
+unauthenticated caller who cannot pass the control plane's own read-key gate
+could reach this service directly and assemble an equivalent evidence bundle
+by hand. VERIFIER_READ_KEY and VERIFIER_WRITE_KEY are independent secrets
+from CONTROL_PLANE_READ_KEY/WRITE_KEY (ADR-0007) - a compromise of one layer
+does not hand out the other's. See docs/adr/0011-verifier-authentication.md.
 """
 
 import base64
@@ -35,7 +46,7 @@ from contextlib import asynccontextmanager
 
 import grpc
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -50,6 +61,37 @@ IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD", "immudb")
 IMMUDB_DB      = os.getenv("IMMUDB_DB", "defaultdb")
 STATE_FILE     = os.getenv("VERIFIER_STATE_FILE", "/data/verifier-state/immudb.state")
 PUBKEY_FILE    = os.getenv("IMMUDB_SIGNING_PUBKEY", "")
+
+# D21: two independent keys, not one shared key - the same split ADR-0007
+# established for the control plane, applied here for the same reason. READ
+# authorizes only POST /verify; WRITE authorizes only POST /write. Set both
+# in the environment (docker-compose .env); an absent key disables the route
+# it gates with a 503 response, matching control_plane/main.py's
+# _require_read_key/_require_write_key fail-closed behavior exactly.
+_VERIFIER_READ_KEY  = os.getenv("VERIFIER_READ_KEY", "")
+_VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "")
+
+
+def _require_read_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
+    """FastAPI dependency: enforces X-API-Key (read-scoped) on POST /verify."""
+    if not _VERIFIER_READ_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Read-key authentication not configured (VERIFIER_READ_KEY missing)",
+        )
+    if x_api_key != _VERIFIER_READ_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+def _require_write_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
+    """FastAPI dependency: enforces X-API-Key (write-scoped) on POST /write."""
+    if not _VERIFIER_WRITE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Write-key authentication not configured (VERIFIER_WRITE_KEY missing)",
+        )
+    if x_api_key != _VERIFIER_WRITE_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
 # D18: the wire format of the proof material this service exports. Bumped
 # only when a field is added, removed, or reinterpreted, so an offline
@@ -262,7 +304,7 @@ def health():
 
 
 @app.post("/write", response_model=WriteResponse)
-def write(payload: WriteRequest):
+def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
     """
     Write a key-value pair via verifiedSet.
 
@@ -270,6 +312,10 @@ def write(payload: WriteRequest):
     persisted state to the new transaction before updating its local state.
     Returns verified: false (never raises HTTP 500) so callers can fail closed
     without catching exceptions.
+
+    D21: gated by _require_write_key. Callers: ledger/immudb_ledger.py (the
+    decision service's decision and intent writes) and
+    control_plane/main.py::_write_tombstone (the erasure tombstone).
     """
     from immudb.exceptions import ErrCorruptedData
 
@@ -290,7 +336,7 @@ def write(payload: WriteRequest):
 
 
 @app.post("/verify", response_model=VerifyResponse)
-def verify(payload: VerifyRequest):
+def verify(payload: VerifyRequest, _: None = Depends(_require_read_key)):
     """
     Retrieve and verify a key via verifiedGet.
 
@@ -298,6 +344,10 @@ def verify(payload: VerifyRequest):
     verifies a dual consistency proof from the persisted state to this tx.
     If signing is configured, the returned state is verified against the
     server's ECDSA signature before updating local state.
+
+    D21: gated by _require_read_key. Callers: control_plane/main.py's
+    get_audit (per-entry verification), get_audit_bundle (evidence export),
+    and _has_tombstone (the erasure-conflict check).
 
     D18 (Phase 3a): the same verification runs, on the same SDK function,
     with the same result - but the material it consumed is captured and

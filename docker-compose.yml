@@ -26,6 +26,14 @@ services:
       # gates with a 503 response.
       - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY}
       - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
+      # D21 (Phase 3a completion): the verifier's own credential pair,
+      # independent of CONTROL_PLANE_READ_KEY/WRITE_KEY above - a compromise
+      # of one layer does not hand out the other's. The control plane holds
+      # both: READ for every /verify call (get_audit, get_audit_bundle,
+      # _has_tombstone), WRITE for the one /write call (_write_tombstone).
+      # See docs/adr/0011-verifier-authentication.md.
+      - VERIFIER_READ_KEY=${VERIFIER_READ_KEY}
+      - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY}
     volumes:
       # policy/ mounted at runtime — changes on tenant config updates.
       - ./policy:/policy:ro
@@ -142,10 +150,14 @@ services:
     # No host port published (R1, Phase 1.3 completion pass). The previous
     # fix was a loopback bind ("127.0.0.1:8003:8003", P13-2); red-team V2
     # showed host.docker.internal reaches a loopback-bound port from any
-    # container on the Docker host, so binding alone does not close this -
-    # /write and /verify carry no authentication of their own (the exact
-    # surface red-team U5 used to forge a tombstone). P2-1 (Phase 2) closes
-    # the residual this comment used to describe (the agent container
+    # container on the Docker host, so binding alone does not close this.
+    # /write and /verify carried no authentication of their own until D21
+    # (Phase 3a completion) - the exact surface red-team U5 used to forge a
+    # tombstone, and X5 used to bypass GET /audit/bundle's read-key gate by
+    # going straight to the source the bundle route itself calls. Both
+    # routes now require VERIFIER_READ_KEY/VERIFIER_WRITE_KEY - see
+    # docs/adr/0011-verifier-authentication.md. P2-1 (Phase 2) separately
+    # closes the residual this comment used to describe (the agent container
     # sharing this network): the agent is edge-only now and this service is
     # backend-only, so the agent has no route here at all, mutation-tested
     # in tests/test_decision_service_network_isolation.py. The test stack
@@ -159,6 +171,12 @@ services:
       # The verifier checks every server state response against this key.
       - IMMUDB_SIGNING_PUBKEY=/keys/signing.pub
       - VERIFIER_STATE_FILE=/data/verifier-state/immudb.state
+      # D21: this service's own credential pair (docs/adr/0011-verifier-
+      # authentication.md), distinct from CONTROL_PLANE_READ_KEY/WRITE_KEY.
+      # An absent key disables the route it gates with a 503 response,
+      # matching control_plane/main.py's fail-closed behavior exactly.
+      - VERIFIER_READ_KEY=${VERIFIER_READ_KEY}
+      - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY}
     volumes:
       - ./keys:/keys:ro
       # Verifier state is its own volume, not shared with the ledger-writing
@@ -332,6 +350,11 @@ services:
       # Content-store writes (D5, D7) - moved here from the agent's own env
       # (D12). Write-scoped key, never the read key (D6).
       - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY}
+      # D21 (Phase 3a completion): ledger/immudb_ledger.py's decision and
+      # intent writes now carry this. Write-scoped only - this service never
+      # calls verifier /verify, so it is never provisioned with
+      # VERIFIER_READ_KEY (control_plane/main.py holds that one).
+      - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY}
       - VAULT_TOKEN_PATH=/run/secrets/vault_api_token
     secrets:
       # D14: attached only here, never to langgraph-demo - this container
@@ -380,7 +403,11 @@ services:
       # related. It holds no VERIFIER_URL, no IMMUDB_USER/PASSWORD, no
       # CONTROL_PLANE_URL/WRITE_KEY, and no direct OPA_URL any more - see
       # docs/adr/0008-decision-service-boundary.md and
-      # tests/test_decision_service_network_isolation.py.
+      # tests/test_decision_service_network_isolation.py. D21 (Phase 3a
+      # completion): also holds neither VERIFIER_READ_KEY nor
+      # VERIFIER_WRITE_KEY - it has no route to the verifier at all (backend-
+      # only, below), so provisioning it with either credential would be a
+      # key with nowhere to be used, not a capability.
       - DECISION_SERVICE_URL=https://envoy:8443/decide
       - SPIRE_DISABLED=false
       - AIL_TENANT_ID=${AIL_TENANT_ID:-tenant_default}

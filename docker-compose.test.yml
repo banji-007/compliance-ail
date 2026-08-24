@@ -53,6 +53,10 @@ services:
       - VERIFIER_URL=http://verifier:8003
       - CONTROL_PLANE_READ_KEY=${CONTROL_PLANE_READ_KEY:-test-read-key}
       - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY:-test-write-key}
+      # D21 (Phase 3a completion): the verifier's own credential pair -
+      # see docker-compose.yml's ail-control-plane service for the reasoning.
+      - VERIFIER_READ_KEY=${VERIFIER_READ_KEY:-test-verifier-read-key}
+      - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY:-test-verifier-write-key}
     volumes:
       - ./policy:/policy:ro
       - test-control-plane-data:/data
@@ -136,6 +140,10 @@ services:
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
       - IMMUDB_SIGNING_PUBKEY=/keys/signing.pub
       - VERIFIER_STATE_FILE=/data/verifier-state/immudb.state
+      # D21 (Phase 3a completion): see docker-compose.yml's verifier service
+      # for the reasoning.
+      - VERIFIER_READ_KEY=${VERIFIER_READ_KEY:-test-verifier-read-key}
+      - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY:-test-verifier-write-key}
     volumes:
       - ./keys:/keys:ro
       - test-verifier-state:/data/verifier-state
@@ -165,6 +173,9 @@ services:
       - VERIFIER_URL=http://verifier:8003
       - CONTROL_PLANE_URL=http://ail-control-plane:8002
       - CONTROL_PLANE_WRITE_KEY=${CONTROL_PLANE_WRITE_KEY:-test-write-key}
+      # D21 (Phase 3a completion): write-scoped only - see docker-compose.yml's
+      # decision-service for why it never holds VERIFIER_READ_KEY.
+      - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY:-test-verifier-write-key}
       - VAULT_TOKEN_PATH=/run/secrets/vault_api_token
     secrets:
       - source: vault_api_token

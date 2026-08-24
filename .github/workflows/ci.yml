@@ -33,6 +33,8 @@ jobs:
           IMMUDB_PASSWORD: immudb
           CONTROL_PLANE_READ_KEY: test-read-key
           CONTROL_PLANE_WRITE_KEY: test-write-key
+          VERIFIER_READ_KEY: test-verifier-read-key
+          VERIFIER_WRITE_KEY: test-verifier-write-key
           DASHBOARD_READ_USER: test-dashboard-reader
           DASHBOARD_READ_PASSWORD: test-dashboard-read-pw
           DASHBOARD_WRITE_USER: test-dashboard-writer
