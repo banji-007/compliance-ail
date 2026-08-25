@@ -35,6 +35,16 @@ could reach this service directly and assemble an equivalent evidence bundle
 by hand. VERIFIER_READ_KEY and VERIFIER_WRITE_KEY are independent secrets
 from CONTROL_PLANE_READ_KEY/WRITE_KEY (ADR-0007) - a compromise of one layer
 does not hand out the other's. See docs/adr/0011-verifier-authentication.md.
+
+D23 (Phase 3b): two changes, both about which transaction a proof runs to.
+GET /state returns ImmuDB's current signed state - the checkpoint an
+anchoring job submits to a public transparency log - after verifying its
+signature here, which currentRoot's own handler does not do. And POST
+/verify now accepts an optional anchor: the proof runs to that checkpoint
+instead of to whatever this service's volume happens to hold, because an
+anchor internal to this deployment is unfalsifiable to an external party.
+A supplied anchor is verified before use and never persisted. See
+docs/adr/0012-writer-signing-and-external-anchoring.md.
 """
 
 import base64
@@ -96,7 +106,17 @@ def _require_write_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
 # D18: the wire format of the proof material this service exports. Bumped
 # only when a field is added, removed, or reinterpreted, so an offline
 # checker can refuse material it does not understand rather than guess.
-PROOF_MATERIAL_FORMAT = "ail-proof-material/1"
+#
+# Bumped to /2 by D23 (Phase 3b). No field was added or removed, but
+# source_state was reinterpreted: in /1 it was always whatever this
+# service's PersistentRootService happened to hold at export time, which is
+# an internal implementation detail of this deployment and meaningless to an
+# external party. In /2 it is either that, or - when the caller supplies an
+# anchor - the externally anchored checkpoint the proof actually runs to.
+# A /1 checker reading a /2 bundle would draw the wrong conclusion about
+# what the proof is anchored at, which is exactly the case this version
+# string exists to refuse.
+PROOF_MATERIAL_FORMAT = "ail-proof-material/2"
 
 # Pinned in verifier/requirements.txt. Recorded in the exported material
 # because the material is only meaningful to a checker running the same
@@ -190,6 +210,44 @@ class _CapturedEntryStub:
         return self._ventry
 
 
+class _PinnedRootService:
+    """
+    D23/P3b-1: drive the SDK's own verification from an externally anchored
+    checkpoint instead of from this service's persisted state.
+
+    docs/reports/spike-consistency-proof.md is the whole basis for this
+    class, including its limits. `verifiedGet.call()` derives its proof
+    source entirely from `rs.get()`, and `rs` is a caller-supplied object -
+    probe 6 in that spike enumerated every public ImmudbClient method and
+    found none that takes a source or proveSinceTx argument. So this is a
+    seam, not an API, and an immudb-py upgrade past the pinned 1.5.0 can
+    move it. tests/test_anchored_export.py asserts the seam's shape against
+    the installed SDK so an upgrade fails a test rather than silently
+    anchoring at the wrong transaction.
+
+    set() records rather than persists, deliberately: verifying a record
+    against an anchor must not advance, consume, or otherwise mutate this
+    service's real trust anchor. Probe 7a established that the anchor is
+    unchanged in this direction anyway (the older transaction is always the
+    proof source, so the retained state would be the anchor itself), but
+    that is a property of the pair rather than a guarantee about every pair
+    a caller could ask for, so it is enforced here as well.
+    """
+
+    def __init__(self, state):
+        self._state = state
+        self.new_state = None
+
+    def init(self):
+        return self._state
+
+    def get(self):
+        return self._state
+
+    def set(self, new_state):
+        self.new_state = new_state
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _get_client()
@@ -214,8 +272,34 @@ class WriteResponse(BaseModel):
     detail: str | None = None
 
 
+class AnchorState(BaseModel):
+    """
+    D23/P3b-1: the externally anchored checkpoint a caller wants a record
+    proven against, rather than whatever this service happens to hold.
+
+    Exactly the four fields immudb's own State carries, minus publicKey -
+    which is omitted for the same reason SourceState below omits it: the
+    spike established verifiedGet.call() never reads it, so accepting one
+    would be accepting a key-shaped field that decides nothing.
+
+    This is untrusted input. Before it is used as a proof source its ECDSA
+    signature is checked against the server's public key this service holds
+    on its own volume; an anchor that does not verify is refused, never used
+    (see verify() below). A caller cannot pin the proof to a state ImmuDB
+    never signed.
+    """
+    db: str
+    tx_id: int
+    tx_hash: str            # base64 of the 32-byte state hash
+    signature: str | None   # base64 of the state's own DER ECDSA signature
+
+
 class VerifyRequest(BaseModel):
     key: str    # base64-encoded raw key bytes
+    # D23/P3b-1: absent means "anchor at this service's persisted state",
+    # which is what Phase 3a always did and remains correct for a record no
+    # anchored checkpoint covers yet.
+    anchor: AnchorState | None = None
 
 
 class SourceState(BaseModel):
@@ -284,6 +368,20 @@ class VerifyResponse(BaseModel):
     # not its gRPC status code - see the except grpc.RpcError branch below
     # for why), or "unknown" for anything else. Only meaningful when verified
     # is False.
+    #
+    # D23/P3b-1 adds two more, both about the anchor a caller supplied
+    # rather than about the record. They are additions to this vocabulary,
+    # never substitutes: nothing that used to report consistency_failure or
+    # signature_failure now reports one of these.
+    #   "anchor_signature_failure" - the supplied anchor is not a state this
+    #       ImmuDB signed, so it was refused before any proof ran. Distinct
+    #       from signature_failure, which is the server's signature over the
+    #       state the SDK derived from a proof that did run.
+    #   "anchor_precedes_record"   - the anchor is older than the record. A
+    #       checkpoint published before a record existed cannot corroborate
+    #       it, so this is refused rather than answered with a proof running
+    #       the other way. Not a statement that the record is bad; the
+    #       caller's next move is to export it as unanchored.
     error_class: str | None = None
     # D18 (Phase 3a): the raw material this verdict was computed from, so the
     # check is reproducible by someone who does not have this service, this
@@ -335,6 +433,74 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
         return WriteResponse(tx_id=None, verified=False, detail=str(exc))
 
 
+class CurrentStateResponse(BaseModel):
+    db: str
+    tx_id: int
+    tx_hash: str            # base64
+    signature: str          # base64 of the state's own DER ECDSA signature
+    signing_key_fingerprint: str | None
+
+
+@app.get("/state", response_model=CurrentStateResponse)
+def current_state(_: None = Depends(_require_read_key)):
+    """
+    D23: the signed ImmuDB state an anchoring job submits to Rekor.
+
+    Not client.currentState(). That SDK method calls rs.set() on the way out
+    (immudb/handler/currentRoot.py), so asking this service what the current
+    state is would silently advance its persisted trust anchor - a read that
+    mutates the thing every later proof is measured against. The RPC is made
+    directly and the persisted anchor is left exactly where it was.
+
+    The signature is verified here, against the ImmuDB public key mounted on
+    this service's own volume, before the state is handed out. currentRoot's
+    handler does not verify it, and an unverified state would be a state the
+    caller has only the server's word for - which is the entire thing
+    anchoring exists to stop relying on. No configured key, or a signature
+    that does not check out, is a 503: fail closed, like every other
+    dependency in this project except the one D23 names.
+
+    Read-scoped (ADR-0011): this returns a public Merkle root and a
+    signature over it, which is strictly less than /verify already returns
+    to the same credential.
+    """
+    from ecdsa.keys import BadSignatureError
+    from google.protobuf import empty_pb2
+    from immudb.rootService import State
+
+    client = _get_client()
+    if client._vk is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No ImmuDB signing key configured (IMMUDB_SIGNING_PUBKEY); this "
+                "deployment produces no state a checkpoint could be built from"
+            ),
+        )
+    try:
+        state = State.FromGrpc(client._stub.CurrentState(empty_pb2.Empty()))
+    except Exception as exc:
+        logger.error("CurrentState RPC failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"ImmuDB unavailable: {exc}")
+
+    try:
+        state.Verify(client._vk)
+    except BadSignatureError as exc:
+        logger.error("CurrentState signature did not verify: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="ImmuDB's current state is not signed by the configured key",
+        )
+
+    return CurrentStateResponse(
+        db=state.db,
+        tx_id=state.txId,
+        tx_hash=base64.b64encode(state.txHash).decode(),
+        signature=base64.b64encode(state.signature).decode(),
+        signing_key_fingerprint=signing_key_fingerprint(),
+    )
+
+
 @app.post("/verify", response_model=VerifyResponse)
 def verify(payload: VerifyRequest, _: None = Depends(_require_read_key)):
     """
@@ -363,14 +529,58 @@ def verify(payload: VerifyRequest, _: None = Depends(_require_read_key)):
     from immudb.grpc import schema_pb2
     from immudb.handler import verifiedGet as sdk_verified_get
 
+    from immudb.rootService import State
+
     key = base64.b64decode(payload.key)
     try:
         client = _get_client()
 
-        # The trust anchor as it stands before this read. Captured first,
-        # because verifiedGet.call() replaces it via rs.set() on success and
-        # the anchor a checker needs is the one that was in force going in.
-        source_state = client._rs.get()
+        if payload.anchor is None:
+            # Phase 3a's behaviour, unchanged and still correct for a record
+            # no anchored checkpoint covers yet. The trust anchor as it
+            # stands before this read, captured first because
+            # verifiedGet.call() replaces it via rs.set() on success and the
+            # anchor a checker needs is the one that was in force going in.
+            root_service = client._rs
+            source_state = client._rs.get()
+        else:
+            # D23/P3b-1: prove the record against the checkpoint that was
+            # actually submitted to Rekor. A dual proof running to whatever
+            # this service's volume happened to hold is unfalsifiable to an
+            # outside party - they have no way to know what that state was
+            # or whether it was ever published.
+            source_state = State(
+                db=payload.anchor.db,
+                txId=int(payload.anchor.tx_id),
+                txHash=base64.b64decode(payload.anchor.tx_hash),
+                publicKey=b"",
+                signature=base64.b64decode(payload.anchor.signature or ""),
+            )
+            if client._vk is None:
+                return VerifyResponse(
+                    verified=False,
+                    detail=(
+                        "no ImmuDB signing key is configured, so a supplied anchor "
+                        "cannot be checked and will not be used"
+                    ),
+                    error_class="anchor_signature_failure",
+                )
+            try:
+                source_state.Verify(client._vk)
+            except Exception as exc:
+                logger.warning(
+                    "Refusing an anchor at tx=%s: %s: %s",
+                    payload.anchor.tx_id, type(exc).__name__, exc,
+                )
+                return VerifyResponse(
+                    verified=False,
+                    detail=(
+                        f"the supplied anchor (tx {payload.anchor.tx_id}) is not a "
+                        f"state this ImmuDB signed: {type(exc).__name__}"
+                    ),
+                    error_class="anchor_signature_failure",
+                )
+            root_service = _PinnedRootService(source_state)
 
         req = schema_pb2.VerifiableGetRequest(
             keyRequest=schema_pb2.KeyRequest(key=key),
@@ -380,14 +590,48 @@ def verify(payload: VerifyRequest, _: None = Depends(_require_read_key)):
 
         resp = sdk_verified_get.call(
             _CapturedEntryStub(ventry),
-            client._rs,
+            root_service,
             key,
             verifying_key=client._vk,
         )
-        state = client.currentState()
+
+        if payload.anchor is not None and int(resp.id) > int(source_state.txId):
+            # Proof direction is fixed by the SDK, not by the caller: the
+            # older transaction is always the source and the newer always
+            # the target (docs/reports/spike-consistency-proof.md item 4).
+            # So an anchor older than the record does not fail - it quietly
+            # inverts, producing a proof from the checkpoint forward to a
+            # record the checkpoint was published before. That proof is
+            # sound and says nothing about external corroboration, which is
+            # exactly the confusion D23's "fail-closed on the claim" rule
+            # exists to prevent. Refused by name instead.
+            logger.info(
+                "Anchor at tx=%d precedes record at tx=%d; refusing to anchor there",
+                source_state.txId, resp.id,
+            )
+            return VerifyResponse(
+                verified=False,
+                detail=(
+                    f"the supplied anchor is at tx {source_state.txId}, which precedes "
+                    f"the record at tx {resp.id}; a checkpoint cannot corroborate a "
+                    "record written after it"
+                ),
+                error_class="anchor_precedes_record",
+            )
+
+        # Unchanged from Phase 3a on the unanchored path, deliberately:
+        # client.currentState() calls rs.set() on the way out, so it both
+        # reports the head and advances this service's persisted anchor to
+        # it, and that has been this endpoint's behaviour since Phase 1.3.
+        # On the anchored path it is not called at all - the persisted
+        # anchor must not move because someone asked a question about an
+        # old record, and _PinnedRootService.set() already refuses to move
+        # the one the proof itself ran against.
+        state = client.currentState() if payload.anchor is None else client._rs.get()
         logger.info(
-            "Verified read: tx=%d state_id=%d verified=%s",
+            "Verified read: tx=%d anchor=%d state_id=%d verified=%s",
             resp.id,
+            source_state.txId,
             state.txId,
             resp.verified,
         )

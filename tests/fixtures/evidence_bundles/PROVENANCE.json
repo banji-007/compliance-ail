@@ -1,12 +1,36 @@
 {
-  "generated_at": "2026-08-21T15:56:43.004371Z",
+  "generated_at": "2026-08-24T21:48:41.898325Z",
   "generated_by": "tools/export_evidence_fixtures.py",
-  "agent_id": "p3a_fixture_96d87a2f",
-  "signing_key_fingerprint": "sha256:cc837c537fe429fa4c565919004bd8a799a55e525aa639a669052647b719d6f8",
+  "agent_id": "p3a_fixture_af6edad9",
+  "signing_key_fingerprint": "sha256:772cc0d38c2d40a4971fc589a87df71c8c83e948a9fe38605865662aca94d11e",
   "record_types": [
     "content_erasure",
     "fault",
     "policy_allow",
     "policy_deny"
-  ]
+  ],
+  "writer_key_fingerprints": [
+    "sha256:c770706648326c5c1d13656e63a4de08c1020fcbddd332e978c75655be30560f",
+    "sha256:e528c08db9b6f6ee44e176568ba35ac5db4a18987304a407f64bc012cbf71784"
+  ],
+  "anchored": [
+    "policy_allow",
+    "policy_deny"
+  ],
+  "not_anchored": [
+    "content_erasure",
+    "fault"
+  ],
+  "anchor": {
+    "policy_allow": {
+      "log_url": "https://log2025-1.rekor.sigstore.dev",
+      "log_index": "79224227",
+      "anchored_tx_id": 2
+    },
+    "policy_deny": {
+      "log_url": "https://log2025-1.rekor.sigstore.dev",
+      "log_index": "79224227",
+      "anchored_tx_id": 2
+    }
+  }
 }

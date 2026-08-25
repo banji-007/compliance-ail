@@ -47,3 +47,11 @@ uvicorn==0.34.0
 #          docker-compose.yml and docker-compose.test.yml the same way
 #          Compose itself does (P13-1, P13-2, Phase 1.3; P2-1, Phase 2)
 PyYAML==6.0.3
+# sigstore - tests/test_external_anchor.py verifies a committed Rekor
+#            inclusion proof and its witnessed checkpoint offline, using
+#            sigstore-python's own verify_merkle_inclusion and
+#            verify_checkpoint rather than anything written here (D23,
+#            Phase 3b). tools/ail_verify_bundle.py imports it lazily, only
+#            when a bundle claims external corroboration, so the base
+#            offline check still needs nothing but immudb-py.
+sigstore==4.5.0

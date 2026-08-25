@@ -77,9 +77,16 @@ os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluat
 os.environ.setdefault("VERIFIER_URL", VERIFIER_URL)
 os.environ.setdefault("CONTROL_PLANE_URL", CONTROL_PLANE_URL)
 os.environ.setdefault("CONTROL_PLANE_WRITE_KEY", WRITE_API_KEY)
+# D22 (Phase 3b): ledger/immudb_ledger.py refuses to write a record it
+# cannot sign, so the in-process decision service loaded below needs a host
+# path to the same key the decision-service container mounts at /keys.
+os.environ.setdefault(
+    "AIL_WRITER_SIGNING_KEY", str(REPO_ROOT / "keys" / "writer-decision.key")
+)
 
 sys.path.insert(0, str(REPO_ROOT / "decision_service"))
 sys.path.insert(0, str(REPO_ROOT / "ledger"))
+sys.path.insert(0, str(REPO_ROOT))
 
 
 def _load_module(name: str, path: Path):
@@ -94,12 +101,19 @@ def _load_module(name: str, path: Path):
     return module
 
 
+from provenance import record_signature as signer  # noqa: E402
+
 decision_main = _load_module("decision_service_main", REPO_ROOT / "decision_service" / "main.py")
 checker = _load_module("ail_verify_bundle", REPO_ROOT / "tools" / "ail_verify_bundle.py")
 socket.socket.connect = _REAL_SOCKET_CONNECT  # see the note at the top of this file
 
 FIXTURE_KEY = REPO_ROOT / "tests" / "fixtures" / "evidence_bundles" / "signing.pub"
 LIVE_KEY = REPO_ROOT / "keys" / "signing.pub"
+# D22 (Phase 3b): the two writer keys this stack's own services sign with.
+# The live keys, not the fixture copies - these tests check bundles this
+# stack just produced, not the committed ones.
+WRITER_DECISION_PUB = REPO_ROOT / "keys" / "writer-decision.pub"
+WRITER_CONTROL_PLANE_PUB = REPO_ROOT / "keys" / "writer-control-plane.pub"
 
 _APPROVED_ARGS = {
     "instance_type": "t3.micro",
@@ -170,11 +184,22 @@ def _check_offline(bundle: dict, key_path=None):
     The block is installed here, inside this file's own live run, so the
     offline assertions below are genuinely offline even though everything
     around them is not.
+
+    D22/D23 (Phase 3b): the checker now also needs the writer keys, because
+    a record it cannot attribute is refused rather than reported as
+    verified. The anchor half is deliberately NOT exercised here - this
+    stack has no anchor-service, so every bundle it exports is
+    not_anchored, and that path is covered by tests/test_external_anchor.py
+    against a real committed log entry.
     """
     saved = socket.socket.connect
     checker.block_network()
     try:
-        return checker.verify_bundle(bundle, checker.load_key(key_path or LIVE_KEY))
+        return checker.verify_bundle(
+            bundle,
+            checker.load_key(key_path or LIVE_KEY),
+            checker.load_writer_keys([str(WRITER_DECISION_PUB), str(WRITER_CONTROL_PLANE_PUB)]),
+        )
     finally:
         socket.socket.connect = saved
 
@@ -252,14 +277,29 @@ def _fresh_record() -> bytes:
     "unknown". A synthetic shape here would let the record_type comparison
     in tools/ail_verify_bundle.py pass without ever exercising the
     derivation it exists to perform.
+
+    D22 (Phase 3b): the value is signed with the decision service's own
+    writer key, through provenance/record_signature.py - the same call
+    ledger/immudb_ledger.py makes - rather than written raw. The offline
+    check below refuses a record it cannot attribute, so a raw value here
+    would fail on its writer signature and never reach the D18 material
+    assertions this helper exists to feed.
     """
-    key = f"p3a_material_test:{uuid.uuid4().hex}".encode()
+    key = f"p3b_material_test:{uuid.uuid4().hex}".encode()
+    signing_key, verifying_key = signer.load_signing_key(
+        REPO_ROOT / "keys" / "writer-decision.key"
+    )
     value = json.dumps(
-        {"outcome_type": "policy_allow", "note": "p3a proof material"}
+        signer.sign_record(
+            {"outcome_type": "policy_allow", "note": "p3b proof material"},
+            signing_key,
+            verifying_key,
+        ),
+        separators=(",", ":"),
     ).encode()
     result = _write(key, value)
     assert result["verified"], result
-    _write(f"p3a_material_test:{uuid.uuid4().hex}".encode(), b'{"note":"advances the anchor"}')
+    _write(f"p3b_material_test:{uuid.uuid4().hex}".encode(), b'{"note":"advances the anchor"}')
     return key
 
 
@@ -340,7 +380,9 @@ def test_proof_material_identifies_the_transaction_and_the_request():
     material = _verify(key)["proof_material"]
     assert material["prove_since_tx"] == material["source_state"]["tx_id"]
     assert isinstance(material["entry_tx_id"], int) and material["entry_tx_id"] > 0
-    assert material["format"] == "ail-proof-material/1"
+    # Bumped to /2 by D23 (Phase 3b): source_state was reinterpreted, from
+    # "whatever this verifier held" to "the checkpoint the proof runs to".
+    assert material["format"] == "ail-proof-material/2"
     assert material["sdk"] == "immudb-py==1.5.0"
 
 
@@ -390,7 +432,9 @@ def test_exported_material_actually_completes_an_offline_check():
     material = response["proof_material"]
 
     bundle = {
-        "bundle_format": "ail-evidence-bundle/1",
+        # Bumped by D22/D23 (Phase 3b) - see control_plane/main.py's
+        # EVIDENCE_BUNDLE_FORMAT for why a reinterpreted field bumps it.
+        "bundle_format": "ail-evidence-bundle/2",
         "exported_at": "assembled-in-test",
         "exported_by": "tests/test_evidence_bundle.py",
         "record": {
@@ -406,6 +450,13 @@ def test_exported_material_actually_completes_an_offline_check():
         },
         "proof": material,
         "signing_key": {"fingerprint": material["signing_key_fingerprint"]},
+        # D23: stated, never omitted. This stack runs without anchor-service
+        # (docker-compose.test.yml), so the honest value here is the same
+        # one GET /audit/bundle would produce for this record.
+        "external_anchor": {
+            "state": "not_anchored",
+            "detail": "assembled in a test from /verify's own material; no checkpoint was anchored",
+        },
     }
 
     result = _check_offline(bundle)

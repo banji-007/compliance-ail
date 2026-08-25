@@ -27,6 +27,9 @@ COPY --from=builder /install /usr/local
 # carry; it now lives only here.
 COPY decision_service/ ./
 COPY ledger/ ./ledger/
+# D22 (Phase 3b): the canonicalization rule and the signing call
+# ledger/immudb_ledger.py uses to sign every record before it is written.
+COPY provenance/ ./provenance/
 
 EXPOSE 8010
 EXPOSE 8000

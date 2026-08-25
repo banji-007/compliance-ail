@@ -15,6 +15,14 @@
 ## Skips generation if keys/signing.key already exists (idempotent).
 ## To rotate keys: delete keys/ and re-run, then also delete the verifier
 ## state volume (docker compose down -v) so the new root is accepted.
+##
+## Rotating a WRITER key (D22) is a different operation and needs no volume
+## deleted: records already written stay verifiable against the old public
+## key, which is why a bundle names its writer by fingerprint and a checker
+## can be handed more than one --writer-key. Rotation after a suspected
+## compromise additionally means adding the old fingerprint to the checker's
+## deny-list, or every record that key ever signed still verifies - see
+## docs/adr/0012-writer-signing-and-external-anchoring.md.
 keygen:
 	@mkdir -p keys
 	@if [ -f keys/signing.key ]; then \
@@ -25,6 +33,27 @@ keygen:
 	  echo "keygen: keys written to keys/signing.key and keys/signing.pub"; \
 	fi
 	@chmod 644 keys/signing.key keys/signing.pub
+	@# D22/D23 (Phase 3b): three more long-lived P-256 pairs, generated
+	@# by the same openssl invocation as the ImmuDB key above, because
+	@# they are the same kind of thing - a key whose custody is an
+	@# operational matter, not a credential the platform mints.
+	@#   writer-decision      decision-service signs decision + intent records
+	@#   writer-control-plane the control plane signs erasure tombstones
+	@#   anchor-signing       anchor-service signs Rekor submissions
+	@# Two writer keys, not one, so a bundle's writer_key_fingerprint names
+	@# which service wrote the record, and so one writer can be put on a
+	@# checker's deny-list without revoking the other. See
+	@# docs/adr/0012-writer-signing-and-external-anchoring.md.
+	@for name in writer-decision writer-control-plane anchor-signing; do \
+	  if [ -f keys/$$name.key ]; then \
+	    echo "keygen: keys/$$name.key already exists - reusing existing key."; \
+	  else \
+	    openssl ecparam -genkey -name prime256v1 -noout -out keys/$$name.key && \
+	    openssl ec -in keys/$$name.key -pubout -out keys/$$name.pub && \
+	    echo "keygen: keys written to keys/$$name.key and keys/$$name.pub"; \
+	  fi; \
+	  chmod 644 keys/$$name.key keys/$$name.pub; \
+	done
 	@mkdir -p decision_service/secrets
 	@if [ -f decision_service/secrets/vault_api_token.txt ]; then \
 	  echo "keygen: decision_service/secrets/vault_api_token.txt already exists — reusing."; \
@@ -95,6 +124,8 @@ test-integration:
 	  CONTROL_PLANE_WRITE_KEY=$${CONTROL_PLANE_WRITE_KEY_ENV:-$${CONTROL_PLANE_WRITE_KEY:-test-write-key}} \
 	  VERIFIER_READ_KEY=$${VERIFIER_READ_KEY_ENV:-$${VERIFIER_READ_KEY:-test-verifier-read-key}} \
 	  VERIFIER_WRITE_KEY=$${VERIFIER_WRITE_KEY_ENV:-$${VERIFIER_WRITE_KEY:-test-verifier-write-key}} \
+	  AIL_WRITER_SIGNING_KEY=$$(pwd)/keys/writer-decision.key \
+	  AIL_ANCHOR_SIGNING_KEY=$$(pwd)/keys/anchor-signing.key \
 	  DASHBOARD_URL=http://localhost:3001 \
 	  DASHBOARD_READ_USER=$${DASHBOARD_READ_USER_ENV:-$${DASHBOARD_READ_USER:-test-dashboard-reader}} \
 	  DASHBOARD_READ_PASSWORD=$${DASHBOARD_READ_PASSWORD_ENV:-$${DASHBOARD_READ_PASSWORD:-test-dashboard-read-pw}} \

@@ -6,13 +6,18 @@
 #   copied to the final image.
 # Stage 2 (runtime): copies installed packages + application source; no
 #   network access required at container start-up.
+#
+# D22 (Phase 3b): the build context is the repository root, not
+# control_plane/, because this service also needs provenance/ - the
+# canonicalization rule it shares with every other writer. Same reason
+# decision_service/Dockerfile has built from the root since Phase 2.
 
 # ── Stage 1: dependency installer ──────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-COPY requirements.txt .
+COPY control_plane/requirements.txt .
 
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
@@ -27,7 +32,8 @@ COPY --from=builder /install /usr/local
 
 # Bake application source into the image layer.
 # policy/ and the SQLite data volume are mounted at runtime by docker-compose.
-COPY . .
+COPY control_plane/ ./
+COPY provenance/ ./provenance/
 
 EXPOSE 8002
 

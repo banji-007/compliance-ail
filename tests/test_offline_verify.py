@@ -45,6 +45,19 @@ FIXTURE_KEY = FIXTURES / "signing.pub"
 # copy of the right one.
 OTHER_KEY = FIXTURES / "other-signing.pub"
 
+# D22/D23 (Phase 3b): the rest of what a full check needs, each its own file
+# beside the bundles and never inside one. A bundle now names four kinds of
+# key by fingerprint - the ImmuDB state key above, one writer key per
+# writing service, and the key the Rekor submission was made under - plus
+# the Sigstore trust root the log entry is checked against.
+# tests/test_writer_signing.py and tests/test_external_anchor.py are where
+# each of those is exercised on its own; this file supplies them so its own
+# Phase 3a assertions still run end to end rather than stopping at the new
+# checks.
+WRITER_KEYS = [FIXTURES / "writer-decision.pub", FIXTURES / "writer-control-plane.pub"]
+ANCHOR_KEYS = [FIXTURES / "anchor-signing.pub"]
+TRUSTED_ROOT = FIXTURES / "trusted_root.json"
+
 BUNDLE_FILES = {
     "policy_allow": FIXTURES / "policy_allow.json",
     "policy_deny": FIXTURES / "policy_deny.json",
@@ -167,7 +180,13 @@ def test_fixture_bundle_verifies_offline_with_no_network(record_type):
     """
     checker.block_network()
     try:
-        result = checker.check(BUNDLE_FILES[record_type], FIXTURE_KEY)
+        result = checker.check(
+            BUNDLE_FILES[record_type],
+            FIXTURE_KEY,
+            [str(p) for p in WRITER_KEYS],
+            trusted_root_path=TRUSTED_ROOT,
+            anchor_key_paths=[str(p) for p in ANCHOR_KEYS],
+        )
     except checker.NetworkAccessAttempted as exc:
         pytest.fail(
             f"the offline checker attempted a network connection while verifying "
@@ -192,9 +211,36 @@ def test_verified_bundle_reports_the_record_the_ledger_actually_held():
     """
     checker.block_network()
     bundle = json.loads(BUNDLE_FILES["policy_allow"].read_text())
-    result = checker.check(BUNDLE_FILES["policy_allow"], FIXTURE_KEY)
+    result = checker.check(
+        BUNDLE_FILES["policy_allow"],
+        FIXTURE_KEY,
+        [str(p) for p in WRITER_KEYS],
+        trusted_root_path=TRUSTED_ROOT,
+        anchor_key_paths=[str(p) for p in ANCHOR_KEYS],
+    )
     assert result["value"] == base64.b64decode(bundle["record"]["value"])
     assert result["ledger_key"].encode() == base64.b64decode(bundle["record"]["ledger_key"])
+
+
+# The complete list of functions in tools/ail_verify_bundle.py that may
+# touch hashlib, and why each one is on it. Kept beside the test rather than
+# inline so adding a name is a visible edit to a named set.
+#
+#   key_fingerprint        derives the identifier a bundle names a key by.
+#                          No verification result depends on it: a bundle
+#                          that renamed its key still fails at the
+#                          signature (Phase 3a asserts exactly that).
+#   anchor_payload_digest  recomputes the digest a transparency log entry
+#                          claims to be about, so the entry can be shown to
+#                          concern this bundle's own anchor rather than
+#                          some other state. A comparison, not a step in
+#                          any proof - and one there is no way to make
+#                          without hashing the preimage.
+#   _ecdsa_verify          passes hashlib.sha256 to ecdsa as its hashfunc.
+#                          ecdsa's default is SHA-1, so naming it is what
+#                          keeps the check from silently running under a
+#                          hash nobody chose.
+_HASHLIB_ALLOWED = frozenset({"key_fingerprint", "anchor_payload_digest", "_ecdsa_verify"})
 
 
 def test_the_checker_implements_no_cryptography_of_its_own():
@@ -205,11 +251,29 @@ def test_the_checker_implements_no_cryptography_of_its_own():
     wrong. Asserted against the source rather than trusted, because a later
     change could quietly add one.
 
-    hashlib is permitted in exactly one place, key_fingerprint(), where it
-    derives an identifier and no proof result depends on it.
+    hashlib is permitted in exactly three named places, listed in
+    _HASHLIB_ALLOWED below with the reason each one is there. Phase 3a had
+    one; Phase 3b adds two, and that widening is recorded here rather than
+    left implicit, because an allowlist that grows quietly is not an
+    allowlist. None of the three assembles a construction of this project's
+    own: one derives an identifier, one recomputes a digest purely to
+    compare it against a claim, and one passes hashlib.sha256 to ecdsa as
+    its hashfunc because ecdsa's default is SHA-1.
+
+    Two assertions are added alongside it rather than in place of it, so the
+    net effect is a stricter test: the Merkle and checkpoint work must go
+    through sigstore's own entry point, and no cryptographic module may be
+    imported here beyond the ones the SDKs themselves are reached through.
     """
     tree = ast.parse(CHECKER_SRC.read_text(encoding="utf-8"))
 
+    # Unchanged from Phase 3a. sigstore is deliberately NOT added: it is
+    # imported inside verify_external_anchor, which is a function-level
+    # import this walk does see, and it is permitted for the same reason
+    # immudb and ecdsa are - it is somebody else's verification code being
+    # called, not a primitive written here. What must never appear is a
+    # general-purpose crypto toolkit, because that is what a hand-rolled
+    # construction would be built out of.
     banned_modules = {"hmac", "Crypto", "cryptography", "nacl", "hashes"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -234,16 +298,27 @@ def test_the_checker_implements_no_cryptography_of_its_own():
                     and node.value.id == "hashlib"
                 ):
                     sha_functions.add(func.name)
-    assert sha_functions <= {"key_fingerprint"}, (
-        f"hashlib is used outside key_fingerprint, in {sorted(sha_functions)}; "
-        "a digest anywhere else would be a reimplemented primitive"
+    assert sha_functions <= _HASHLIB_ALLOWED, (
+        f"hashlib is used outside {sorted(_HASHLIB_ALLOWED)}, in "
+        f"{sorted(sha_functions)}; a digest anywhere else would be a "
+        "reimplemented primitive"
     )
 
-    # The verification itself must go through the SDK's own entry point.
+    # The verification itself must go through each SDK's own entry point.
     source = CHECKER_SRC.read_text(encoding="utf-8")
     assert "verifiedGet.call(" in source, (
         "the checker must call immudb's own verifiedGet.call(); if this "
         "disappeared, verification was reimplemented"
+    )
+    assert "TransparencyLogEntry(raw_entry)._verify(keyring)" in source, (
+        "the checker must reach sigstore-python's own verify_merkle_inclusion "
+        "and verify_checkpoint through TransparencyLogEntry._verify; if this "
+        "disappeared, a Merkle walk or a checkpoint signature check was "
+        "reimplemented here"
+    )
+    assert "sigdecode=sigdecode_der" in source, (
+        "the writer and anchor signature checks must go through ecdsa's own "
+        "verify with an explicit DER decoder"
     )
 
 
@@ -260,12 +335,26 @@ def _bundle(name="policy_allow") -> dict:
     return json.loads(BUNDLE_FILES[name].read_text())
 
 
+def _writer_keys():
+    return checker.load_writer_keys([str(p) for p in WRITER_KEYS])
+
+
+def _anchor_keys():
+    return checker.load_writer_keys([str(p) for p in ANCHOR_KEYS])
+
+
 def _check_dict(bundle: dict, key_path=FIXTURE_KEY):
     """Run the checker against an in-memory bundle, so a tamper case never
     has to touch a fixture file on disk."""
     checker.block_network()
     verifying_key = checker.load_key(key_path)
-    return checker.verify_bundle(bundle, verifying_key)
+    return checker.verify_bundle(
+        bundle,
+        verifying_key,
+        _writer_keys(),
+        trusted_root_path=TRUSTED_ROOT,
+        anchor_keys=_anchor_keys(),
+    )
 
 
 def _flip_first_byte(b64_value: str) -> str:

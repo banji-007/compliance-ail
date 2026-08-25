@@ -8,9 +8,26 @@ evidence bundle through the real GET /audit/bundle route (not by assembling
 JSON here), and writes the results plus the public key they were exported
 against into the fixture directory.
 
-    docker compose -p p3a-bundle -f docker-compose.test.yml up -d --build --wait
+    docker compose -p p3b-bundle -f docker-compose.test.yml up -d --build --wait
     python tools/export_evidence_fixtures.py
-    docker compose -p p3a-bundle -f docker-compose.test.yml down -v
+    docker compose -p p3b-bundle -f docker-compose.test.yml down -v
+
+D23 (Phase 3b) makes one step of this reach the public internet. Between
+writing the first two records and the last two, this script runs one real
+anchoring cycle - a genuine submission to a Rekor v2 instance discovered
+from Sigstore's own TUF-distributed configuration - so the committed
+fixtures contain both states a bundle can be in:
+
+    policy_allow, policy_deny   written before the anchor  -> anchored
+    fault, content_erasure      written after it           -> not_anchored
+
+Both are real. Neither is hand-edited into that state, and the difference
+between them is a fact about transaction ordering rather than a flag this
+script sets. The anchoring step runs in a one-shot container built from
+anchor_service/Dockerfile and attached to the compose project's own
+network, because sigstore-python's TUF client needs symlink privileges this
+project's own spike found Windows refuses (WinError 1314,
+docs/reports/spike-signing-anchor.md, "What blocked it").
 
 The bundles are committed so tests/test_offline_verify.py can check them
 with no stack at all. The key is committed alongside them, as its own file,
@@ -26,6 +43,7 @@ import base64
 import json
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -43,6 +61,14 @@ WRITE_KEY = os.getenv("CONTROL_PLANE_WRITE_KEY", "test-write-key")
 # D21 (Phase 3a completion): ledger/immudb_ledger.py, loaded in-process below
 # via decision_service/main.py, now needs this to write through the verifier.
 VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
+VERIFIER_READ_KEY = os.getenv("VERIFIER_READ_KEY", "test-verifier-read-key")
+
+# The compose project the anchoring container attaches to. Every compose
+# invocation in this repository passes an explicit -p, and this is the same
+# name; a mismatch here surfaces as an unresolvable network rather than as a
+# silently wrong fixture.
+COMPOSE_PROJECT = os.getenv("AIL_COMPOSE_PROJECT", "p3b-bundle")
+ANCHOR_ONESHOT_IMAGE = "ail-anchor-oneshot"
 
 # This script loads the decision service in-process on the host, while the
 # stack it drives runs in compose. decision_service/main.py,
@@ -59,6 +85,12 @@ os.environ.setdefault("VERIFIER_URL", VERIFIER)
 os.environ.setdefault("CONTROL_PLANE_URL", CONTROL_PLANE)
 os.environ.setdefault("CONTROL_PLANE_WRITE_KEY", WRITE_KEY)
 os.environ.setdefault("VERIFIER_WRITE_KEY", VERIFIER_WRITE_KEY)
+# D22 (Phase 3b): ledger/immudb_ledger.py signs every record before writing
+# it, and refuses to write one it cannot sign. Loaded in-process here, so
+# the key path has to be a host path rather than the container's /keys.
+os.environ.setdefault(
+    "AIL_WRITER_SIGNING_KEY", str(REPO_ROOT / "keys" / "writer-decision.key")
+)
 
 sys.path.insert(0, str(REPO_ROOT / "decision_service"))
 sys.path.insert(0, str(REPO_ROOT / "ledger"))
@@ -143,6 +175,66 @@ def _erasure_tombstone_key(agent_id: str) -> str:
     return base64.b64encode(f"content_erasure:{call_id}".encode()).decode()
 
 
+def _write_trusted_root() -> None:
+    """Copy the TUF-fetched Sigstore TrustedRoot out of the one-shot image.
+
+    Fetched inside the container for the reason this script's own docstring
+    gives: sigstore-python's TUF client calls os.symlink, which Windows
+    refuses without elevated privileges. Written to the fixture directory so
+    tests/test_external_anchor.py can verify the committed inclusion proof
+    with no network at all.
+    """
+    out = OUT / "trusted_root.json"
+    result = subprocess.run(
+        [
+            "docker", "run", "--rm", ANCHOR_ONESHOT_IMAGE,
+            "python", "-c",
+            "import sys;"
+            "from sigstore._internal.tuf import TrustUpdater, DEFAULT_TUF_URL;"
+            "u = TrustUpdater(DEFAULT_TUF_URL, offline=False);"
+            "sys.stdout.write(open(u.get_trusted_root_path()).read())",
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    out.write_text(result.stdout, encoding="utf-8", newline="\n")
+    print(f"wrote {out.relative_to(REPO_ROOT)} ({out.stat().st_size} bytes)")
+
+
+def _anchor_now() -> None:
+    """Run one real anchoring cycle against the live public log.
+
+    This is the one step in this script that leaves the machine. It builds
+    anchor_service's image and runs it with --once on the compose project's
+    own network, so it reaches the verifier and control plane by their
+    service names exactly as the long-running service does in
+    docker-compose.yml. Non-zero exit is fatal here, unlike in the
+    unattended loop: fixtures that quietly came out unanchored would make
+    every anchored-bundle test vacuous.
+    """
+    print("anchoring: building the one-shot image")
+    subprocess.run(
+        ["docker", "build", "-q", "-t", ANCHOR_ONESHOT_IMAGE,
+         "-f", "anchor_service/Dockerfile", "."],
+        cwd=str(REPO_ROOT), check=True,
+    )
+    print(f"anchoring: submitting to a Rekor v2 instance "
+          f"(network {COMPOSE_PROJECT}_default)")
+    subprocess.run(
+        [
+            "docker", "run", "--rm",
+            "--network", f"{COMPOSE_PROJECT}_default",
+            "-v", f"{REPO_ROOT / 'keys'}:/keys:ro",
+            "-e", "VERIFIER_URL=http://verifier:8003",
+            "-e", "CONTROL_PLANE_URL=http://ail-control-plane:8002",
+            "-e", f"VERIFIER_READ_KEY={VERIFIER_READ_KEY}",
+            "-e", f"CONTROL_PLANE_WRITE_KEY={WRITE_KEY}",
+            "-e", "AIL_ANCHOR_SIGNING_KEY=/keys/anchor-signing.key",
+            ANCHOR_ONESHOT_IMAGE, "python", "main.py", "--once",
+        ],
+        check=True,
+    )
+
+
 def main():
     agent_id = f"p3a_fixture_{uuid.uuid4().hex[:8]}"
     decision_main = _load_decision_service_main()
@@ -158,6 +250,11 @@ def main():
     deny = _decide(decision_main, "provision_cloud_server", _DENIED_ARGS, agent_id)
     print(f"  policy_deny:  outcome={deny['outcome_type']} tx={deny.get('ledger_tx_id')}")
     wanted["policy_deny"] = deny["ledger_tx_id"]
+
+    # D23: everything above this line is covered by the anchored
+    # checkpoint; everything below it was written after and is not. The two
+    # committed states differ by transaction ordering and nothing else.
+    _anchor_now()
 
     # A fault, produced where the decision service would actually observe
     # one: OPA unreachable. Same mechanism tests/test_outcome_types.py uses.
@@ -201,13 +298,45 @@ def main():
         print(f"wrote {path.relative_to(REPO_ROOT)} "
               f"(tx={bundle['record']['tx_id']}, {path.stat().st_size} bytes)")
 
-    # The key these bundles were exported against, copied as its own file.
-    shutil.copyfile(REPO_ROOT / "keys" / "signing.pub", OUT / "signing.pub")
-    print(f"wrote {(OUT / 'signing.pub').relative_to(REPO_ROOT)}")
+    # Every public key these bundles are checked against, each copied as its
+    # own file. None of them is inside a bundle, and that separation is the
+    # subject of P3a-5 and P3b-3 rather than an accident of layout.
+    #   signing.pub               ImmuDB's state-signing key (D18)
+    #   writer-decision.pub       the decision service's writer key (D22)
+    #   writer-control-plane.pub  the control plane's writer key (D22)
+    #   anchor-signing.pub        the key the Rekor submission was made under (D23)
+    for name in (
+        "signing.pub",
+        "writer-decision.pub",
+        "writer-control-plane.pub",
+        "anchor-signing.pub",
+    ):
+        shutil.copyfile(REPO_ROOT / "keys" / name, OUT / name)
+        print(f"wrote {(OUT / name).relative_to(REPO_ROOT)}")
+
+    # Sigstore's TrustedRoot, fetched via TUF by the same one-shot container
+    # that made the submission, so the committed trust root and the
+    # committed entry come from one run rather than two. It plays exactly
+    # the role signing.pub plays: an independently obtained trust anchor the
+    # checker holds, never something the entry supplies about itself.
+    _write_trusted_root()
 
     fingerprints = {b["signing_key"]["fingerprint"] for b in exported.values()}
     print(f"all bundles name signing key: {fingerprints}")
     assert len(fingerprints) == 1, "bundles disagree about which key signed them"
+
+    anchored = {rt for rt, b in exported.items()
+                if b["external_anchor"]["state"] == "anchored"}
+    unanchored = set(exported) - anchored
+    print(f"anchored: {sorted(anchored)}  not anchored: {sorted(unanchored)}")
+    assert anchored, (
+        "no fixture came out anchored; the anchoring cycle did not cover any "
+        "of these records and every anchored-bundle test would be vacuous"
+    )
+    assert unanchored, (
+        "every fixture came out anchored; P3b-5 needs a real unanchored bundle "
+        "to compare against, not a hand-edited one"
+    )
 
     (OUT / "PROVENANCE.json").write_text(
         json.dumps(
@@ -217,6 +346,20 @@ def main():
                 "agent_id": agent_id,
                 "signing_key_fingerprint": sorted(fingerprints)[0],
                 "record_types": sorted(exported),
+                "writer_key_fingerprints": sorted({
+                    json.loads(base64.b64decode(b["record"]["value"]))["writer_key_fingerprint"]
+                    for b in exported.values()
+                }),
+                "anchored": sorted(anchored),
+                "not_anchored": sorted(unanchored),
+                "anchor": {
+                    rt: {
+                        "log_url": exported[rt]["external_anchor"]["log_url"],
+                        "log_index": exported[rt]["external_anchor"]["log_index"],
+                        "anchored_tx_id": exported[rt]["proof"]["source_state"]["tx_id"],
+                    }
+                    for rt in sorted(anchored)
+                },
             },
             indent=2,
         )

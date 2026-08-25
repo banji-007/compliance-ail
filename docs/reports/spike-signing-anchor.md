@@ -17,6 +17,119 @@ but a hash, a signature, and a public key, never the content anchored.
 
 ---
 
+---
+
+## Re-running the committed artifacts
+
+`spikes/signing-anchor/` holds the inputs both offline checkers need, so
+each script can be re-run from a checkout with no live SPIRE, no live
+Rekor, and no network. Three things a re-runner has to know first, all of
+them consequences of findings this report already records rather than
+caveats added on top of them.
+
+**`offline_check.py` stops verifying after 2026-08-25T19:28:11Z, by design.**
+The committed `leaf_cert.pem` is the real A2 signing leaf, and it carries
+this project's own default `default_x509_svid_ttl = 24h`:
+
+```
+$ openssl x509 -in spikes/signing-anchor/leaf_cert.pem -noout -dates -serial
+notBefore=Aug 24 19:28:01 2026 GMT
+notAfter=Aug 25 19:28:11 2026 GMT
+serial=3529E6114AE55A1A1F8C1E55B4069171
+```
+
+After `notAfter`, the checker refuses with the same named
+`cryptography.x509.verification` expired-certificate error A4 reproduced
+deliberately against a 70-second leaf:
+
+```
+FAILED chain validation failed: validation failed: cert is not valid at
+validation time ...
+```
+
+That refusal **is the Question A NO-GO finding**, reproducing itself on
+schedule against a committed artifact - the bounded window A4 measured, seen
+from the other end. It is not a regression in the script, and it is not a
+reason to regenerate the certificate: a leaf that had to be refreshed to keep
+old evidence checkable is exactly the property that disqualified SVID
+signing. Re-running it before that instant is a live pass; re-running it
+after is a live demonstration of the verdict. Both are the intended outcome,
+and which one you get depends only on the clock.
+
+```
+$ docker run --rm --network none -v <spikes/signing-anchor>:/app -w /app <image> \
+    python offline_check.py record_bytes.bin signature.bin leaf_cert.pem \
+    trust_bundle.pem spiffe://ail.internal/workload/test
+OK {'signer_spiffe_id': 'spiffe://ail.internal/workload/test',
+    'leaf_not_before': '2026-08-24T19:28:01+00:00',
+    'leaf_not_after': '2026-08-25T19:28:11+00:00', 'chain_length': 2, ...}
+```
+
+(re-run 2026-08-24T21:20Z from the committed artifacts, inside the window)
+
+**`offline_verify_rekor.py` needs a Sigstore trust root, and it is now
+committed.** B3 obtained it once via TUF and held it out of band, which is
+the correct role for it - the same role `signing.pub` plays for
+`tools/ail_verify_bundle.py`. The script reads it as its first argument and
+never fetches it, so leaving it uncommitted made the script unrunnable from a
+checkout. `spikes/signing-anchor/trusted_root.json` is that file, fetched
+with `sigstore-python`'s own TUF client rather than downloaded over plain
+HTTPS:
+
+```python
+from sigstore._internal.tuf import TrustUpdater, DEFAULT_TUF_URL
+u = TrustUpdater(DEFAULT_TUF_URL, offline=False)      # https://tuf-repo-cdn.sigstore.dev
+shutil.copy(u.get_trusted_root_path(), "trusted_root.json")
+```
+
+Committing it does not make the entry self-certifying, for the same reason
+committing `tests/fixtures/evidence_bundles/signing.pub` does not: it is a
+separate file, obtained independently of the entry it checks, and it can be
+re-fetched with the two lines above and diffed. A checker that took the trust
+root from the entry response would be a different and much weaker thing.
+
+**One committed artifact needed a byte-level repair.** `submit_response.json`
+had been copied back out of its container through a cp1252 round-trip, which
+collapsed the four UTF-8 em dashes (`\xe2\x80\x94`) that separate the C2SP
+checkpoint's signature lines into single `\x97` bytes - one for the log
+operator and one for each of B2's three witnesses. The file no longer decoded
+as UTF-8 at all, and would not have verified even if it had, since those
+bytes are inside the signed note. The four bytes were restored and the file
+re-verified end to end:
+
+```
+$ docker run --rm --network none -v <spikes/signing-anchor>:/app -w /app <image> \
+    python offline_verify_rekor.py trusted_root.json submit_response.json
+OK: Merkle inclusion proof and checkpoint signature both verified, offline
+log_index: 78995452
+tree_size (from inclusion proof, cross-checked against signed checkpoint): 78995488
+root_hash: f9df8c8f44f878d3275fe14c852c8811bbcb1b2ae2a1149b4ee5c6a14e829155
+```
+
+The repair needed no judgement call about whether it was right: the
+checkpoint signature covers those exact bytes, so a single wrong one would
+have failed the same `verify_checkpoint` that B3's negative control already
+showed refuses tampered input by name. It passing is the confirmation.
+
+One correction to B2's transcript while re-verifying this file: the entry
+recorded in `submit_response.json` is `logIndex 78995452` in a tree of size
+`78995488`, not the `78978396` / `78978442` pair quoted in B2's excerpt.
+B2 and B4 made five live submissions between them, and the excerpt was
+transcribed from a different one than the response that was kept. Nothing in
+the verdict turns on which entry was retained; the retained one is the one
+that verifies above.
+
+**A note on `trusted_root.json` and log discovery.** The TUF-distributed
+`trusted_root.json` names both public instances in its `tlogs[]`
+(`https://rekor.sigstore.dev`, and `https://log2025-1.rekor.sigstore.dev`
+with `validFor.start = 2025-09-23`), while the TUF-distributed
+`signing_config.json` fetched in the same call lists only the v1 instance
+under `rekorTlogUrls` (`majorApiVersion: 1`). So as of this re-run, an
+integration that discovers its write target strictly from `SigningConfig`
+finds no Rekor v2 instance advertised there yet. This does not change B1's
+finding that the URL must be discovered rather than hardcoded; it narrows
+where it is currently discoverable from.
+
 ## Question A: can a record be signed with the decision service's SPIFFE SVID private key such that a bundle stays verifiable offline after that SVID has rotated?
 
 ### A1. How the decision service obtains its SVID private key today

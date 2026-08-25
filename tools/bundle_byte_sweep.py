@@ -3,9 +3,14 @@
 bundle_byte_sweep.py - rerun the spike's tamper methodology against the
 evidence bundle format instead of the raw VerifiableEntry protobuf.
 
-    python tools/bundle_byte_sweep.py [BUNDLE.json] [--key signing.pub]
+    python tools/bundle_byte_sweep.py [BUNDLE.json] [--key signing.pub] \
+        [--writer-key writer-decision.pub ...] [--trusted-root trusted_root.json] \
+        [--anchor-key anchor-signing.pub]
 
-Defaults to the committed policy_allow fixture and its key.
+Defaults to the committed policy_allow fixture and every key committed
+beside it, so the sweep exercises the same full check an auditor runs -
+D22's writer signature and D23's transparency log entry included - rather
+than the Phase 3a subset of it.
 
 docs/reports/spike-offline-verify.md item 4 swept 794 bytes of ventry.pb and
 reported honestly that 251 of them had no detectable effect. A bundle is not
@@ -43,7 +48,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUNDLE = REPO_ROOT / "tests" / "fixtures" / "evidence_bundles" / "policy_allow.json"
-DEFAULT_KEY = REPO_ROOT / "tests" / "fixtures" / "evidence_bundles" / "signing.pub"
+_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "evidence_bundles"
+DEFAULT_KEY = _FIXTURES / "signing.pub"
+DEFAULT_WRITER_KEYS = [_FIXTURES / "writer-decision.pub", _FIXTURES / "writer-control-plane.pub"]
+DEFAULT_ANCHOR_KEYS = [_FIXTURES / "anchor-signing.pub"]
+DEFAULT_TRUSTED_ROOT = _FIXTURES / "trusted_root.json"
 
 
 def _load_checker():
@@ -59,6 +68,21 @@ checker = _load_checker()   # importing it blocks the network for this process
 
 NO_EFFECT = "no_effect"
 NOT_JSON = "not_json"
+
+
+class _Keys:
+    """Everything a full check needs, so this sweeps the real check
+    rather than a reduced one. Passed as one object because Phase 3b's
+    checker takes four kinds of trust input, and threading them through
+    every call site separately would invite one being quietly dropped
+    from a pass - which would report bytes as inert that are not.
+    """
+
+    def __init__(self, verifying_key, writer_keys, anchor_keys, trusted_root):
+        self.verifying_key = verifying_key
+        self.writer_keys = writer_keys
+        self.anchor_keys = anchor_keys
+        self.trusted_root = trusted_root
 
 
 def try_bundle_bytes(raw: bytes, verifying_key) -> tuple[str, str]:
@@ -83,7 +107,13 @@ def try_bundle(bundle, verifying_key) -> tuple[str, str]:
     if not isinstance(proof, dict) or proof.get("format") != checker.PROOF_MATERIAL_FORMAT:
         return checker.MALFORMED_BUNDLE, "unsupported or missing proof.format"
     try:
-        result = checker.verify_bundle(bundle, verifying_key)
+        result = checker.verify_bundle(
+            bundle,
+            verifying_key.verifying_key,
+            verifying_key.writer_keys,
+            trusted_root_path=verifying_key.trusted_root,
+            anchor_keys=verifying_key.anchor_keys,
+        )
     except checker.BundleCheckFailed as exc:
         return exc.result_class, exc.detail
     except checker.NetworkAccessAttempted:
@@ -143,6 +173,26 @@ def _region_of(raw: bytes, offset: int) -> str:
         ("proof.entry_tx_id", '"entry_tx_id"'),
         ("proof.signing_key_fingerprint", '"signing_key_fingerprint"'),
         ("signing_key.fingerprint", '"fingerprint"'),
+        # D22/D23 (Phase 3b). The writer signature lives inside record.value,
+        # so its bytes fall under that span already; these are the envelope
+        # fields the external_anchor section adds.
+        ("external_anchor.state", '"state"'),
+        ("external_anchor.detail", '"detail"'),
+        ("external_anchor.log_url", '"log_url"'),
+        ("external_anchor.log_url_source", '"log_url_source"'),
+        ("external_anchor.log_index", '"log_index"'),
+        ("external_anchor.anchor_key_fingerprint", '"anchor_key_fingerprint"'),
+        ("external_anchor.anchor_payload_format", '"anchor_payload_format"'),
+        ("external_anchor.entry.canonicalizedBody", '"canonicalizedBody"'),
+        ("external_anchor.entry.rootHash", '"rootHash"'),
+        ("external_anchor.entry.treeSize", '"treeSize"'),
+        ("external_anchor.entry.hashes", '"hashes"'),
+        ("external_anchor.entry.checkpoint", '"checkpoint"'),
+        ("external_anchor.entry.logId", '"logId"'),
+        ("external_anchor.entry.kindVersion", '"kindVersion"'),
+        ("external_anchor.entry.integratedTime", '"integratedTime"'),
+        ("external_anchor.entry.inclusionPromise", '"inclusionPromise"'),
+        ("external_anchor.transparency_log_entry", '"transparency_log_entry"'),
     ]
     spans = []
     for name, needle in regions:
@@ -293,7 +343,114 @@ def targeted(bundle: dict, verifying_key):
          lambda b: b["proof"].update(sdk="immudb-py==9.9.9"))
     case("signing_key.fingerprint, byte flipped",
          lambda b: b["signing_key"].update(fingerprint="sha256:" + "00" * 32))
+
+    # --- D22 (Phase 3b). The writer signature is a field INSIDE
+    # record.value, so it is part of the leaf the inclusion proof covers.
+    # Each case below rewrites the protobuf as well as the readable copy,
+    # so the D19 binding between them does not fire first - and the result
+    # is still consistency_failure, from immudb-py's own store.VerifyInclusion.
+    #
+    # That is the finding, not a limitation of the sweep: a writer signature
+    # cannot be edited inside a bundle at all, because editing it edits the
+    # record, and the record is what the ledger committed to. The D22 check
+    # is what catches a bad signature that was committed to the ledger in
+    # the first place, which is a thing no bundle-level tamper can produce -
+    # it needs a writer that signed the wrong bytes. That case is exercised
+    # live, against a real ledger, in
+    # tests/test_anchored_export.py::test_a_record_signed_over_different_
+    # bytes_is_refused_end_to_end.
+    case("record writer_signature, byte 0 flipped", _tamper_writer_signature)
+    case("record writer_key_fingerprint, repointed", _tamper_writer_fingerprint)
+    case("record outcome_type, relabelled inside the signed bytes",
+         lambda b: _tamper_record_field(b, "outcome_type", "policy_deny"))
+    case("record writer_signature, removed entirely", _remove_writer_signature)
+
+    # --- D23 (Phase 3b), the anchor section.
+    if bundle.get("external_anchor", {}).get("state") == "anchored":
+        case("external_anchor.state, downgraded to not_anchored",
+             lambda b: b["external_anchor"].update(state="not_anchored", detail="claims nothing"))
+        case("external_anchor.log_url, rewritten",
+             lambda b: b["external_anchor"].update(log_url="https://example.invalid"))
+        case("external_anchor.log_index, incremented",
+             lambda b: b["external_anchor"].update(
+                 log_index=str(int(b["external_anchor"]["log_index"]) + 1)))
+        case("external_anchor.anchor_key_fingerprint, repointed",
+             lambda b: b["external_anchor"].update(anchor_key_fingerprint="sha256:" + "00" * 32))
+        case("entry.inclusionProof.rootHash, byte 0 flipped", _tamper_root_hash)
+        case("entry.inclusionProof.hashes[0], byte 0 flipped", _tamper_first_audit_hash)
+        case("entry.checkpoint.envelope, one label changed", _tamper_checkpoint)
+        case("entry.canonicalizedBody, byte 0 flipped",
+             lambda b: b["external_anchor"]["transparency_log_entry"].update(
+                 canonicalizedBody=_flip_b64_first_byte(
+                     b["external_anchor"]["transparency_log_entry"]["canonicalizedBody"])))
+    else:
+        case("external_anchor, removed entirely", lambda b: b.pop("external_anchor"))
+        case("external_anchor.state, upgraded to anchored",
+             lambda b: b["external_anchor"].update(state="anchored"))
+        case("external_anchor.detail, rewritten",
+             lambda b: b["external_anchor"].update(detail="anything at all"))
     return cases
+
+
+def _proven_record(bundle):
+    return json.loads(base64.b64decode(bundle["record"]["value"]).decode())
+
+
+def _rewrite_record(bundle, record):
+    """Put an edited record back into BOTH the protobuf and the readable copy.
+
+    Without this the D19 binding between them fires first, and the sweep
+    would report record_mismatch for every writer-signature case and never
+    reach the check it is supposed to be measuring.
+    """
+    from immudb.grpc import schema_pb2
+
+    raw = json.dumps(record, separators=(",", ":")).encode()
+    ventry = schema_pb2.VerifiableEntry()
+    ventry.ParseFromString(base64.b64decode(bundle["proof"]["verifiable_entry"]))
+    ventry.entry.value = raw
+    bundle["proof"]["verifiable_entry"] = base64.b64encode(ventry.SerializeToString()).decode()
+    bundle["record"]["value"] = base64.b64encode(raw).decode()
+
+
+def _tamper_writer_signature(bundle):
+    record = _proven_record(bundle)
+    record["writer_signature"] = _flip_b64_first_byte(record["writer_signature"])
+    _rewrite_record(bundle, record)
+
+
+def _tamper_writer_fingerprint(bundle):
+    record = _proven_record(bundle)
+    record["writer_key_fingerprint"] = "sha256:" + "00" * 32
+    _rewrite_record(bundle, record)
+
+
+def _remove_writer_signature(bundle):
+    record = _proven_record(bundle)
+    record.pop("writer_signature", None)
+    _rewrite_record(bundle, record)
+
+
+def _tamper_record_field(bundle, field, value):
+    record = _proven_record(bundle)
+    record[field] = value
+    _rewrite_record(bundle, record)
+
+
+def _tamper_root_hash(bundle):
+    proof = bundle["external_anchor"]["transparency_log_entry"]["inclusionProof"]
+    proof["rootHash"] = _flip_b64_first_byte(proof["rootHash"])
+
+
+def _tamper_first_audit_hash(bundle):
+    proof = bundle["external_anchor"]["transparency_log_entry"]["inclusionProof"]
+    proof["hashes"][0] = _flip_b64_first_byte(proof["hashes"][0])
+
+
+def _tamper_checkpoint(bundle):
+    checkpoint = (bundle["external_anchor"]["transparency_log_entry"]
+                  ["inclusionProof"]["checkpoint"])
+    checkpoint["envelope"] = checkpoint["envelope"].replace("log2025", "log2026", 1)
 
 
 def _tamper_entry_value(bundle):
@@ -312,11 +469,23 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     parser.add_argument("bundle", nargs="?", default=str(DEFAULT_BUNDLE))
     parser.add_argument("--key", default=str(DEFAULT_KEY))
+    parser.add_argument("--writer-key", action="append", default=None)
+    parser.add_argument("--anchor-key", action="append", default=None)
+    parser.add_argument("--trusted-root", default=str(DEFAULT_TRUSTED_ROOT))
     args = parser.parse_args(argv)
 
     raw = Path(args.bundle).read_bytes()
     bundle = json.loads(raw.decode("utf-8"))
-    verifying_key = checker.load_key(args.key)
+    verifying_key = _Keys(
+        checker.load_key(args.key),
+        checker.load_writer_keys(
+            args.writer_key or [str(k) for k in DEFAULT_WRITER_KEYS]
+        ),
+        checker.load_writer_keys(
+            args.anchor_key or [str(k) for k in DEFAULT_ANCHOR_KEYS]
+        ),
+        args.trusted_root,
+    )
 
     baseline_category, baseline_detail = try_bundle(copy.deepcopy(bundle), verifying_key)
     print(f"Baseline (untampered): {baseline_category} - {baseline_detail}")

@@ -1,0 +1,9 @@
+# Rekor v2 submission and Sigstore's own TUF client. sigstore pulls a
+# recent cryptography; nothing else in this image needs one, and this
+# service shares a process with nothing.
+sigstore==4.5.0
+httpx==0.28.1
+# ecdsa: the anchoring key's signing side. Same library this project's
+# ImmuDB state signatures already go through, so the anchoring signature and
+# the ledger's own use one implementation rather than two.
+ecdsa==0.19.2
