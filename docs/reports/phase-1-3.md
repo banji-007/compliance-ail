@@ -312,3 +312,58 @@ Methodology: every substantive claim in `readME.md`, `docs/adr/0005-outcome-taxo
 | Dashboard, `AuditEntry.profile` / `AuditEntry.payload_state` types | New closed-set values | `dashboard/lib/types.ts` (TypeScript compiles under the dashboard's own `npm run build`, confirmed during the `--no-cache` image build, §1) |
 
 ---
+
+---
+
+## Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over section 8's P13-7 mapping table. The
+table carries 28 rows. **Five fail class (b)**, the support check. None fails
+class (a).
+
+- **Row 9**, Location "§3.4, \"the hash, not the payload\" / content store /
+  erasure", Claim "Erasure semantics strengthened this phase". Selected term:
+  `semantic`.
+- **Row 14**, Location "§4.1-4.4", Claim "Environment setup, boot sequence,
+  three worked demo requests". Selected term: `sequence`.
+- **Row 15**, Location "§4.5, cost-center denial worked example", Claim "Exact
+  deny message text". Selected term: `message`.
+- **Row 16**, Location "§4.6, service endpoint table", Claim "Port numbers".
+  Selected term: `number`.
+- **Row 18**, Location "§5, prompt injection scoping ...", Claim "Untouched,
+  per the instruction". Selected term: `instruction`.
+
+**All five are citation defects, not false claims.** Each cited section was
+read directly this pass and carries what its row claims: §3.4 discusses
+erasure (in the word "erasable"), §4.5 carries the exact
+`DENIED: Production environments must include a valid 'cost_center' tag.
+Approved values: executive, finance.` string the row is about, §4.6 carries
+the service endpoint table with its port numbers, §4.1-4.4 carry the setup and
+demo requests, §5 carries the prompt-injection scoping. What fails in every
+case is the Claim column, which names the *kind* of row rather than the claim,
+so the term rule is left with `semantic`, `sequence`, `message`, `number` and
+`instruction`, none of which the README has any reason to use. Class (a)
+passes all five: `policy/packs/finops/finops.rego`,
+`tests/test_deny_message_formatting.py` and the rest all resolve.
+
+One row was examined closely and does **not** fail, for a reason worth
+recording because it nearly did. **Row 5**, Claim "Static-secret theft vs.
+in-workload code execution, distinguished", backs itself on "Residual Limits
+§5 bullet 1 and bullet 2". That subsection was rewritten in Phase 2 and no
+longer contains the term `theft`, so the citation the row gives has drifted
+out from under it. The row survives only because its Location column cites
+§3.1, which still carries the distinction ("exfiltrating a *static API key*
+buys an attacker nothing on this data plane"). A row with a single citation in
+that position would have failed, and the drift would have been real rather
+than cosmetic.
+
+Coverage: 23 of this table's 28 rows cite a document section and 15 of those
+yield no load-bearing term, so class (b) is decisive on 8 rows. Four rows name
+nothing mechanically checkable.
+
+The rows are not corrected here. They are entered in
+`docs/reports/mapping-check-baseline.json` and asserted by
+`tests/test_mapping_tables.py`.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.

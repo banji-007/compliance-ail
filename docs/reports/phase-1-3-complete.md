@@ -426,3 +426,40 @@ CI run id: **32271095759**, conclusion: **success**.
 - ~~`docs/adr/0002-fastapi-immudb-proxy.md`'s Decision and Consequences sections describe `/audit`'s response shape as a single `verified: true|false` boolean~~ - **resolved in `p13-merge`, item 1**: rewritten to describe the current five-state `verification` object, `payload_state`, `profile`, and `record_type`. See `docs/reports/p13-merge.md`.
 - Whether every historical commit between the incidents `cleanup-p13-b`'s dangling-reference test cites and now was itself clean - that test only guards the current and future state (inherited limitation, restated from `docs/reports/cleanup-p13-b.md` section 6, not re-investigated this run).
 - A second physical machine or a genuine WSL2 user distribution for V2's off-host reachability - same gap the red-team itself disclosed as untestable in this environment (`docs/reports/phase-1-3-redteam.md`, section 5); not re-attempted since R1's fix (removing the publish) makes the vantage point moot for the deployment compose specifically.
+
+---
+
+## Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over section 9's R8 mapping table. The table
+carries 38 rows. **One fails class (b)**, the support check. None fails class
+(a).
+
+- **Row 15**, Location "README §4.6, service endpoint table", Claim
+  "**Corrected this pass (R1)** - Control Plane API and OPA rows removed (no
+  longer published); replacement commands given and verified live". Class (b).
+  Section 4.6 of `readME.md` carries none of the claim's load-bearing terms;
+  the rule selects `given` and `replacement`.
+
+**Citation defect, not a false claim.** Section 4.6 was read directly. Its
+endpoint table lists only the CISO Control Plane, Grafana and Prometheus, so
+the Control Plane API and OPA rows are indeed gone, and the section does give
+replacement commands (`docker compose exec ail-control-plane python -c ...`
+for OPA, and a sibling command for the control plane, from a container on
+`backend`). Everything the row claims is true of the section it cites. The row
+fails because its Claim column describes the edit that was made rather than
+the state that resulted, and `replacement` and `given` are the report's own
+words for that edit.
+
+Coverage: 25 of this table's 38 rows cite a document section and 17 of those
+yield no load-bearing term, so class (b) is decisive on 8 rows. Twelve rows
+name nothing mechanically checkable, the highest count of any table in
+`docs/reports/`, which is consistent with this table's own stated methodology
+of mapping some claims to "Reproducible commands, unchanged" as prose.
+
+The row is not corrected here. It is entered in
+`docs/reports/mapping-check-baseline.json` and asserted by
+`tests/test_mapping_tables.py`.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.

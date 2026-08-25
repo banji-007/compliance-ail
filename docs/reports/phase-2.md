@@ -283,3 +283,61 @@ suite that *is* permanently skipped there, `test_vault_tool_bypass.py`
 row as its citation - the `decision_service/mcp_tools/vault_server.py` row
 cites `test_credential_boundary_static.py` only, which is not stack-gated.
 No other row claims enforcement that is absent or skipped in CI.
+
+---
+
+## 8. Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over section 3's Mapping table. The table
+carries 17 rows. **One fails class (b)**, the support check. None fails class
+(a), including the `envoy/envoy.yaml` row that section 7's erratum corrected:
+`tests/test_envoy_config_boundary.py` resolves to collected functions.
+
+- **Row 7**, Location "README §6, ADR-0007 summary", Claim "Backfilled (was
+  missing pre-Phase-2, noted during exploration)". Class (b). Selected term:
+  `during`.
+
+**Citation defect, not a false claim.** README §6 was read directly and does
+carry an ADR-0007 summary paragraph. The row fails because its Claim column
+describes the edit rather than the state, leaving the term rule with `during`.
+
+**A second defect in this table was found by hand and is NOT caught by the
+committed check.** Row 15, the `envoy/envoy.yaml` row, still backs its claim
+on "Live transcript §2 above (504 before the fix, 200 after)". Section 2 of
+this report contains no such transcript: it was read directly this pass, and
+`45s`, `cluster` and `504` appear in this file only inside that mapping row
+and inside section 7's erratum quoting it. The row therefore carries the same
+species of defect Phase 3b's row 38 carried, on a substantive claim rather
+than a meta-claim.
+
+Two independent reasons the check misses it, both stated in
+`docs/adr/0013-mapping-table-self-check.md` under Consequences. First,
+"§2 above" names no document, and an unqualified section marker is
+deliberately not treated as a citation: it usually points inside the report
+making it, which no external artefact can confirm. Second, when the identical
+claim is re-cited with a document name, in
+`docs/reports/phase-2-completion-b.md` section 3 row 1, the check still misses
+it, because the term rule measures rarity inside the cited document and the
+cited document is a report that contains the mapping row itself. `cluster`
+appears in three of `docs/reports/phase-2.md`'s sections, all of them talking
+about this row, so it reads as common vocabulary rather than as a load-bearing
+term.
+
+**It is a citation defect rather than a false claim**, so it is filed as an
+erratum rather than escalated: the claim is true and independently derivable
+without the cited transcript. `envoy/envoy.yaml:43` carries `timeout: 45s`
+under a comment explaining the mediated tool's slower round trip, and
+`tests/test_envoy_config_boundary.py::test_every_network_cluster_targets_only_the_decision_service`
+is collected and asserts the retargeting. What does not exist is the transcript
+the row names as its live evidence.
+
+Coverage: 8 of this table's 17 rows cite a document section and 5 of those
+yield no load-bearing term, so class (b) is decisive on 3 rows. One row names
+nothing mechanically checkable.
+
+Row 7 is entered in `docs/reports/mapping-check-baseline.json`. Row 15 is not,
+because the check does not report it; it is recorded here and in
+`docs/reports/phase-3c1.md` as a known gap for the next pass.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.

@@ -87,3 +87,24 @@ Same format as `docs/reports/phase-2.md` §3 / `docs/reports/phase-1-3-complete.
 ## 6. CI run id
 
 PR #8, `integration-tests` job: **pass, 2m40s** - https://github.com/banji-007/compliance-ail/actions/runs/32473837505/job/96746008139
+
+---
+
+## 6. Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over section 3's Mapping table. The table
+carries 9 rows. **No row fails either check.** Recorded rather than omitted,
+because "checked and clean" and "never checked" are the two states this phase
+exists to keep apart.
+
+Coverage, so the clean result is not read as more than it is: 2 rows cite a
+document section and both yield no load-bearing term under the term rule, so
+**class (b) is decisive on no row in this table**. Two rows name nothing
+mechanically checkable, which matches this table's own section 3 note that the
+`audit-table.tsx` row rests on manual review with no automated UI test in this
+codebase's suite. The checker reports that row as unchecked rather than
+passing it. The clean result here is therefore a class (a) result: every cited
+test resolves to a collected function and every cited path resolves to a file.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.

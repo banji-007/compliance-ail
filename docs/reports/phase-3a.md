@@ -816,3 +816,49 @@ outliving the key of the system that is running today is the ordinary case
 for an auditor, not an edge case.
 
 The PR is left open for human review and was not merged.
+
+---
+
+## Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over section 7's Mapping table. The table
+carries 30 rows. **Three fail class (b)**, the support check. None fails class
+(a): every cited test resolves to a collected function and every cited path
+resolves to a file.
+
+- **Row 3**, Location "README §3.4.1, \"behind the same read credential
+  `GET /audit` already requires\"", Claim "Authorization is not new or
+  looser". Class (b). Section 3.4.1 carries none of the claim's load-bearing
+  terms; the only one the rule selects is `authorization`.
+- **Row 8**, Location "README §3.4.1, \"replaces `socket.socket.connect` ...
+  property of the process\"", Claim "The block is structural, not
+  incidental". Class (b). Selected term: `structural`.
+- **Row 9**, Location "README §3.4.1, \"No cryptography is implemented in the
+  checker\"", Claim "D20 compliance". Class (b). Selected term: `compliance`.
+
+**All three are citation defects, not false claims**, and the distinction
+decides the triage. Each row's Location column quotes the claim's actual
+wording out of section 3.4.1, so the claim is demonstrably in the section
+cited: "behind the same read credential `GET /audit` already requires",
+"replaces `socket.socket.connect`", "No cryptography is implemented in the
+checker" are all present. What fails is the Claim column, which says what
+*kind* of row this is rather than what the system does, so the term rule has
+only `authorization`, `structural` and `compliance` to work with and the
+README has no reason to use any of them. Every row's Backed by column also
+resolves: the four named tests are collected and pass class (a).
+
+`docs/adr/0013-mapping-table-self-check.md` records this limitation under
+Consequences rather than working around it. It is a property of the
+`Location | Claim | Maps to` table shape, which puts the claim's real text in
+the Location column and a label in the Claim column.
+
+Coverage: 17 of this table's 30 rows cite a document section and 10 of those
+yield no load-bearing term, so class (b) is decisive on 7 rows. Two rows name
+nothing mechanically checkable.
+
+The rows are not corrected here. They are entered in
+`docs/reports/mapping-check-baseline.json` and asserted by
+`tests/test_mapping_tables.py`.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.
