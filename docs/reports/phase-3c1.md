@@ -661,8 +661,17 @@ the set.**
 
 ## 8. CI run id
 
-PR #11, `integration-tests` job: **pass, 2m58s, 297 passed, 9 skipped** -
-https://github.com/banji-007/compliance-ail/actions/runs/32886943698
+PR #11, `integration-tests` job: **pass, 2m54s, 297 passed, 9 skipped** -
+https://github.com/banji-007/compliance-ail/actions/runs/32887830855
+
+That run covers every part of this phase except the paragraph naming it: all
+of `tools/mapping_check.py`, `tests/test_mapping_tables.py`, the baseline, the
+ADR, the seven errata and this report's body. A run id can only ever name the
+run before the commit that records it, so the run over this final commit is
+the one shown in the PR's own checks rather than here. The preceding run on
+the same content was also green:
+https://github.com/banji-007/compliance-ail/actions/runs/32886943698 (2m58s,
+297 passed, 9 skipped).
 
 All 11 of this phase's tests pass in CI, listed by name in the run log.
 
