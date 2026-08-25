@@ -733,3 +733,51 @@ asserts otherwise, but it is a scaling property nothing currently measures.
 
 ## CI
 
+**No CI run id. This pass could not obtain one, and did not.**
+
+`.github/workflows/ci.yml` triggers on `push` to `main` and on
+`pull_request`, so a run id requires pushing this pass's commits to
+`origin/phase-3b-provenance` (PR #10). That push was attempted and refused by
+this session's own permission layer:
+
+```
+$ git push gh HEAD:phase-3b-provenance
+Permission for this action was denied by the Claude Code auto mode classifier.
+```
+
+Retried once, refused identically, so it is a standing denial rather than a
+transient one. No workaround was attempted, and no run id is quoted here,
+invented, or inferred from a previous run's.
+
+**Where the work is instead.** The two commits (the cherry-picked red-team
+report, and this pass) are on branch `p3b-verify-and-fix` in the repository at
+`c:\Users\banji\OneDrive\Documents\compliance-ail`, pushed there as a ref only.
+That repository's working tree was not checked out to the branch, not built,
+and not otherwise touched. Pushing that branch to GitHub is what remains, and
+it is an operator action rather than one this pass can take.
+
+**What CI would be expected to show**, stated so the gap is bounded rather than
+open-ended. This pass changes three files, all documentation: `readME.md`
+(§5 gains one bullet), `docs/reports/phase-3b.md` (one mapping row added, one
+row's Kind column corrected), and `docs/reports/phase-3b-verify.md` (new). No
+source, no test, and no compose file is touched, so the only test that reads
+any of them is `test_readme_command_block_is_exactly_reproducible`, which
+extracts and runs §3.4.1's command block. §3.4.1 is untouched by this pass.
+That test is among the fourteen that fail locally for the missing-`sigstore`
+reason above, and it is one of the reasons this report does not treat the local
+run as a substitute for CI: the assertion this pass would most want CI to make
+is exactly one of the ones the host cannot make.
+
+---
+
+# What this pass changed
+
+| File | Change |
+| :--- | :--- |
+| `readME.md` | §5 Residual Limits gains the `external_anchor.state` downgrade bullet (B1) |
+| `docs/reports/phase-3b.md` | Claim mapping gains the `/anchors` credential-split row (B2); row 2's Kind corrected from `test + command` to `command, marked: no test covers this` (B3) |
+| `docs/reports/phase-3b-verify.md` | This report |
+| `docs/reports/phase-3b-redteam.md` | Cherry-picked from `claude/phase-3b-redteam-brief-dhf1ux` (`66f284e`), unmodified |
+
+No source file, test, policy, or compose file was changed. Part A found nothing
+to fix.
