@@ -233,8 +233,8 @@ _CLASS_NAME_RE = re.compile(r"\bTest[A-Za-z0-9_]{3,}")
 # being checked, which no external artefact can confirm. The gap between the
 # document name and the marker may not cross a semicolon or the words above /
 # below, because those separate two independent references: phase-2.md row 1
-# reads "docs/adr/0008-....md; section 2 below", where the section belongs to
-# the report, not to the ADR.
+# names the ADR for the decision-service boundary and then says "section 2
+# below", where the section belongs to the report, not to the ADR.
 _DOC_SECTION_RE = re.compile(
     r"(?P<doc>[A-Za-z0-9_./-]+\.md|README)"
     r"(?P<gap>(?:(?!\babove\b|\bbelow\b)[^|;§]){0,30}?)§\s*(?P<num>\d+(?:\.\d+)*)"

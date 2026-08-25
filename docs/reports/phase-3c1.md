@@ -116,7 +116,31 @@ which asserts the collection rule itself rather than only its output.
 **Named mutation:** change one row's Kind to name a test that does not exist.
 Applied to this report's own mapping table, row 1.
 
-PLACEHOLDER_MUTATION_1
+Row 1's Backed by column was repointed from
+`test_every_mapping_table_in_docs_reports_is_discovered` to
+`test_mapping_tables_are_found_by_shape`, a name nothing defines, leaving its
+Kind reading `test`.
+
+```
+$ python -m pytest "tests/test_mapping_tables.py::test_every_mapping_row_kind_matches_the_shape_of_its_backing" -q
+E       AssertionError: 1 mapping row(s) declare a backing that does not exist
+        in the shape declared, and are not in the committed baseline:
+E           docs/reports/phase-3c1.md row 1 [class a]: cited test
+            test_mapping_tables_are_found_by_shape is not collected under
+            tests/ in tests/test_mapping_tables.py :: Mapping tables are
+            discovered by structure, never from a list of file...
+FAILED tests/test_mapping_tables.py::test_every_mapping_row_kind_matches_the_shape_of_its_backing
+1 failed in 11.45s
+```
+
+**Caught.** The failure names the row, the class, the missing test and the
+file the row said it lives in. Reverted, and the suite is clean again:
+
+```
+$ python -m pytest tests/test_mapping_tables.py -q
+...........                                                              [100%]
+11 passed in 12.90s
+```
 
 ---
 
@@ -256,7 +280,35 @@ catchable), and that a term the README uses pervasively is never selected.
 **Named mutation:** revert row 38's fix, meaning remove the disclosure from
 `readME.md` while leaving the row.
 
-PLACEHOLDER_MUTATION_2
+The disclosure bullet was deleted from `readME.md`'s Residual Limits
+subsection (one line, 1690 characters, at line 524), leaving Phase 3b's row 39
+in place and unchanged. That restores exactly the state the row was in before
+its fix.
+
+```
+$ python -m pytest "tests/test_mapping_tables.py::test_every_cited_section_contains_a_distinctive_term_from_the_claim" -q
+E       AssertionError: 1 mapping row(s) cite a document section that carries
+        none of the claim's distinctive terms, and are not in the committed
+        baseline:
+E           docs/reports/phase-3b.md row 39 [class b]: readME.md section 5 /
+            Residual Limits (Mixed Profile, Since Phase 2) contains none of
+            the claim's distinctive terms (external_anchor, not_anchor) ::
+            external_anchor.state can be downgraded to not_anchored
+            undetectably
+FAILED tests/test_mapping_tables.py::test_every_cited_section_contains_a_distinctive_term_from_the_claim
+1 failed in 10.74s
+```
+
+**Caught**, and it is the same row, the same subsection and the same two terms
+the pre-fix tree at `ab2a678` produces. The mutation causes exactly one new
+failure, with no collateral on any other row. Reverted, and the suite is clean
+again:
+
+```
+$ python -m pytest tests/test_mapping_tables.py -q
+...........                                                              [100%]
+11 passed in 23.25s
+```
 
 ---
 
@@ -366,7 +418,45 @@ commit, with the phase report saying which entry left and why.
 
 **Named mutation:** add a new failing row to a historical table.
 
-PLACEHOLDER_MUTATION_3
+One row was appended to `docs/reports/phase-2.md` section 3's table,
+after its D12-D15 row, citing a test file that does not exist:
+
+```
+| `decision_service/main.py` | Retry budget is bounded | `tests/test_decision_service_retry_budget.py::test_retry_budget_is_bounded` |
+```
+
+```
+$ python -m pytest "tests/test_mapping_tables.py::test_no_mapping_failure_outside_the_committed_baseline" -q
+E       AssertionError: 1 new mapping failure(s), on top of 13 known and baselined:
+E           docs/reports/phase-2.md row 10 [class a]: cited path
+            tests/test_decision_service_retry_budget.py does not resolve to a
+            file in this tree :: Retry budget is bounded
+FAILED tests/test_mapping_tables.py::test_no_mapping_failure_outside_the_committed_baseline
+1 failed in 12.37s
+```
+
+**Caught, and distinguished from the baselined ones by name**: the assertion
+reads "1 new mapping failure(s), on top of 13 known and baselined", and lists
+only the new one. Running the whole file under the mutation fails two tests,
+the class (a) check and the baseline gate, both correctly, while
+`test_the_baseline_holds_no_entry_that_no_longer_fails` still passes, so the
+insertion is attributed cleanly and did not shift a baselined row's number out
+from under its entry:
+
+```
+$ python -m pytest tests/test_mapping_tables.py -q
+FAILED tests/test_mapping_tables.py::test_every_mapping_row_kind_matches_the_shape_of_its_backing
+FAILED tests/test_mapping_tables.py::test_no_mapping_failure_outside_the_committed_baseline
+2 failed, 9 passed in 15.29s
+```
+
+Reverted, and the suite is clean again:
+
+```
+$ python -m pytest tests/test_mapping_tables.py -q
+...........                                                              [100%]
+11 passed in 13.88s
+```
 
 ---
 
@@ -437,13 +527,135 @@ fixes its own table rather than baselining it.
 - [ ] **Any assertion weakened.**
 - [ ] **Any item met by live evidence alone with no test enforcing it.**
 
-PLACEHOLDER_NEGATIVES
+**Each confirmed individually, derived per row rather than asserted over
+the set.**
+
+- [x] **Any mapping row in the current phase failing either check: false.**
+  `docs/reports/phase-3c1.md` contributes 14 rows, 0 class (a) failures, 0
+  class (b) failures, 0 shape-unchecked and 0 support-unchecked. Every one of
+  its 14 rows names something the checker resolves. Asserted by
+  `test_the_current_phase_table_is_clean_rather_than_baselined`, which fails
+  if any failure or any baseline entry carries this report's path.
+
+- [x] **Any historical failing row edited in place rather than recorded as a
+  dated erratum: false.** `git diff c034ce0..HEAD -- docs/reports/` touches
+  seven historical reports and every hunk is an append below a
+  `## Erratum, 2026-08-25` heading. No line inside any mapping table was
+  changed, added or removed; the row counts per table are identical to those
+  at `c034ce0` (28, 38, 17, 9, 2, 30, 39).
+
+- [x] **Any historical false claim filed as an erratum rather than escalated:
+  false.** All thirteen were triaged individually. For each of the ten class
+  (b) failures the cited section was read directly and carries the substance
+  of the claim in different words; for each of the three class (a) failures
+  the declared backing exists and is named elsewhere in the same report. The
+  sharpest candidate, `phase-2-completion-b.md` row 1, was checked hardest and
+  is still a citation defect: its claim is independently derivable from
+  `envoy/envoy.yaml:43` and a collected test, so only the cited transcript is
+  missing, not the fact. Nothing met the Blocking bar and nothing was
+  escalated.
+
+- [x] **Any hand-maintained term list that nothing derives: false.** There is
+  no term list in `tools/mapping_check.py`. Terms come from the row's own
+  Claim cell; the two frequency bounds are measured against the cited document
+  and against every Claim cell in every mapping table. What is written down is
+  a fixed English suffix list for stemming (`ing`, `ed`, `es`, `s`, `ly` and
+  relatives), which is a stemming rule rather than a list of load-bearing
+  terms, and the Kind vocabulary (`test`, `command`, `Residual Limits`,
+  `document`), which is constrained rather than open: a Kind atom the checker
+  does not recognise is now a class (a) failure, so the vocabulary cannot be
+  extended silently by a row.
+  `test_the_term_rule_selects_terms_rather_than_reading_a_list` asserts the
+  rule directly.
+
+- [x] **Any baseline entry added without the report naming it: false.** The
+  baseline holds 13 entries. The three class (a) rows are named in section 1
+  and the ten class (b) rows in section 2, each with its report, row number,
+  class and selected terms; all thirteen appear again in their own report's
+  erratum. `test_every_baseline_entry_names_a_real_row` additionally asserts
+  every entry resolves to a row that exists.
+
+- [x] **Any assertion weakened: false.** Nothing existing was touched. All 11
+  tests in `tests/test_mapping_tables.py` are new; no test file other than
+  this one was modified; `git diff c034ce0..HEAD --stat` shows no change under
+  `tests/` except the new file, and none under `interceptor/`,
+  `decision_service/`, `control_plane/`, `verifier/`, `ledger/`, `policy/`,
+  `anchor_service/`, `provenance/` or any compose file. `readME.md` is
+  unchanged (it was mutated and reverted; `git diff` on it is empty). The one
+  edit to an existing non-report file is a comment reword in
+  `tools/mapping_check.py`, itself new this phase.
+
+- [x] **Any item met by live evidence alone with no test enforcing it:
+  false.** P3c1-1 is enforced by
+  `test_every_mapping_row_kind_matches_the_shape_of_its_backing` and
+  `test_a_kind_naming_a_test_requires_a_test_pytest_actually_collects`; P3c1-2
+  by `test_every_cited_section_contains_a_distinctive_term_from_the_claim` and
+  `test_the_term_rule_selects_terms_rather_than_reading_a_list`; P3c1-3 by
+  `test_no_mapping_failure_outside_the_committed_baseline`,
+  `test_the_baseline_holds_no_entry_that_no_longer_fails`,
+  `test_every_baseline_entry_names_a_real_row` and
+  `test_the_current_phase_table_is_clean_rather_than_baselined`; P3c1-4's
+  claim that this phase's own table is subject to the checks by
+  `test_the_current_phase_report_carries_a_mapping_table`. Each of the three
+  named mutations was applied one at a time and caught, with the reverts
+  recorded above.
 
 ---
 
 ## 7. Could not verify / known gaps
 
-PLACEHOLDER_GAPS
+- **`docs/reports/phase-2-completion-b.md` row 1 is a real defect the
+  committed check does not catch.** It cites `docs/reports/phase-2.md` section
+  2 for an Envoy route-timeout transcript that is not there, which is the row
+  38 defect on a substantive claim rather than a label. Found by hand, not by
+  the tool. Two reasons, both recorded in the ADR: the term rule measures a
+  term's rarity inside the cited document, and here the cited document is a
+  report that contains the mapping row itself, so `cluster` occurs in three of
+  that report's sections (all of them discussing this row) and reads as common
+  vocabulary. The same claim in `docs/reports/phase-2.md` row 15 escapes even
+  parsing, because it writes "section 2 above", and an unqualified section
+  marker is deliberately not treated as a citation. **This is the concrete
+  target for the next red team**, and it is not in the baseline, because a
+  baseline records what the check reports rather than what a person found.
+
+- **Class (b) is decisive on 29 of the 81 rows that cite a section, not 81.**
+  52 rows yield no load-bearing term. Almost all are in the older
+  `Location | Claim | Maps to` tables, whose Claim column labels the row
+  rather than stating the claim. The counts are reported per table in section
+  3 and in each erratum, and the ADR records the measured sweep behind the
+  threshold that produced them. A future phase could raise the bar for new
+  tables specifically, which would not disturb history.
+
+- **22 of 177 rows name nothing mechanically checkable at all.** They back a
+  claim with prose. They are reported as unchecked rather than passed, and are
+  not failures. `docs/reports/phase-2-completion.md` is the sharpest case:
+  its clean result is entirely a class (a) result, because class (b) is
+  decisive on none of its rows.
+
+- **Class (a) verifies that a cited test exists and is collected, not that it
+  tests the claim.** A row citing a real, collected test that asserts
+  something else passes both checks. That is the triage-Blocking case and it
+  stays a human judgement; nothing here reads a test body.
+
+- **The baseline is coupled to the corpus of Claim cells.** Adding a mapping
+  row anywhere can move a term across the sharing threshold and add or retire
+  an entry with no historical row having changed. It is not silent (the stale
+  check fails the build and names the entry) and it is far narrower than the
+  first implementation's coupling to report prose, which was discarded for
+  exactly this reason during the phase. It does mean a future phase re-derives
+  and re-justifies the baseline rather than appending to it.
+
+- **The circularity is narrowed, not closed.** Section 4 states what remains:
+  a checker and a table written in the same session share an author's blind
+  spots.
+
+- **The full integration suite was not run green locally.** 21 tests fail on
+  this host without the Docker stack up (ImmuDB, the verifier and the control
+  plane, reached over gRPC and HTTP). The identical 21 fail on an untouched
+  export of `c034ce0`, checked this pass, so nothing here regressed them. This
+  phase adds no service, touches no compose file and needs no stack: all 13 of
+  its tests are static and run with nothing running. CI runs the full suite
+  with the stack up; its result is section 8.
 
 ---
 
