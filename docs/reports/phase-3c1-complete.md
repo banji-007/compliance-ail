@@ -497,4 +497,19 @@ than baselining it. Every Claim cell states what the mechanism does.
 
 ## 9. CI run id
 
-CI_RUN
+PR #11, `integration-tests` job: **pass, 3m08s, 304 passed, 9 skipped** -
+https://github.com/banji-007/compliance-ail/actions/runs/32905459436
+
+That run covers `185f41f`, which is every part of this pass except the
+paragraph naming it: all of `tools/mapping_check.py`, `tests/conftest.py`, the
+seventeen converted test files, `tests/test_mapping_tables.py`, the
+regenerated baseline, `docs/reports/heading-pins.json`, ADR-0013 D28,
+`readME.md`, the eighth erratum and this report's body. A run id can only ever
+name the run before the commit that records it, so the run over this final
+commit is the one in the PR's own checks.
+
+304 passed, against 297 on the branch's previous run: seven net new tests, all
+of them in `tests/test_mapping_tables.py`, which goes from 11 to 20 while two
+of the original eleven were merged or renamed. 9 skipped, unchanged, and none
+of them skipped by the new marker: CI brings the stack up before the suite
+runs, so every service every file declares was answering.
