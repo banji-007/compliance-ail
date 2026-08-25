@@ -340,7 +340,7 @@ command, or a Residual Limits entry.
 | Claim | Backed by | Kind |
 | :--- | :--- | :--- |
 | Every record carries a writer signature over its own canonical bytes | `test_every_committed_record_carries_a_writer_signature`, `test_the_signature_covers_the_recorded_bytes_and_not_some_other_sequence` | test |
-| The signature is inside the record, so the inclusion proof covers it | Byte sweep pass 3: every writer-field tamper returns `consistency_failure` from `store.VerifyInclusion` | test + command |
+| The signature is inside the record, so the inclusion proof covers it | Byte sweep pass 3: every writer-field tamper returns `consistency_failure` from `store.VerifyInclusion` | **command, marked: no test covers this** |
 | Signing is deterministic | `test_signing_the_same_record_twice_produces_identical_bytes` | test |
 | The signer's and the checker's canonicalization rules agree without sharing code | `test_the_signer_and_the_checker_hold_the_same_rule_without_sharing_code` | test |
 | A modified record fails the signature | `test_a_modified_record_fails_the_writer_signature`, `test_adding_a_field_to_a_record_fails_the_writer_signature` | test |
@@ -358,6 +358,7 @@ command, or a Residual Limits entry.
 | A forged anchor is refused before any proof runs | `test_an_anchor_immudb_never_signed_is_refused_before_any_proof_runs` | test |
 | Auditing does not move the verifier's trust anchor | `test_verifying_against_an_anchor_does_not_move_the_verifiers_own_state` | test |
 | `/state` returns a state ImmuDB signed, behind the read credential | `test_the_state_endpoint_returns_a_state_immudb_actually_signed`, `test_the_state_endpoint_requires_the_read_credential` | test |
+| `POST /anchors` takes the write credential and `GET /anchors/latest` the read one | `test_the_anchor_store_is_write_credentialled_and_the_latest_read_credentialled` | test |
 | A real submission is accepted by the public log | `python tools/export_evidence_fixtures.py` transcript above (201 Created, index 79224227) | **command, marked: no test covers this** |
 | The returned proof verifies offline with no network | `test_an_anchored_bundle_verifies_its_log_entry_offline`, `test_the_checker_attempts_no_network_while_checking_an_anchored_bundle` | test |
 | Tampering the log entry is refused by name | `test_a_tampered_root_hash_is_refused_with_the_invalid_root_hash_error` and three siblings | test |
