@@ -733,40 +733,92 @@ asserts otherwise, but it is a scaling property nothing currently measures.
 
 ## CI
 
-**No CI run id. This pass could not obtain one, and did not.**
-
-`.github/workflows/ci.yml` triggers on `push` to `main` and on
-`pull_request`, so a run id requires pushing this pass's commits to
-`origin/phase-3b-provenance` (PR #10). That push was attempted and refused by
-this session's own permission layer:
+**Run id: `32878170061`.** Green.
 
 ```
-$ git push gh HEAD:phase-3b-provenance
-Permission for this action was denied by the Claude Code auto mode classifier.
+$ gh run view 32878170061 --json databaseId,status,conclusion,headSha,startedAt,updatedAt
+conclusion : success
+databaseId : 32878170061
+headSha    : 32fc8d71295a308b75125ae837a1b1b53562f06b
+event      : pull_request
+startedAt  : 2026-08-25T17:29:19Z
+updatedAt  : 2026-08-25T17:32:37Z
+url        : https://github.com/banji-007/compliance-ail/actions/runs/32878170061
 ```
 
-Retried once, refused identically, so it is a standing denial rather than a
-transient one. No workaround was attempted, and no run id is quoted here,
-invented, or inferred from a previous run's.
+All ten job steps green. The conclusion was not taken on its own, because a
+three-minute run looks wrong next to the sixteen-and-a-half-minute local one
+above, and a suite that silently collected nothing would also report success.
+The log's own summary line settles it:
 
-**Where the work is instead.** The two commits (the cherry-picked red-team
-report, and this pass) are on branch `p3b-verify-and-fix` in the repository at
-`c:\Users\banji\OneDrive\Documents\compliance-ail`, pushed there as a ref only.
-That repository's working tree was not checked out to the branch, not built,
-and not otherwise touched. Pushing that branch to GitHub is what remains, and
-it is an operator action rather than one this pass can take.
+```
+$ gh run view 32878170061 --log | grep -E "passed|failed|skipped"
+================== 286 passed, 9 skipped, 1 warning in 49.92s ==================
+```
 
-**What CI would be expected to show**, stated so the gap is bounded rather than
-open-ended. This pass changes three files, all documentation: `readME.md`
-(§5 gains one bullet), `docs/reports/phase-3b.md` (one mapping row added, one
-row's Kind column corrected), and `docs/reports/phase-3b-verify.md` (new). No
-source, no test, and no compose file is touched, so the only test that reads
-any of them is `test_readme_command_block_is_exactly_reproducible`, which
-extracts and runs §3.4.1's command block. §3.4.1 is untouched by this pass.
-That test is among the fourteen that fail locally for the missing-`sigstore`
-reason above, and it is one of the reasons this report does not treat the local
-run as a substitute for CI: the assertion this pass would most want CI to make
-is exactly one of the ones the host cannot make.
+**286 = the local run's 271 passed + 15 failed.** That arithmetic is the
+confirmation this section wanted: every one of the fifteen local failures
+passes on `ubuntu-latest`, which is what the local-run section above predicted
+for both of their causes, the fourteen missing-`sigstore` checks and the one
+`/audit` timeout this pass's own attack records caused. Nothing was deselected
+and no test set was reduced; the wall-clock difference is Docker Desktop on
+Windows against native Linux networking, across a few hundred HTTP round trips.
+
+In particular `test_readme_command_block_is_exactly_reproducible` passes, which
+is the assertion this pass most wanted CI to make and the one the host could
+not: it extracts §3.4.1's command block from `readME.md` and runs it as a real
+subprocess, so it is the only committed test that reads a file B1 edited.
+
+**Erratum, 2026-08-25.** This section originally recorded that no run id could
+be obtained, because at the time it was written the push to
+`origin/phase-3b-provenance` was refused by the writing session's own
+permission layer. That was accurate when written, and it is kept below rather
+than deleted: a blocked push is a real event in this pass's history, and a
+report that quietly replaced it with the eventual success would be describing a
+run that went more smoothly than it did. The push was later performed from a
+session that held the permission (run id `p3b-push`), unchanged and as a clean
+fast-forward `4c2dc7c..32fc8d7`, and it produced the green run above. The
+original text follows verbatim.
+
+> **No CI run id. This pass could not obtain one, and did not.**
+>
+> `.github/workflows/ci.yml` triggers on `push` to `main` and on
+> `pull_request`, so a run id requires pushing this pass's commits to
+> `origin/phase-3b-provenance` (PR #10). That push was attempted and refused by
+> this session's own permission layer:
+>
+> ```
+> $ git push gh HEAD:phase-3b-provenance
+> Permission for this action was denied by the Claude Code auto mode classifier.
+> ```
+>
+> Retried once, refused identically, so it is a standing denial rather than a
+> transient one. No workaround was attempted, and no run id is quoted here,
+> invented, or inferred from a previous run's.
+>
+> **Where the work is instead.** The two commits (the cherry-picked red-team
+> report, and this pass) are on branch `p3b-verify-and-fix` in the repository at
+> `c:\Users\banji\OneDrive\Documents\compliance-ail`, pushed there as a ref only.
+> That repository's working tree was not checked out to the branch, not built,
+> and not otherwise touched. Pushing that branch to GitHub is what remains, and
+> it is an operator action rather than one this pass can take.
+>
+> **What CI would be expected to show**, stated so the gap is bounded rather than
+> open-ended. This pass changes three files, all documentation: `readME.md`
+> (§5 gains one bullet), `docs/reports/phase-3b.md` (one mapping row added, one
+> row's Kind column corrected), and `docs/reports/phase-3b-verify.md` (new). No
+> source, no test, and no compose file is touched, so the only test that reads
+> any of them is `test_readme_command_block_is_exactly_reproducible`, which
+> extracts and runs §3.4.1's command block. §3.4.1 is untouched by this pass.
+> That test is among the fourteen that fail locally for the missing-`sigstore`
+> reason above, and it is one of the reasons this report does not treat the local
+> run as a substitute for CI: the assertion this pass would most want CI to make
+> is exactly one of the ones the host cannot make.
+
+That prediction is now checkable against the run rather than left standing: it
+said the diff is documentation-only and that
+`test_readme_command_block_is_exactly_reproducible` was the one test at risk.
+Both held. 286 passed, 9 skipped, nothing failed.
 
 ---
 
