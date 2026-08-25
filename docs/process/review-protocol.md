@@ -71,3 +71,15 @@ Most of the gaps found in Phase 0 review traced back to criteria written loosely
 - State what could not be tested and what blocked it.
 
 **Verdicts:** `HOLDS`, `HOLDS WITH READING ONLY`, `REFUTED`, `UNTESTABLE`. One per claim, with evidence as a command and its output or a `path:line`.
+
+---
+
+## 5. Objectives, and challenging an instruction
+
+Every instruction states an Objective: what the phase is for, in terms of the roadmap's definition of done, separate from its items. The items are a proposed mechanism for reaching it.
+
+The build session is authorized, and expected, to challenge the instruction where an item does not serve the stated objective, where the objective is better served another way, or where the Claim an item would produce describes a goal rather than a behaviour. Challenging is not scope creep and does not require the item to be impossible. Raise it before building, not in the report.
+
+Where an instruction is underspecified, ask rather than assume. An assumption that turns out wrong costs a phase; a question costs a message.
+
+No phase is scheduled whose exit criterion is not on the path to the roadmap's definition of done, unless it is Blocking under the triage rule.
