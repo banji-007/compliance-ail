@@ -152,27 +152,7 @@ _APPROVED_ARGS = {
 }
 
 
-def _opa_reachable() -> bool:
-    try:
-        httpx.get("http://localhost:8181/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-def _immudb_reachable() -> bool:
-    immudb_url = os.getenv("IMMUDB_URL", "http://localhost:8080")
-    try:
-        httpx.get(immudb_url, timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_stack = pytest.mark.skipif(
-    not (_opa_reachable() and _immudb_reachable()),
-    reason="OPA and/or ImmuDB not reachable",
-)
+requires_stack = pytest.mark.needs_stack("opa", "immudb", "verifier", "control_plane", "decision_service")
 
 # P13-5 (Phase 1.3, red-team U7): test_direct_sqlite_delete_produces_lost_not_erased
 # and test_erasure_refused_when_tombstone_write_fails both shell out to the
@@ -417,22 +397,36 @@ def test_erasure_refused_when_tombstone_write_fails():
         )
         assert del_resp.status_code == 503, del_resp.text
     finally:
+        # Restore reports through `restore_problem` rather than asserting here.
+        # An assert raised inside a finally replaces the exception in flight,
+        # so when this test's own erasure assertion failed and the restart wait
+        # also timed out, the real regression was discarded and the only
+        # surviving message was the environmental one (red team rt-p3c1-a, Z7).
+        # The primary failure now wins, and a restore problem is raised only
+        # when there is no primary failure to lose.
+        restore_problem = None
         start = subprocess.run(
             ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE, "start", "verifier"],
             cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
         )
-        assert start.returncode == 0, f"Failed to restart verifier: {start.stdout}\n{start.stderr}"
-        deadline = time.monotonic() + 30
-        healthy = False
-        while time.monotonic() < deadline:
-            try:
-                if httpx.get(VERIFIER_HEALTH_URL, timeout=2).status_code == 200:
-                    healthy = True
-                    break
-            except Exception:
-                pass
-            time.sleep(1)
-        assert healthy, "Verifier did not come back healthy after restart"
+        if start.returncode != 0:
+            restore_problem = f"Failed to restart verifier: {start.stdout}\n{start.stderr}"
+        else:
+            deadline = time.monotonic() + 30
+            healthy = False
+            while time.monotonic() < deadline:
+                try:
+                    if httpx.get(VERIFIER_HEALTH_URL, timeout=2).status_code == 200:
+                        healthy = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            if not healthy:
+                restore_problem = "Verifier did not come back healthy after restart"
+
+    if restore_problem is not None:
+        raise AssertionError(restore_problem)
 
     entry_after = _audit_entry_for_tx(r["ledger_tx_id"])
     assert entry_after["payload_state"] == "present", (

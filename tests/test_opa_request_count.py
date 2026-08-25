@@ -86,27 +86,7 @@ def _decide(tool_name, tool_args, agent_id="opa_count_test") -> dict:
     return asyncio.run(decision_main.decide(req))
 
 
-def _opa_reachable() -> bool:
-    try:
-        httpx.get("http://localhost:8181/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-def _immudb_reachable() -> bool:
-    immudb_url = os.getenv("IMMUDB_URL", "http://localhost:8080")
-    try:
-        httpx.get(immudb_url, timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_stack = pytest.mark.skipif(
-    not (_opa_reachable() and _immudb_reachable()),
-    reason="OPA and/or ImmuDB not reachable",
-)
+requires_stack = pytest.mark.needs_stack("opa", "immudb", "verifier", "control_plane", "decision_service")
 
 _REAL_POST = httpx.Client.post
 

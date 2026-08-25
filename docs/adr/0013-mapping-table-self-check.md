@@ -229,11 +229,13 @@ caught, two of them by class (a) and one by class (b).
   this pass"). The checker reports these as unchecked rather than passing
   them, and the phase report carries the count. They are not failures, and
   they are not coverage either.
-- **Rows whose claim yields no load-bearing term.** 52 of the 81 rows that
-  cite a section fall here, almost all of them label-shaped Claim cells in the
-  older tables. Class (b) is decisive on 29 rows of 81. The report carries
-  this number rather than reporting "0 failures" as though it meant "81 rows
-  verified".
+- **Rows class (b) does not fail.** 71 of the 81 rows that cite a section.
+  Class (b) is a falsifier and reports nothing about them, so they are counted
+  as not decided; see D28. The figure of 29 "decisive" rows that this ADR and
+  the seven errata carried before the completion pass was the old arithmetic,
+  which treated a term match as a pass. It is superseded by this paragraph and
+  by `docs/reports/phase-3c1-complete.md`; the errata are not edited, because
+  they are point-in-time records.
 
 - **A claim cited into a report that contains the mapping row itself.** The
   term rule measures rarity inside the cited document, so when the cited
@@ -270,9 +272,9 @@ The Phase 3c-1 report's own mapping table is checked by the same two checks,
 and the tests that enforce them are the same tests that table cites. If the
 checker were broken in a way that made it find nothing, the report's table
 would pass vacuously and so would every other. This is why
-`test_every_mapping_table_in_docs_reports_is_discovered` re-counts the tables
-with a second, deliberately dumb regex scan written independently of the
-parser, and requires the two to agree, and why
+`test_every_mapping_table_and_row_in_docs_reports_is_discovered` re-counts
+both the tables and the rows with a scan that shares no code with the parser,
+and requires the two to agree, and why
 `test_a_kind_naming_a_test_requires_a_test_pytest_actually_collects` asserts
 the collection rule itself rather than only its output. It does not fully
 dissolve the circularity: a checker and a table written in the same session
@@ -280,6 +282,78 @@ share an author's blind spots, and no amount of self-checking fixes that.
 What it does remove is the specific failure this project actually suffered
 three times, which is a row nobody re-derived. The next red team should attack
 the checker, not the table.
+
+### D28. The completion pass: each check enforces or says it did not decide
+
+Red team `rt-p3c1-a` refuted five of the seven claims this phase made. Two of
+them were the same defect: a check reporting success while not running. The
+completion pass closes them, and states what is left as a limitation rather
+than as future work.
+
+**Class (b) reports failed or not decided. There is no pass.** The term rule
+can be satisfied by accident: a claim was shown passing because the stem
+`govern` prefix-matched `governance` in the README's closing tagline. A check
+that can be accidentally satisfied cannot report a pass without overstating
+itself, so the pass bucket and the "decisive on N rows" count are removed. The
+mapping is **machine-falsified, not machine-verified**: the check can show a
+cited section does not carry a claim's vocabulary, and it cannot show that it
+does.
+
+**Scope narrowing is pinned.** Class (b) narrows a citation to a named
+subsection by matching the document's own heading titles against the row's
+text, which means a retitle widens the search back to the whole section and
+nothing notices. One retitle neutralised this phase's own named class (b)
+mutation completely. `docs/reports/heading-pins.json` records the heading each
+narrowing matched, and a retitle now fails the build the way a stale baseline
+entry does. Pins exist only where narrowing occurs; a row that does not narrow
+has no heading to pin.
+
+**A failure's identity includes its reason.** The baseline keyed on report,
+row and class, and the run's failures were collapsed into a dict on that key,
+so a row already baselined for one class absorbed every later failure of the
+same class. Two new class (a) defects on a baselined row reported as nothing
+new. The reason is now part of the key and the comparison is a multiset.
+
+**Discovery no longer depends on cosmetic shape.** Outer pipes are optional,
+the walk is recursive, the markdown pipe escape is honoured, and a row whose
+cell count does not match its header is a class (a) failure rather than a
+silent drop. That last one is the general fix: the defect was not the escape,
+it was that a row could leave a table the checker was running over with no
+number moving.
+
+**Tables inside fenced code blocks are not discovered.** Reports quote table
+rows and whole tables as examples, including the red-team report quoting the
+pipe-less table it used to prove discovery missed one. A fenced block renders
+as literal text rather than as a table, so it is not a claim the report makes.
+This is a deliberate scope boundary: a real mapping table hidden in a fence
+would also stop looking like a table to a reader.
+
+**What remains out of reach, and why it is a limitation rather than a phase.**
+Two citation shapes cannot be checked by this mechanism, and between them they
+account for every instance of the defect class found by hand in this
+repository:
+
+- **A citation into a sibling report.** The term rule measures a term's rarity
+  inside the cited document. When that document is another phase report, it
+  contains the mapping row making the claim, so the claim's own words are part
+  of what makes them look common. `docs/reports/phase-2-completion-b.md` row 1
+  cites `docs/reports/phase-2.md` section 2 for a route-timeout transcript
+  that is not there, and `cluster` occurs in three of that report's sections,
+  all of them discussing this row.
+- **A citation into the report's own body.** "section 2 above" names no
+  document, so it is not parsed as a citation at all.
+  `docs/reports/phase-1-3-complete.md` rows 14 and 15 cite that report's own
+  section 2 for a live verification it does not contain, and
+  `docs/reports/phase-2.md` row 15 does the same.
+
+Fixing either would mean measuring rarity against a corpus that excludes the
+citing row, and treating a report's own section markers as citations. Both are
+buildable. Neither is scheduled, because the honest statement of what a
+keyword check can establish about a prose citation is the one above, and a
+fourth mechanism aimed at the same target would be the same substitution this
+ADR exists to stop: a mechanism whose description matches the goal while its
+behaviour matches something narrower. The limitation is stated in `readME.md`
+section 5 and instanced in three errata.
 
 ## Alternatives considered
 

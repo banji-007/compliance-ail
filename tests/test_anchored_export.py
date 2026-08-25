@@ -64,24 +64,7 @@ checker = _load_module("ail_verify_bundle", REPO_ROOT / "tools" / "ail_verify_bu
 socket.socket.connect = _REAL_SOCKET_CONNECT  # the checker's import blocks it process-wide
 
 
-def _verifier_reachable() -> bool:
-    try:
-        return httpx.get(f"{VERIFIER_URL}/health", timeout=2).status_code == 200
-    except Exception:
-        return False
-
-
-def _control_plane_reachable() -> bool:
-    try:
-        return httpx.get(f"{CONTROL_PLANE_URL}/health", timeout=2).status_code == 200
-    except Exception:
-        return False
-
-
-requires_stack = pytest.mark.skipif(
-    not (_verifier_reachable() and _control_plane_reachable()),
-    reason="verifier and/or control plane not reachable",
-)
+requires_stack = pytest.mark.needs_stack("verifier", "control_plane")
 
 
 @pytest.fixture(autouse=True)

@@ -1,7 +1,7 @@
 {
   "entries": [
     {
-      "key": "docs/reports/phase-1-3-complete.md#15#b",
+      "key": "docs/reports/phase-1-3-complete.md#15#b#readME.md section 4.6 contains none of the claim's distinctive terms (given, replacement)",
       "report": "docs/reports/phase-1-3-complete.md",
       "row": 15,
       "class": "b",
@@ -9,7 +9,7 @@
       "claim": "Corrected this pass (R1) - Control Plane API and OPA rows removed (no longer published); replacement commands given a..."
     },
     {
-      "key": "docs/reports/phase-1-3.md#9#b",
+      "key": "docs/reports/phase-1-3.md#9#b#readME.md section 3.4 contains none of the claim's distinctive terms (semantic)",
       "report": "docs/reports/phase-1-3.md",
       "row": 9,
       "class": "b",
@@ -17,7 +17,7 @@
       "claim": "Erasure semantics strengthened this phase"
     },
     {
-      "key": "docs/reports/phase-1-3.md#14#b",
+      "key": "docs/reports/phase-1-3.md#14#b#readME.md section 4.1 contains none of the claim's distinctive terms (sequence)",
       "report": "docs/reports/phase-1-3.md",
       "row": 14,
       "class": "b",
@@ -25,7 +25,7 @@
       "claim": "Environment setup, boot sequence, three worked demo requests"
     },
     {
-      "key": "docs/reports/phase-1-3.md#15#b",
+      "key": "docs/reports/phase-1-3.md#15#b#readME.md section 4.5 contains none of the claim's distinctive terms (message)",
       "report": "docs/reports/phase-1-3.md",
       "row": 15,
       "class": "b",
@@ -33,7 +33,7 @@
       "claim": "Exact deny message text"
     },
     {
-      "key": "docs/reports/phase-1-3.md#16#b",
+      "key": "docs/reports/phase-1-3.md#16#b#readME.md section 4.6 contains none of the claim's distinctive terms (number)",
       "report": "docs/reports/phase-1-3.md",
       "row": 16,
       "class": "b",
@@ -41,7 +41,7 @@
       "claim": "Port numbers"
     },
     {
-      "key": "docs/reports/phase-1-3.md#18#b",
+      "key": "docs/reports/phase-1-3.md#18#b#readME.md section 5 / Prompt Injection - Structurally Constrained contains none of the claim's distinctive terms (instruction)",
       "report": "docs/reports/phase-1-3.md",
       "row": 18,
       "class": "b",
@@ -49,7 +49,7 @@
       "claim": "Untouched, per the instruction"
     },
     {
-      "key": "docs/reports/phase-2.md#7#b",
+      "key": "docs/reports/phase-2.md#7#b#readME.md section 6 contains none of the claim's distinctive terms (during)",
       "report": "docs/reports/phase-2.md",
       "row": 7,
       "class": "b",
@@ -57,7 +57,7 @@
       "claim": "Backfilled (was missing pre-Phase-2, noted during exploration)"
     },
     {
-      "key": "docs/reports/phase-3a.md#3#b",
+      "key": "docs/reports/phase-3a.md#3#b#readME.md section 3.4.1 contains none of the claim's distinctive terms (authorization)",
       "report": "docs/reports/phase-3a.md",
       "row": 3,
       "class": "b",
@@ -65,7 +65,7 @@
       "claim": "Authorization is not new or looser"
     },
     {
-      "key": "docs/reports/phase-3a.md#8#b",
+      "key": "docs/reports/phase-3a.md#8#b#readME.md section 3.4.1 contains none of the claim's distinctive terms (structural)",
       "report": "docs/reports/phase-3a.md",
       "row": 8,
       "class": "b",
@@ -73,7 +73,7 @@
       "claim": "The block is structural, not incidental"
     },
     {
-      "key": "docs/reports/phase-3a.md#9#b",
+      "key": "docs/reports/phase-3a.md#9#b#readME.md section 3.4.1 contains none of the claim's distinctive terms (compliance)",
       "report": "docs/reports/phase-3a.md",
       "row": 9,
       "class": "b",
@@ -81,7 +81,7 @@
       "claim": "D20 compliance"
     },
     {
-      "key": "docs/reports/phase-3b.md#2#a",
+      "key": "docs/reports/phase-3b.md#2#a#Kind declares command but the backing column names no command",
       "report": "docs/reports/phase-3b.md",
       "row": 2,
       "class": "a",
@@ -89,7 +89,7 @@
       "claim": "The signature is inside the record, so the inclusion proof covers it"
     },
     {
-      "key": "docs/reports/phase-3b.md#38#a",
+      "key": "docs/reports/phase-3b.md#38#a#Kind declares test but the backing column names no test",
       "report": "docs/reports/phase-3b.md",
       "row": 38,
       "class": "a",
@@ -97,7 +97,7 @@
       "claim": "The arbitrary-pair capability rests on a library seam"
     },
     {
-      "key": "docs/reports/phase-3b.md#39#a",
+      "key": "docs/reports/phase-3b.md#39#a#Kind declares command but the backing column names no command",
       "report": "docs/reports/phase-3b.md",
       "row": 39,
       "class": "a",

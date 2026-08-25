@@ -117,7 +117,7 @@ which asserts the collection rule itself rather than only its output.
 Applied to this report's own mapping table, row 1.
 
 Row 1's Backed by column was repointed from
-`test_every_mapping_table_in_docs_reports_is_discovered` to
+`test_every_mapping_table_and_row_in_docs_reports_is_discovered` to
 `test_mapping_tables_are_found_by_shape`, a name nothing defines, leaving its
 Kind reading `test`.
 
@@ -477,10 +477,9 @@ were broken in a way that made it find nothing, this table would pass
 vacuously and so would every other, and the report would say "0 failures".
 
 Two things narrow that, and neither closes it.
-`test_every_mapping_table_in_docs_reports_is_discovered` re-counts the tables
-with a second, deliberately dumb regex scan written independently of the
-parser and requires the two to agree, so a parser that stopped seeing tables
-fails the build rather than reporting health.
+`test_every_mapping_table_and_row_in_docs_reports_is_discovered` re-counts
+both the tables and the rows with a scan that shares no code with the parser
+and requires the two to agree.
 `test_a_kind_naming_a_test_requires_a_test_pytest_actually_collects` asserts
 the collection rule itself rather than only its output.
 
@@ -500,16 +499,16 @@ fixes its own table rather than baselining it.
 
 | Claim | Backed by | Kind |
 | :--- | :--- | :--- |
-| Mapping tables are discovered by structure, never from a list of filenames | `tests/test_mapping_tables.py::test_every_mapping_table_in_docs_reports_is_discovered` | test |
-| The discovery agrees with an independent scan, so a parser that goes blind fails the build | `test_every_mapping_table_in_docs_reports_is_discovered` re-counts with a separate regex sweep | test |
+| Mapping tables are discovered by structure, never from a list of filenames | `tests/test_mapping_tables.py::test_every_mapping_table_and_row_in_docs_reports_is_discovered` | test |
+| The parser's table count and row count both equal a scan that shares no code with it | `test_every_mapping_table_and_row_in_docs_reports_is_discovered` re-counts with an os.walk sweep and its own splitter | test |
 | A Kind naming a test requires a function pytest actually collects, not merely a def | `tests/test_mapping_tables.py::test_a_kind_naming_a_test_requires_a_test_pytest_actually_collects` | test |
 | A row declaring a backing kind its backing column does not name is a failure | `tests/test_mapping_tables.py::test_every_mapping_row_kind_matches_the_shape_of_its_backing` | test |
-| A row citing a document section that does not discuss its claim is a failure | `tests/test_mapping_tables.py::test_every_cited_section_contains_a_distinctive_term_from_the_claim` | test |
+| A row citing a document section that contains none of its claim's selected terms is a failure | `tests/test_mapping_tables.py::test_every_cited_section_contains_a_distinctive_term_from_the_claim` | test |
 | Load-bearing terms are derived from the claim and the corpus, with no curated list anywhere | `tests/test_mapping_tables.py::test_the_term_rule_selects_terms_rather_than_reading_a_list` | test |
 | The term that catches phase 3b's downgrade row survives selection | `test_the_term_rule_selects_terms_rather_than_reading_a_list` asserts `not_anchor` is selected | test |
 | A word the README uses pervasively is never treated as load-bearing | `test_the_term_rule_selects_terms_rather_than_reading_a_list` asserts the ceiling excludes it | test |
 | A failure outside the committed baseline fails the build and is reported as new | `tests/test_mapping_tables.py::test_no_mapping_failure_outside_the_committed_baseline` | test |
-| A baselined entry that stops failing fails the build, so the baseline cannot accumulate | `tests/test_mapping_tables.py::test_the_baseline_holds_no_entry_that_no_longer_fails` | test |
+| A baseline entry that no longer matches a current failure fails the build | `tests/test_mapping_tables.py::test_the_baseline_holds_no_entry_that_no_longer_fails` | test |
 | The baseline may not carry an entry for a row that is not in any table | `tests/test_mapping_tables.py::test_every_baseline_entry_names_a_real_row` | test |
 | This phase's own table is fixed rather than quarantined | `tests/test_mapping_tables.py::test_the_current_phase_table_is_clean_rather_than_baselined` | test |
 | The whole run is reproducible outside pytest, including against an arbitrary tree | `python tools/mapping_check.py --repo <tree>`, the transcripts in sections 1 and 2 | command |

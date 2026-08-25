@@ -129,36 +129,8 @@ _APPROVED_ARGS = {
 _DENIED_ARGS = {**_APPROVED_ARGS, "instance_type": "p4d.24xlarge", "cost_per_hour": 50.0}
 
 
-def _verifier_reachable() -> bool:
-    try:
-        return httpx.get(f"{VERIFIER_URL}/health", timeout=2).status_code == 200
-    except Exception:
-        return False
-
-
-def _control_plane_reachable() -> bool:
-    try:
-        return httpx.get(f"{CONTROL_PLANE_URL}/health", timeout=2).status_code == 200
-    except Exception:
-        return False
-
-
-def _opa_reachable() -> bool:
-    try:
-        httpx.get("http://localhost:8181/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_stack = pytest.mark.skipif(
-    not (_verifier_reachable() and _control_plane_reachable()),
-    reason="verifier and/or control plane not reachable",
-)
-requires_decisions = pytest.mark.skipif(
-    not (_verifier_reachable() and _control_plane_reachable() and _opa_reachable()),
-    reason="verifier, control plane and/or OPA not reachable",
-)
+requires_stack = pytest.mark.needs_stack("verifier", "control_plane")
+requires_decisions = pytest.mark.needs_stack("verifier", "control_plane", "opa")
 
 
 @pytest.fixture(autouse=True)

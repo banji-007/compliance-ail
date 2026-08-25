@@ -40,14 +40,7 @@ VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 _WRONG_KEY = "definitely-not-a-real-verifier-key"
 
 
-def _verifier_reachable() -> bool:
-    try:
-        return httpx.get(f"{VERIFIER_URL}/health", timeout=2).status_code == 200
-    except Exception:
-        return False
-
-
-requires_stack = pytest.mark.skipif(not _verifier_reachable(), reason="verifier not reachable")
+requires_stack = pytest.mark.needs_stack("verifier")
 
 
 def _b64(s: str) -> str:

@@ -44,26 +44,7 @@ _TENANT_ID = "tenant_default"
 _NOOP_UPDATE = {"name": "Default Tenant"}  # matches the seeded value - idempotent even if wrongly authorized
 
 
-def _dashboard_reachable() -> bool:
-    try:
-        httpx.get(f"{DASHBOARD_URL}/audit", timeout=3)
-        return True
-    except Exception:
-        return False
-
-
-def _control_plane_reachable() -> bool:
-    try:
-        httpx.get(f"{CONTROL_PLANE_URL}/health", timeout=3)
-        return True
-    except Exception:
-        return False
-
-
-requires_dashboard = pytest.mark.skipif(
-    not (_dashboard_reachable() and _control_plane_reachable()),
-    reason="dashboard and/or control plane not reachable",
-)
+requires_dashboard = pytest.mark.needs_stack("dashboard", "control_plane")
 
 
 # ---------------------------------------------------------------------------

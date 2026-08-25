@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import collections
 import json
 import re
 import sys
@@ -75,13 +76,28 @@ def _normalise_header(cell):
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
+_UNESCAPED_PIPE_RE = re.compile(r"(?<![\\])\|")
+
+
 def _split_row(line):
+    """Split a table row on unescaped pipes, then unescape.
+
+    Splitting on every pipe and unescaping afterwards, which is what this did
+    until Phase 3c-1's completion pass, means the escape can never take
+    effect: a cell written with the standard markdown \| yields one cell too
+    many and the row was then dropped by the cell-count guard in _tables_in,
+    silently. Splitting on unescaped pipes only is what makes the unescape
+    reachable.
+
+    Leading and trailing pipes are optional in GitHub-flavoured markdown, so
+    they are stripped when present and not required.
+    """
     stripped = line.strip()
     if stripped.startswith("|"):
         stripped = stripped[1:]
-    if stripped.endswith("|"):
+    if stripped.endswith("|") and not stripped.endswith(r"\|"):
         stripped = stripped[:-1]
-    return [c.replace(r"\|", "|").strip() for c in stripped.split("|")]
+    return [c.replace(r"\|", "|").strip() for c in _UNESCAPED_PIPE_RE.split(stripped)]
 
 
 def _is_separator(cells):
@@ -97,6 +113,11 @@ class MappingRow:
     line: int        # 1-based line number in the report
     location: str = ""       # "" when the table has no Location column
     location_doc: str = ""   # document the Location column's own header names
+    cell_count: int = 0      # non-zero only when the row does not parse
+
+    @property
+    def malformed(self):
+        return self.cell_count != 0
 
     def citing_text(self):
         """Every (cell, default document) this row can cite a section from.
@@ -137,13 +158,59 @@ class MappingTable:
 def find_mapping_tables(repo_root=REPO_ROOT):
     """Every mapping table under docs/reports/, discovered by header shape."""
     tables = []
-    for path in sorted((repo_root / "docs" / "reports").glob("*.md")):
+    for path in sorted((repo_root / "docs" / "reports").rglob("*.md")):
         tables.extend(_tables_in(path, repo_root))
     return tables
 
 
+def _looks_like_row(line):
+    """A candidate table row.
+
+    Leading and trailing pipes are optional in GitHub-flavoured markdown, so
+    requiring a leading pipe, which is what this did until Phase 3c-1's
+    completion pass, means a table written without them is not a table as far
+    as the checker is concerned. It renders identically to a reader. The gate
+    is now an unescaped pipe anywhere in a non-blank, non-heading line, and
+    the real filter stays where it always was: a separator row underneath and
+    a Claim column plus a backing column in the header.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    return bool(_UNESCAPED_PIPE_RE.search(stripped))
+
+
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+
+
+def _fenced_lines(lines):
+    """Index of every line inside a fenced code block.
+
+    A table inside a fence renders as literal text, not as a table, so it is
+    an example rather than a claim the report is making. Reports quote table
+    rows and whole tables routinely: this red-team report quotes the very
+    pipe-less table it used to prove discovery missed one. Without this, the
+    discovery fix turns every such quotation into a mapping row with a backing
+    column nothing resolves. The scoping is deliberate and is recorded in
+    ADR-0013: putting a real mapping table in a fence would hide it from the
+    checker, and would also stop it looking like a table to a reader, which is
+    the population this check is about.
+    """
+    inside = set()
+    open_fence = False
+    for idx, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            open_fence = not open_fence
+            inside.add(idx)
+            continue
+        if open_fence:
+            inside.add(idx)
+    return inside
+
+
 def _tables_in(path, repo_root):
     lines = path.read_text(encoding="utf-8").splitlines()
+    fenced = _fenced_lines(lines)
     found = []
     heading = ""
     i = 0
@@ -151,7 +218,10 @@ def _tables_in(path, repo_root):
         line = lines[i]
         if line.startswith("#"):
             heading = line.lstrip("#").strip()
-        if line.strip().startswith("|") and i + 1 < len(lines):
+        if i in fenced:
+            i += 1
+            continue
+        if _looks_like_row(line) and i + 1 < len(lines) and (i + 1) not in fenced:
             header = _split_row(line)
             sep = _split_row(lines[i + 1])
             normalised = [_normalise_header(c) for c in header]
@@ -185,10 +255,10 @@ def _tables_in(path, repo_root):
                     location_doc = "readME.md"
                 j = i + 2
                 count = 0
-                while j < len(lines) and lines[j].strip().startswith("|"):
+                while j < len(lines) and j not in fenced and _looks_like_row(lines[j]):
                     cells = _split_row(lines[j])
+                    count += 1
                     if len(cells) == len(header):
-                        count += 1
                         table.rows.append(
                             MappingRow(
                                 number=count,
@@ -200,6 +270,26 @@ def _tables_in(path, repo_root):
                                     cells[location_at] if location_at is not None else ""
                                 ),
                                 location_doc=location_doc,
+                            )
+                        )
+                    else:
+                        # A row whose cell count does not match the header used
+                        # to be skipped here, with no diagnostic and no effect
+                        # on any count, so a row could leave a table the checker
+                        # was running over and the totals would not move. That
+                        # is the defect, not the escaped pipe that exposed it: a
+                        # silent drop is available to any shape nobody
+                        # enumerated. It is now a class (a) failure.
+                        table.rows.append(
+                            MappingRow(
+                                number=count,
+                                claim=_clip(lines[j], 96),
+                                backing="",
+                                kind="",
+                                line=j + 1,
+                                location="",
+                                location_doc=location_doc,
+                                cell_count=len(cells),
                             )
                         )
                     j += 1
@@ -670,7 +760,25 @@ class Failure:
     claim: str
 
     def key(self):
-        return "%s#%d#%s" % (self.report, self.row, self.cls)
+        """Identity of a failure, including why it failed.
+
+        Until Phase 3c-1's completion pass this was report, row and class
+        only, and the run's failures were collapsed into a dict on it. Two
+        consequences, both exploited by red team rt-p3c1-a: the reason was not
+        part of the identity, so a row already baselined for a class absorbed
+        any further failure of that class, and several failures on one row and
+        class collapsed to one entry before the comparison ever ran. A cited
+        test that does not exist, added to a row baselined for a Kind
+        mismatch, reported as nothing new.
+
+        The reason is now part of the key, so a changed reason is a stale
+        entry plus a new failure rather than silence. That makes the reason
+        string a contract: changing its wording re-baselines every entry
+        carrying it, loudly.
+        """
+        return "%s#%d#%s#%s" % (
+            self.report, self.row, self.cls, re.sub(r"\s+", " ", self.reason).strip()
+        )
 
     def __str__(self):
         return "%s row %d [class %s]: %s :: %s" % (
@@ -781,6 +889,16 @@ class RepoIndex:
 def check_shape(table, row, repo_root, collected, index):
     """Class (a). What the row declares must exist in the shape it declares."""
     failures = []
+
+    if row.malformed:
+        return [
+            Failure(table.report, row.number, "a",
+                    "row has %d cells but the header has %d, so it does not parse "
+                    "and nothing in it was checked"
+                    % (row.cell_count, len(table.columns)),
+                    row.claim)
+        ]
+
     tok = extract_tokens(row.backing, repo_root)
 
     for name, path in tok.tests:
@@ -953,12 +1071,27 @@ class ReportResult:
     report: str
     rows: int
     unchecked_shape: int     # rows whose backing names nothing checkable
-    unchecked_support: int   # rows citing a section but yielding no distinctive term
     citing: int = 0          # rows that cite at least one document section
+    unparsed: int = 0        # rows whose cell count does not match the header
     failures: list = field(default_factory=list)
+    narrowings: list = field(default_factory=list)
 
     def count(self, cls):
         return sum(1 for f in self.failures if f.cls == cls)
+
+    @property
+    def undecided_support(self):
+        """Citing rows class (b) did not fail.
+
+        There is deliberately no third bucket. Class (b) is a falsifier: it can
+        show that a cited section carries none of a claim's distinctive terms,
+        and it cannot show the converse, because a term can match by accident
+        (red team rt-p3c1-a, Z3-c: a claim passed on the stem `govern` matching
+        `governance` in a closing tagline). Reporting a pass would put a number
+        in the coverage table that overstates itself, so a citing row is either
+        failed or not decided.
+        """
+        return self.citing - self.count("b")
 
 
 def run(repo_root=REPO_ROOT):
@@ -966,8 +1099,14 @@ def run(repo_root=REPO_ROOT):
     index = RepoIndex(repo_root)
     results = []
     for table in find_mapping_tables(repo_root):
-        result = ReportResult(table.report, len(table.rows), 0, 0)
+        result = ReportResult(table.report, len(table.rows), 0)
         for row in table.rows:
+            if row.malformed:
+                result.unparsed += 1
+                result.failures.extend(
+                    check_shape(table, row, repo_root, collected, index)
+                )
+                continue
             tok = extract_tokens(row.backing, repo_root)
             if tok.is_empty():
                 result.unchecked_shape += 1
@@ -976,9 +1115,8 @@ def run(repo_root=REPO_ROOT):
             )
             if _cited_sections(row, repo_root):
                 result.citing += 1
-                if not support_is_checkable(row, repo_root):
-                    result.unchecked_support += 1
             result.failures.extend(check_support(table, row, repo_root))
+            result.narrowings.extend(narrowings_for(row, table, repo_root))
         results.append(result)
     return results
 
@@ -988,6 +1126,87 @@ def all_failures(results):
     for result in results:
         out.extend(result.failures)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Heading pins
+# ---------------------------------------------------------------------------
+#
+# Scope narrowing is what makes class (b) bite on the defect it was built for.
+# Phase 3b's row 39 cites readME.md section 5 for a disclosure that lives in
+# that section's "Residual Limits" subsection; section 5 as a whole contains
+# the claim's terms elsewhere, so checking it whole passes the row even with
+# the disclosure deleted.
+#
+# The narrowing is found by matching the document's own heading titles against
+# the row's text, which means it stops happening the moment the heading is
+# retitled, and stops silently. Red team rt-p3c1-a (Z3-a) deleted the
+# disclosure and retitled the heading in one edit: the phase's own named
+# mutation, which it demonstrates being caught, passed both checks and the
+# whole suite.
+#
+# A pin records the heading text that was matched when the row was last
+# derived. A retitle then fails the build and names the row, the same signal
+# shape as a stale baseline entry, rather than quietly widening the search.
+# Pins exist only for rows that actually narrow: a row with no narrowing has
+# no heading to pin, and inventing one would be a pin that cannot fail.
+
+PINS_PATH = Path("docs") / "reports" / "heading-pins.json"
+
+
+@dataclass(frozen=True)
+class Narrowing:
+    report: str
+    row: int
+    doc: str
+    section: str
+    title: str
+
+    def key(self):
+        return "%s#%d#%s#%s" % (self.report, self.row, self.doc, self.section)
+
+
+def narrowings_for(row, table, repo_root):
+    """Every citation on this row that resolved to a named subsection."""
+    out = []
+    for cell, rel, number in _cited_sections(row, repo_root):
+        doc = load_document(repo_root, rel)
+        if doc is None:
+            continue
+        section, child = resolve_scope(doc, number, cell + " " + row.kind)
+        if section is None or child is None:
+            continue
+        out.append(Narrowing(table.report, row.number, rel, number, child.title))
+    return _dedup(out)
+
+
+def all_narrowings(results):
+    out = []
+    for result in results:
+        out.extend(result.narrowings)
+    return out
+
+
+def load_pins(repo_root=REPO_ROOT):
+    path = repo_root / PINS_PATH
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {entry["key"]: entry for entry in data.get("pins", [])}
+
+
+def classify_against_pins(results, pins):
+    """Narrowings with no pin, pins whose heading changed, and pins with no narrowing."""
+    current = {n.key(): n for n in all_narrowings(results)}
+    ordered = sorted(current.items(), key=lambda kv: (kv[1].report, kv[1].row, kv[1].doc))
+    unpinned = [n for key, n in ordered if key not in pins]
+    changed = [
+        (n, pins[key]["title"])
+        for key, n in ordered
+        if key in pins and pins[key]["title"] != n.title
+    ]
+    stale = sorted(key for key in pins if key not in current)
+    return unpinned, changed, stale
 
 
 # ---------------------------------------------------------------------------
@@ -1003,11 +1222,24 @@ def load_baseline(repo_root=REPO_ROOT):
 
 
 def classify_against_baseline(results, baseline):
-    """Split current failures into new ones and known ones, and find stale entries."""
-    current = {f.key(): f for f in all_failures(results)}
-    new = [f for key, f in sorted(current.items()) if key not in baseline]
-    known = [f for key, f in sorted(current.items()) if key in baseline]
-    stale = sorted(key for key in baseline if key not in current)
+    """Split current failures into new ones and known ones, and find stale entries.
+
+    Compared as a multiset rather than a dict. Keying a dict by failure
+    identity discards duplicates before the comparison runs, which is half of
+    what let rt-p3c1-a's Z4 attack through; keying it by the full identity
+    without also dropping the dict would still lose a genuine repeat.
+    """
+    current = sorted(all_failures(results), key=lambda f: (f.report, f.row, f.cls, f.reason))
+    seen = collections.Counter()
+    new, known = [], []
+    for failure in current:
+        key = failure.key()
+        seen[key] += 1
+        if key in baseline:
+            known.append(failure)
+        else:
+            new.append(failure)
+    stale = sorted(key for key in baseline if key not in seen)
     return new, known, stale
 
 
@@ -1045,6 +1277,18 @@ def main(argv=None):
             json.dumps({"entries": entries}, indent=2) + "\n", encoding="utf-8"
         )
         print("wrote %d entries to %s" % (len(entries), BASELINE_PATH.as_posix()))
+
+        pins = [
+            {"key": n.key(), "report": n.report, "row": n.row,
+             "doc": n.doc, "section": n.section, "title": n.title}
+            for n in sorted(all_narrowings(results),
+                            key=lambda n: (n.report, n.row, n.doc, n.section))
+        ]
+        pin_path = repo_root / PINS_PATH
+        pin_path.write_text(
+            json.dumps({"pins": pins}, indent=2) + "\n", encoding="utf-8"
+        )
+        print("wrote %d pins to %s" % (len(pins), PINS_PATH.as_posix()))
         return 0
 
     if args.json:
@@ -1060,29 +1304,34 @@ def main(argv=None):
 
     print("mapping tables found: %d" % len(results))
     print()
-    header = "%-40s %5s %5s %5s %5s %7s %7s" % (
-        "report", "rows", "cites", "a", "b", "unchk-a", "unchk-b")
+    # No pass column, by construction. Class (b) reports failed or not
+    # decided; see ReportResult.undecided_support.
+    header = "%-40s %5s %5s %6s %6s %7s %7s %8s" % (
+        "report", "rows", "cites", "a-fail", "b-fail",
+        "a-undec", "b-undec", "unparsed")
     print(header)
     print("-" * len(header))
     for result in results:
-        print("%-40s %5d %5d %5d %5d %7d %7d" % (
+        print("%-40s %5d %5d %6d %6d %7d %7d %8d" % (
             result.report.replace("docs/reports/", ""),
             result.rows,
             result.citing,
             result.count("a"),
             result.count("b"),
             result.unchecked_shape,
-            result.unchecked_support,
+            result.undecided_support,
+            result.unparsed,
         ))
     print("-" * len(header))
-    print("%-40s %5d %5d %5d %5d %7d %7d" % (
+    print("%-40s %5d %5d %6d %6d %7d %7d %8d" % (
         "TOTAL",
         sum(r.rows for r in results),
         sum(r.citing for r in results),
         sum(r.count("a") for r in results),
         sum(r.count("b") for r in results),
         sum(r.unchecked_shape for r in results),
-        sum(r.unchecked_support for r in results),
+        sum(r.undecided_support for r in results),
+        sum(r.unparsed for r in results),
     ))
 
     if failures:
@@ -1090,6 +1339,21 @@ def main(argv=None):
         print("failing rows:")
         for f in sorted(failures, key=lambda f: (f.report, f.row, f.cls)):
             print("  " + str(f))
+
+    pins = load_pins(repo_root)
+    unpinned, changed, stale_pins = classify_against_pins(results, pins)
+    print()
+    print("heading pins: %d recorded, %d unpinned, %d retitled, %d stale"
+          % (len(pins), len(unpinned), len(changed), len(stale_pins)))
+    for n in unpinned:
+        print("  UNPINNED  %s row %d narrows %s section %s to %r"
+              % (n.report, n.row, n.doc, n.section, n.title))
+    for n, was in changed:
+        print("  RETITLED  %s row %d narrows %s section %s to %r, pinned as %r"
+              % (n.report, n.row, n.doc, n.section, n.title, was))
+    for key in stale_pins:
+        print("  STALE PIN %s: the row no longer narrows, so the search has "
+              "silently widened to the whole section" % key)
 
     baseline = load_baseline(repo_root)
     if baseline:
@@ -1101,9 +1365,9 @@ def main(argv=None):
             print("  NEW   " + str(f))
         for key in stale:
             print("  STALE " + key)
-        return 1 if (new or stale) else 0
+        return 1 if (new or stale or unpinned or changed or stale_pins) else 0
 
-    return 1 if failures else 0
+    return 1 if (failures or unpinned or changed or stale_pins) else 0
 
 
 if __name__ == "__main__":

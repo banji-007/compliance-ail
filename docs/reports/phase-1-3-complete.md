@@ -463,3 +463,51 @@ The row is not corrected here. It is entered in
 
 See `docs/adr/0013-mapping-table-self-check.md` and
 `docs/reports/phase-3c1.md`.
+
+---
+
+## Erratum, 2026-08-26 (added by the Phase 3c-1 completion pass, `p3c1-complete`)
+
+Red team `rt-p3c1-a` read the claim and the cited backing for every row of
+this table that neither check could decide. It found one defect, in two rows,
+and neither check reports it.
+
+- **Row 14**, Location "README §4.5, bundle-load confirmation step", Maps to
+  "Verified live in section 2 above".
+- **Row 15**, Location "README §4.6, service endpoint table", Claim
+  "replacement commands given and verified live", Maps to "Same as §4.5",
+  which resolves to the same section 2.
+
+**Section 2 of this report does not contain that verification.** It is R1's
+port-binding evidence: it demonstrates that OPA's port is no longer published,
+which is what broke the `curl localhost:8181` step, and it does not run the
+compose-network command that replaced it. The only occurrence of `docker
+compose exec` anywhere in this report is inside the erratum above, which
+quotes the README. Section 2's own escalation note says the affordance "is
+fixed in documentation (section 5 below)", and section 5 of this report is R4,
+`GET /bundles/{tenant_id}` requires a credential, while section 6 is R5, whose
+subsections cover four other statements. Neither carries the section 4.5 or
+4.6 edit.
+
+**Citation defect, not a false claim.** What the rows say about `readME.md` is
+true and was re-checked: section 4.6's endpoint table lists only the CISO
+Control Plane, Grafana and Prometheus, and section 4.5 gives the replacement
+command. What is unsupported is "verified live", for which the cited section
+carries no transcript. Whether the command was run during that pass cannot be
+established from this tree either way, so this is filed as an erratum rather
+than escalated.
+
+**Why neither check reports it.** Both rows cite this report's own section 2.
+An unqualified section marker names no document and is deliberately not parsed
+as a citation, so class (b) never looks at it; row 14 names nothing
+mechanically checkable at all, and row 15's class (b) failure is against
+`readME.md` section 4.6 on different terms. This is the report-internal
+citation shape recorded as out of reach in
+`docs/adr/0013-mapping-table-self-check.md` (D28) and in `readME.md` section 5.
+It is deliberately not in `docs/reports/mapping-check-baseline.json`: a
+baseline records what the check reports, not what a person found.
+
+The rows are not corrected here.
+
+See `docs/reports/phase-3c1-redteam.md` (Z1) and
+`docs/reports/phase-3c1-complete.md`.
