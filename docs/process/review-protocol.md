@@ -22,6 +22,8 @@ Every instruction carries a unique run id. A session's first reported action sta
 
 Before deleting a branch, enumerate what is unique to it and confirm each item either exists on the target branch or is intentionally discarded. Use git diff --stat against the target, not a recollection of what was ported.
 
+**Cherry-picked content defeats the commit-level check.** `git log target..branch` is the usual gate, and it is empty only when the branch's commits are ancestors of the target. A cherry-pick mints a new commit with a new SHA, so the content can be fully present on the target while that log still lists the original commit. Reading the non-empty log as "unique work would be lost" is wrong, and loosening the gate to a path-scoped log after it fails is worse: a gate rewritten to pass is not a gate. Compare blob hashes instead. For every file the branch introduces, `git rev-parse branch:path` must equal `git rev-parse target:path`; delete only if every one matches, and quote the hashes in the report so the authorization rests on the evidence rather than on the claim. If any file differs or is absent, the branch holds something the target does not, and the commit-level gate was right.
+
 Tearing down Docker state is not tearing down the session. A session that creates a scratch clone or worktree removes the directory itself before reporting, and states in its report what it removed. Scratch clones under Claude Code's Temp session storage count; six sessions left 1.16G of them behind before anyone noticed. If a session cannot remove its own directory because a file handle is held, it says so in its report rather than leaving it silently.
 
 ---
