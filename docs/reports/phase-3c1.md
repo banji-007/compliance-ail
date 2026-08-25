@@ -661,4 +661,27 @@ the set.**
 
 ## 8. CI run id
 
-PLACEHOLDER_CI
+PR #11, `integration-tests` job: **pass, 2m58s, 297 passed, 9 skipped** -
+https://github.com/banji-007/compliance-ail/actions/runs/32886943698
+
+All 11 of this phase's tests pass in CI, listed by name in the run log.
+
+**The first attempt on this same commit failed and was re-run, and the reason
+is recorded rather than hidden.** 66 tests failed, and the cascade traces to a
+single test:
+`tests/test_content_states.py::test_erasure_refused_when_tombstone_write_fails`
+deliberately stops the verifier container to force a tombstone-write failure,
+then waits for it to come back. That wait timed out
+("Verifier did not come back healthy after restart"), leaving the verifier
+down for the rest of the session, so every subsequent stack test failed with
+`content_store_unreachable` or a 409. The stack itself had come up healthy
+(every container reported Healthy before the suite started), and all 11 of
+this phase's tests passed on that attempt too, as did
+`tests/test_docs_references_resolve.py`.
+
+This phase adds no service, touches no compose file and changes nothing on any
+code path, so it cannot affect a container restart's timing. The re-run on the
+identical commit passed 297. Recorded here as a **flaky test in this suite**
+worth an item in a later phase: a test that leaves the stack broken when its
+own restart wait times out turns one flake into 66 failures and hides whatever
+else the run would have said.
