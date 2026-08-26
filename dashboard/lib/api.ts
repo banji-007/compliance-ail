@@ -1,4 +1,10 @@
-import type { AuditResponse, Tenant, TenantUpdate } from "./types";
+import type {
+  AuditResponse,
+  RecordVerification,
+  Tenant,
+  TenantUpdate,
+} from "./types";
+import { AUDIT_PAGE_SIZE } from "./constants";
 
 // Same-origin only (D4): every dashboard request goes through this app's own
 // Next.js Route Handlers under app/api/, which hold CONTROL_PLANE_READ_KEY /
@@ -41,6 +47,19 @@ export function updateTenant(
 // Audit Ledger
 // ---------------------------------------------------------------------------
 
-export function fetchAudit(limit = 200): Promise<AuditResponse> {
+export function fetchAudit(limit = AUDIT_PAGE_SIZE): Promise<AuditResponse> {
   return request<AuditResponse>(`/audit?limit=${limit}`);
+}
+
+// P3c2-1 (Phase 3c-2): one record's verification, on demand. /audit
+// defers (D29), so this is the only call that actually asks the verifier
+// for a proof check, and the audit table's row-expand control is its only
+// caller. Named here rather than inside the component so there is one
+// place the route is spelled.
+export function fetchRecordVerification(
+  ledgerKey: string
+): Promise<RecordVerification> {
+  return request<RecordVerification>(
+    `/audit/verify?key=${encodeURIComponent(ledgerKey)}`
+  );
 }

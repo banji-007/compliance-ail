@@ -1,7 +1,13 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { RefreshCw, AlertCircle, ShieldAlert, RefreshCcw } from "lucide-react";
+import {
+  RefreshCw,
+  AlertCircle,
+  ShieldAlert,
+  RefreshCcw,
+  ShieldOff,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AuditTable } from "@/components/audit-table";
 import { fetchAudit } from "@/lib/api";
@@ -10,8 +16,17 @@ export default function AuditPage() {
   const { data, isLoading, isError, error, refetch, isFetching, dataUpdatedAt } =
     useQuery({
       queryKey: ["audit"],
-      queryFn: () => fetchAudit(200),
-      // Refresh every 30 s automatically — ledger grows as agents run.
+      // P3c2-5: no page-size literal here. lib/constants.ts holds the one
+      // definition and fetchAudit defaults to it.
+      queryFn: () => fetchAudit(),
+      // Refresh every 30s automatically - the ledger grows as agents run.
+      //
+      // P3c2-6: this interval, not the page size, was the real multiplier on
+      // the old verification cost. It meant one verifier round trip per row
+      // on the page, every 30s, per open tab, indefinitely. Since D29 the
+      // page defers, so a poll costs three ImmuDB scans and one verifier
+      // health probe regardless of how many rows come back, and the interval
+      // is kept deliberately rather than by omission.
       refetchInterval: 30_000,
     });
 
@@ -70,6 +85,28 @@ export default function AuditPage() {
             <p className="mt-2 text-xs opacity-60">
               Ensure ImmuDB is running and the control-plane has{" "}
               <code>IMMUDB_USER</code> / <code>IMMUDB_PASSWORD</code> set.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* D29: a page of NOT CHECKED rows means one of two very different
+          things - verification was deferred (normal), or the verifier is
+          down (not normal). The rows cannot tell those apart, because a
+          deferred page makes no attempt that could fail. This banner is the
+          only thing that does. */}
+      {data && !data.verifier_reachable && (
+        <div className="flex items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
+          <ShieldOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <div>
+            <p className="font-semibold text-amber-700 dark:text-amber-300">
+              Verifier unreachable
+            </p>
+            <p className="mt-1 text-xs text-amber-700/80 dark:text-amber-300/80">
+              It did not answer a health check when this page was built, so no
+              record on it can be checked right now. Rows below read NOT
+              CHECKED for that reason, not because verification was merely
+              deferred. Expanding a row will fail until the verifier is back.
             </p>
           </div>
         </div>

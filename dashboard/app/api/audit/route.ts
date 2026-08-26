@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { AUDIT_PAGE_SIZE } from "@/lib/constants";
 
 // Server-side only (D4). CONTROL_PLANE_READ_KEY never carries a NEXT_PUBLIC_
 // prefix and is never read from a client component - the browser only ever
@@ -17,7 +18,12 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const limit = req.nextUrl.searchParams.get("limit") ?? "200";
+  // P3c2-5: the page size has one definition (lib/constants.ts). This
+  // file, lib/api.ts and app/audit/page.tsx each carried the number
+  // independently before, three literals that had to agree with nothing
+  // making them agree.
+  const limit =
+    req.nextUrl.searchParams.get("limit") ?? String(AUDIT_PAGE_SIZE);
   const res = await fetch(`${CONTROL_PLANE_URL}/audit?limit=${encodeURIComponent(limit)}`, {
     headers: { "X-API-Key": apiKey },
     cache: "no-store",

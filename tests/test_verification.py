@@ -291,12 +291,16 @@ def test_cross_process():
 
     audit_resp = httpx.get(
         f"{CONTROL_PLANE_URL}/audit",
+        # verify=true (D29, Phase 3c-2): /audit defers verification by
+        # default, so without this parameter the assertion at the end of this
+        # test would read "asserted" and fail. The point of the test is that
+        # the control-plane process reaches a real verification state without
+        # touching any interceptor-local file, which requires a real one.
+        params={"verify": "true"},
         headers={"X-API-Key": READ_API_KEY},
-        # /audit is O(n) over ledger size (TODO.md, Phase 3) - Phase 2 added
-        # enough new ledger-writing tests elsewhere in this suite that a
-        # full run now reliably pushes this past 30s. Not a fix to the
-        # underlying scan cost, just headroom to keep this assertion from
-        # flaking on client timeout while it's still true.
+        # A verified page is still O(min(limit, ledger)) verifier round trips
+        # (D29 makes that cost opt-in, it does not remove it), and this suite
+        # accumulates entries, so the headroom stays on this call.
         timeout=90,
     )
     assert audit_resp.status_code == 200, (

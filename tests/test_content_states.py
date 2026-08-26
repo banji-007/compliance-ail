@@ -188,19 +188,27 @@ requires_docker_cli = pytest.mark.skipif(
 )
 
 
-def _audit_entries(limit: int = 200) -> list[dict]:
+def _audit_entries(limit: int = 200, verify: bool = False) -> list[dict]:
+    """
+    D29 (Phase 3c-2): /audit defers verification, so `verify` has to be asked
+    for by any caller that reads verification.state and means it. Every test
+    in this file except the erasure one below reads payload_state, which
+    deferral does not touch, and so leaves it deferred.
+    """
     resp = httpx.get(
         f"{CONTROL_PLANE_URL}/audit",
-        params={"limit": limit},
+        params={"limit": limit, "verify": str(verify).lower()},
         headers={"X-API-Key": READ_API_KEY},
-        timeout=30,
+        # A verified page is still one verifier round trip per entry
+        # (O(min(limit, ledger))), and this suite accumulates entries.
+        timeout=90 if verify else 30,
     )
     resp.raise_for_status()
     return resp.json()["entries"]
 
 
-def _audit_entry_for_tx(tx_id: int) -> dict:
-    matching = [e for e in _audit_entries() if e["tx_id"] == tx_id]
+def _audit_entry_for_tx(tx_id: int, verify: bool = False) -> dict:
+    matching = [e for e in _audit_entries(verify=verify) if e["tx_id"] == tx_id]
     assert matching, f"tx_id {tx_id} not found in /audit"
     return matching[0]
 
@@ -223,7 +231,14 @@ def test_present_then_erased_via_delete_content():
     assert "ledger_tx_id" in r, f"Expected a recorded call, got: {r}"
     tx_id = r["ledger_tx_id"]
 
-    entry = _audit_entry_for_tx(tx_id)
+    # verify=True on both reads, not just one (D29, Phase 3c-2). The
+    # assertion at the end of this test compares the verification state
+    # before the erasure to the state after it, and under the deferred
+    # default both sides would be "asserted" - the comparison would pass
+    # while establishing nothing about the proof surviving erasure, which is
+    # the only thing it exists to establish. A weakened assertion that goes
+    # red is a nuisance; one that stays green is worse.
+    entry = _audit_entry_for_tx(tx_id, verify=True)
     assert entry["payload_state"] == "present", entry
     assert entry["payload"] is not None and marker in entry["payload"]["query"], entry
     call_id = entry["call_id"]
@@ -236,7 +251,7 @@ def test_present_then_erased_via_delete_content():
     )
     assert del_resp.status_code == 204, del_resp.text
 
-    entry_after = _audit_entry_for_tx(tx_id)
+    entry_after = _audit_entry_for_tx(tx_id, verify=True)
     assert entry_after["payload_state"] == "erased", entry_after
     assert entry_after["payload"] is None
     # Hash and verification are unaffected by erasure - only the erasable
@@ -244,6 +259,10 @@ def test_present_then_erased_via_delete_content():
     assert entry_after["input_sha256"] == entry["input_sha256"]
     assert entry_after["outcome_type"] == entry["outcome_type"]
     assert entry_after["verification"]["state"] == entry["verification"]["state"]
+    # And the states being compared are real ones. Without this, a future
+    # change that quietly re-deferred these two reads would restore the
+    # vacuous comparison with no test noticing.
+    assert entry["verification"]["state"] == "verified", entry["verification"]
 
 
 # ---------------------------------------------------------------------------
