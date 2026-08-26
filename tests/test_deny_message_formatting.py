@@ -74,15 +74,7 @@ os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/evaluat
 query_opa_policy = _load_decision_service_main().query_opa_policy
 
 
-def _opa_reachable() -> bool:
-    try:
-        httpx.get("http://localhost:8181/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_opa = pytest.mark.skipif(not _opa_reachable(), reason="OPA not reachable at localhost:8181")
+requires_opa = pytest.mark.needs_stack("opa")
 
 
 @requires_opa

@@ -50,7 +50,7 @@ Most of the gaps found in Phase 0 review traced back to criteria written loosely
 
 ## 3. Standing rules for build sessions
 
-- No design changes. If a criterion cannot be met without altering architecture, adding a dependency, or changing a schema: stop and escalate. Escalation is a successful outcome. A criterion met by quietly redesigning is a failure even if tests pass.
+- No design changes. If a criterion cannot be met without altering architecture, adding a dependency, or changing a schema: stop and escalate. Escalation is a successful outcome. A criterion met by quietly redesigning is a failure even if tests pass. Escalation is not the only route back to the architect: section 5 covers an item that can be built and should not be, which is a challenge raised before building rather than an escalation during it.
 - Never widen or weaken an assertion to make a test pass. If collecting or narrowing a test reveals it fails, report it and leave it failing.
 - Report format is fixed. "Could not verify" and "worked around" are mandatory and are not optional if empty; state that they are empty only if true.
 - Comments explain why, not what. No change-history narration. No em dashes, code or prose.
@@ -78,7 +78,7 @@ Most of the gaps found in Phase 0 review traced back to criteria written loosely
 
 Every instruction states an Objective: what the phase is for, in terms of the roadmap's definition of done (`docs/plan/ail-roadmap.md` §4), separate from its items. The items are a proposed mechanism for reaching it.
 
-The build session is authorized, and expected, to challenge the instruction where an item does not serve the stated objective, where the objective is better served another way, or where the Claim an item would produce describes a goal rather than a behaviour. Challenging is not scope creep and does not require the item to be impossible. Raise it before building, not in the report.
+The build session is authorized, and expected, to challenge the instruction where an item does not serve the stated objective, where the objective is better served another way, or where the Claim an item would produce describes a goal rather than a behaviour. Challenging is not scope creep and does not require the item to be impossible. Raise it before building, not in the report. This is a different route from section 3's escalation, which is for a criterion that cannot be met at all. Impossibility is not the threshold here; not serving the objective is.
 
 Where an instruction is underspecified, ask rather than assume. An assumption that turns out wrong costs a phase; a question costs a message.
 

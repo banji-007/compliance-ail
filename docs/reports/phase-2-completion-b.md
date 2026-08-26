@@ -132,3 +132,51 @@ No row cites enforcement that is absent or skipped in CI without saying so. `env
 ## 6. CI run id
 
 PR #8, `integration-tests` job: **pass, 2m49s** - https://github.com/banji-007/compliance-ail/actions/runs/32479446452/job/96762480310
+
+---
+
+## 7. Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over section 3's corrected delta mapping. The
+table carries 2 rows. **Neither fails either check.** Both cite a test that
+resolves to a collected function: `tests/test_envoy_config_boundary.py` and
+`tests/test_dashboard_state_rendering.py`.
+
+**The clean result on row 1 is a false negative, and it is recorded here
+rather than left to look like a pass.** Row 1's Claim is "Retargeted cluster;
+45s route timeout" and its Maps to column cites
+"Live transcript (`docs/reports/phase-2.md` §2)". Section 2 of that report was
+read directly this pass and contains no Envoy cluster or route-timeout
+transcript at all; `45s`, `cluster` and `504` appear in that file only inside
+its own mapping row and inside the errata quoting it. The row carries the same
+species of defect Phase 3b's row 38 carried, and unlike this pass's other
+class (b) findings it is a substantive claim, not a meta-claim.
+
+The check misses it because the term rule measures a term's rarity inside the
+document cited, and the document cited is a report that contains the mapping
+row being checked. `cluster` occurs in three of `docs/reports/phase-2.md`'s
+sections, every one of them discussing this row, so it reads as common
+vocabulary and is discarded. The self-reference is stated in
+`docs/adr/0013-mapping-table-self-check.md` under Consequences.
+
+**It is a citation defect rather than a false claim**, so it is filed as an
+erratum rather than escalated: `envoy/envoy.yaml:43` carries `timeout: 45s`
+and
+`tests/test_envoy_config_boundary.py::test_every_network_cluster_targets_only_the_decision_service`
+is collected and asserts the retargeting. Nothing asserted is untrue; what
+does not exist is the transcript the row names as its live evidence.
+
+Coverage: 1 row cites a document section and it yields no load-bearing term,
+so class (b) is decisive on no row here. Nothing is unchecked at the shape
+level.
+
+This table is the delta only. The full table it amends is
+`docs/reports/phase-2.md` section 3, which carries its own erratum from this
+pass, including the same finding against its row 15.
+
+Nothing from this table is entered in
+`docs/reports/mapping-check-baseline.json`, because the check reports no
+failure. The row-1 gap is recorded here and in `docs/reports/phase-3c1.md`.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.

@@ -1,0 +1,156 @@
+{
+  "pins": [
+    {
+      "key": "docs/reports/phase-1-3-complete.md#1#readME.md#5",
+      "report": "docs/reports/phase-1-3-complete.md",
+      "row": 1,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-1-3-complete.md#4#readME.md#5",
+      "report": "docs/reports/phase-1-3-complete.md",
+      "row": 4,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-1-3-complete.md#17#readME.md#5",
+      "report": "docs/reports/phase-1-3-complete.md",
+      "row": 17,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Prompt Injection - Structurally Constrained"
+    },
+    {
+      "key": "docs/reports/phase-1-3-complete.md#18#readME.md#5",
+      "report": "docs/reports/phase-1-3-complete.md",
+      "row": 18,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-1-3.md#2#readME.md#5",
+      "report": "docs/reports/phase-1-3.md",
+      "row": 2,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-1-3.md#5#readME.md#5",
+      "report": "docs/reports/phase-1-3.md",
+      "row": 5,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-1-3.md#11#readME.md#5",
+      "report": "docs/reports/phase-1-3.md",
+      "row": 11,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-1-3.md#18#readME.md#5",
+      "report": "docs/reports/phase-1-3.md",
+      "row": 18,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Prompt Injection - Structurally Constrained"
+    },
+    {
+      "key": "docs/reports/phase-1-3.md#20#readME.md#5",
+      "report": "docs/reports/phase-1-3.md",
+      "row": 20,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Infrastructure Failure - Fail-Closed"
+    },
+    {
+      "key": "docs/reports/phase-1-3.md#21#readME.md#5",
+      "report": "docs/reports/phase-1-3.md",
+      "row": 21,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-2.md#6#readME.md#5",
+      "report": "docs/reports/phase-2.md",
+      "row": 6,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3a.md#14#readME.md#5",
+      "report": "docs/reports/phase-3a.md",
+      "row": 14,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3a.md#15#readME.md#5",
+      "report": "docs/reports/phase-3a.md",
+      "row": 15,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3a.md#16#readME.md#5",
+      "report": "docs/reports/phase-3a.md",
+      "row": 16,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3b.md#35#readME.md#5",
+      "report": "docs/reports/phase-3b.md",
+      "row": 35,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3b.md#36#readME.md#5",
+      "report": "docs/reports/phase-3b.md",
+      "row": 36,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3b.md#37#readME.md#5",
+      "report": "docs/reports/phase-3b.md",
+      "row": 37,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3b.md#38#readME.md#5",
+      "report": "docs/reports/phase-3b.md",
+      "row": 38,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    },
+    {
+      "key": "docs/reports/phase-3b.md#39#readME.md#5",
+      "report": "docs/reports/phase-3b.md",
+      "row": 39,
+      "doc": "readME.md",
+      "section": "5",
+      "title": "Residual Limits (Mixed Profile, Since Phase 2)"
+    }
+  ]
+}

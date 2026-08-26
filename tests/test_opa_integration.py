@@ -74,33 +74,9 @@ def _decide(tool_name, tool_args, agent_id="test_opa_agent") -> dict:
 # Infrastructure availability helpers
 # ---------------------------------------------------------------------------
 
-def _opa_reachable() -> bool:
-    try:
-        httpx.get("http://localhost:8181/health", timeout=2)
-        return True
-    except Exception:
-        return False
+requires_opa = pytest.mark.needs_stack("opa")
 
-
-def _immudb_reachable() -> bool:
-    immudb_url = os.getenv("IMMUDB_URL", "http://localhost:8080")
-    try:
-        # Any HTTP response (even 401) means the REST API is up.
-        httpx.get(immudb_url, timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_opa = pytest.mark.skipif(
-    not _opa_reachable(),
-    reason="OPA not reachable at localhost:8181",
-)
-
-requires_opa_and_immudb = pytest.mark.skipif(
-    not (_opa_reachable() and _immudb_reachable()),
-    reason="OPA (localhost:8181) and/or ImmuDB (IMMUDB_URL) not reachable",
-)
+requires_opa_and_immudb = pytest.mark.needs_stack("opa", "immudb")
 
 
 # ---------------------------------------------------------------------------

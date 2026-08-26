@@ -77,15 +77,7 @@ _APPROVED_ARGS = {
 }
 
 
-def _opa_reachable() -> bool:
-    try:
-        httpx.get(f"{OPA_BASE}/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_opa = pytest.mark.skipif(not _opa_reachable(), reason="OPA not reachable")
+requires_opa = pytest.mark.needs_stack("opa")
 
 
 def _real_revision() -> str:

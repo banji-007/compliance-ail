@@ -426,3 +426,88 @@ CI run id: **32271095759**, conclusion: **success**.
 - ~~`docs/adr/0002-fastapi-immudb-proxy.md`'s Decision and Consequences sections describe `/audit`'s response shape as a single `verified: true|false` boolean~~ - **resolved in `p13-merge`, item 1**: rewritten to describe the current five-state `verification` object, `payload_state`, `profile`, and `record_type`. See `docs/reports/p13-merge.md`.
 - Whether every historical commit between the incidents `cleanup-p13-b`'s dangling-reference test cites and now was itself clean - that test only guards the current and future state (inherited limitation, restated from `docs/reports/cleanup-p13-b.md` section 6, not re-investigated this run).
 - A second physical machine or a genuine WSL2 user distribution for V2's off-host reachability - same gap the red-team itself disclosed as untestable in this environment (`docs/reports/phase-1-3-redteam.md`, section 5); not re-attempted since R1's fix (removing the publish) makes the vantage point moot for the deployment compose specifically.
+
+---
+
+## Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over section 9's R8 mapping table. The table
+carries 38 rows. **One fails class (b)**, the support check. None fails class
+(a).
+
+- **Row 15**, Location "README §4.6, service endpoint table", Claim
+  "**Corrected this pass (R1)** - Control Plane API and OPA rows removed (no
+  longer published); replacement commands given and verified live". Class (b).
+  Section 4.6 of `readME.md` carries none of the claim's load-bearing terms;
+  the rule selects `given` and `replacement`.
+
+**Citation defect, not a false claim.** Section 4.6 was read directly. Its
+endpoint table lists only the CISO Control Plane, Grafana and Prometheus, so
+the Control Plane API and OPA rows are indeed gone, and the section does give
+replacement commands (`docker compose exec ail-control-plane python -c ...`
+for OPA, and a sibling command for the control plane, from a container on
+`backend`). Everything the row claims is true of the section it cites. The row
+fails because its Claim column describes the edit that was made rather than
+the state that resulted, and `replacement` and `given` are the report's own
+words for that edit.
+
+Coverage: 25 of this table's 38 rows cite a document section and 17 of those
+yield no load-bearing term, so class (b) is decisive on 8 rows. Twelve rows
+name nothing mechanically checkable, the highest count of any table in
+`docs/reports/`, which is consistent with this table's own stated methodology
+of mapping some claims to "Reproducible commands, unchanged" as prose.
+
+The row is not corrected here. It is entered in
+`docs/reports/mapping-check-baseline.json` and asserted by
+`tests/test_mapping_tables.py`.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.
+
+---
+
+## Erratum, 2026-08-26 (added by the Phase 3c-1 completion pass, `p3c1-complete`)
+
+Red team `rt-p3c1-a` read the claim and the cited backing for every row of
+this table that neither check could decide. It found one defect, in two rows,
+and neither check reports it.
+
+- **Row 14**, Location "README §4.5, bundle-load confirmation step", Maps to
+  "Verified live in section 2 above".
+- **Row 15**, Location "README §4.6, service endpoint table", Claim
+  "replacement commands given and verified live", Maps to "Same as §4.5",
+  which resolves to the same section 2.
+
+**Section 2 of this report does not contain that verification.** It is R1's
+port-binding evidence: it demonstrates that OPA's port is no longer published,
+which is what broke the `curl localhost:8181` step, and it does not run the
+compose-network command that replaced it. The only occurrence of `docker
+compose exec` anywhere in this report is inside the erratum above, which
+quotes the README. Section 2's own escalation note says the affordance "is
+fixed in documentation (section 5 below)", and section 5 of this report is R4,
+`GET /bundles/{tenant_id}` requires a credential, while section 6 is R5, whose
+subsections cover four other statements. Neither carries the section 4.5 or
+4.6 edit.
+
+**Citation defect, not a false claim.** What the rows say about `readME.md` is
+true and was re-checked: section 4.6's endpoint table lists only the CISO
+Control Plane, Grafana and Prometheus, and section 4.5 gives the replacement
+command. What is unsupported is "verified live", for which the cited section
+carries no transcript. Whether the command was run during that pass cannot be
+established from this tree either way, so this is filed as an erratum rather
+than escalated.
+
+**Why neither check reports it.** Both rows cite this report's own section 2.
+An unqualified section marker names no document and is deliberately not parsed
+as a citation, so class (b) never looks at it; row 14 names nothing
+mechanically checkable at all, and row 15's class (b) failure is against
+`readME.md` section 4.6 on different terms. This is the report-internal
+citation shape recorded as out of reach in
+`docs/adr/0013-mapping-table-self-check.md` (D28) and in `readME.md` section 5.
+It is deliberately not in `docs/reports/mapping-check-baseline.json`: a
+baseline records what the check reports, not what a person found.
+
+The rows are not corrected here.
+
+See `docs/reports/phase-3c1-redteam.md` (Z1) and
+`docs/reports/phase-3c1-complete.md`.

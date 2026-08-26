@@ -215,19 +215,7 @@ class TestMiddlewareRoutingFailClosed:
 # ===========================================================================
 
 
-def _opa_reachable() -> bool:
-    """Return True if OPA is responding at localhost:8181."""
-    try:
-        httpx.get("http://localhost:8181/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_opa = pytest.mark.skipif(
-    not _opa_reachable(),
-    reason="OPA not reachable at localhost:8181 — skipping OPA integration tests",
-)
+requires_opa = pytest.mark.needs_stack("opa")
 
 
 @requires_opa

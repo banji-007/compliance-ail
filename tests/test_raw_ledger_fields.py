@@ -35,26 +35,7 @@ IMMUDB_USER = os.getenv("IMMUDB_USER", "immudb")
 IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD", "immudb")
 
 
-def _opa_reachable() -> bool:
-    try:
-        httpx.get("http://localhost:8181/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-def _immudb_reachable() -> bool:
-    try:
-        httpx.get(IMMUDB_URL, timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-requires_stack = pytest.mark.skipif(
-    not (_opa_reachable() and _immudb_reachable()),
-    reason="OPA and/or ImmuDB not reachable",
-)
+requires_stack = pytest.mark.needs_stack("opa", "immudb", "verifier", "control_plane", "decision_service")
 
 
 def b64(s: str) -> str:

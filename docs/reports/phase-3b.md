@@ -643,3 +643,67 @@ not running`, which reads as a broken erasure path rather than as a
 mismatched project name. CI is unaffected: it runs `make test-integration`
 from the repository root with no `-p`, so the default and the actual project
 are the same string.
+
+---
+
+## Erratum, 2026-08-25 (added by Phase 3c-1, `p3c1-mapping`, item P3c1-3)
+
+`tools/mapping_check.py` was run over this report's Claim mapping. The table
+carries 39 rows. **Three fail class (a)**, the shape check: the Kind column
+declares a backing kind that the Backed by column does not name. None fails
+class (b), the support check.
+
+The rows are not corrected here. This project corrects a shipped report with a
+dated erratum rather than by editing the original claim away, and each of the
+three is a **citation defect**, not a false claim: the backing each row
+describes does exist, and is named elsewhere in this report. What the row does
+not do is name it in a form anything can follow.
+
+- **Row 2**, "The signature is inside the record, so the inclusion proof
+  covers it". Kind `command, marked: no test covers this`. Class (a). The
+  Backed by column describes byte sweep pass 3 in prose and never gives the
+  command, which is `python tools/bundle_byte_sweep.py`, transcribed in this
+  report's own Byte sweep section and re-run in
+  `docs/reports/phase-3b-verify.md` section B3. This row was already corrected
+  once, by that verification pass, which changed its Kind from `test + command`
+  to the current text after finding no test behind the `test` half. Run against
+  the pre-fix tree at `ab2a678` the checker reports this row failing class (a)
+  twice, once per declared kind, which is the same finding B3 reached by hand.
+
+- **Row 38**, "The arbitrary-pair capability rests on a library seam". Kind
+  `Residual Limits + test`. Class (a). The Backed by column says "(and the
+  test above)" instead of naming the test. The test exists and is row 33's:
+  `test_the_proof_source_still_comes_from_the_injected_root_service`.
+
+- **Row 39**, "`external_anchor.state` can be downgraded to `not_anchored`
+  undetectably". Kind `Residual Limits + command`. Class (a). Same defect as
+  row 2: byte sweep pass 3 is named in prose, the command is not given.
+
+**Row 39 is the row Phase 3b's red team refuted as Y5 and Y8**, and what the
+two checks now say about it is worth recording. Its class (b) defect was fixed
+by the verification pass, which added the downgrade disclosure to `readME.md`'s
+Residual Limits subsection; the support check passes it against the committed
+tree. Run against `ab2a678`, the commit before that fix, the same check fails
+the same row by name:
+
+```
+docs/reports/phase-3b.md row 38 [class b]: readME.md section 5 / Residual
+  Limits (Mixed Profile, Since Phase 2) contains none of the claim's
+  distinctive terms (external_anchor, not_anchor)
+```
+
+Row 38 rather than 39 in that tree, because the verification pass later
+inserted the `/anchors` credential-split row above it. The class (a) defect
+recorded above was found by no previous pass.
+
+Coverage, so the class (b) clean result is not read as more than it is: 5 of
+this table's 39 rows cite a document section, 2 of those yield no load-bearing
+term under the term rule, so class (b) is decisive on 3 rows. One row names
+nothing mechanically checkable. This table is the most test-backed of the
+seven and the least exposed to class (b) as a result.
+
+All three failures are entered in `docs/reports/mapping-check-baseline.json`
+and asserted by `tests/test_mapping_tables.py`.
+
+See `docs/adr/0013-mapping-table-self-check.md` and
+`docs/reports/phase-3c1.md`.
