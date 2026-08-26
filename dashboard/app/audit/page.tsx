@@ -112,23 +112,41 @@ export default function AuditPage() {
         </div>
       )}
 
-      {/* Summary stats */}
+      {/* Summary stats.
+
+          P3c3a-1 (Phase 3c-3a): every label states its own scope, because
+          the four numbers do not share one. "Total Decisions" is the
+          ledger's own count of decision records (data.total, measured by
+          the control plane against ImmuDB). The other three are counted
+          here, in the browser, from the rows in this page - so they are
+          page numbers and say so.
+
+          Why they are not all ledger-scoped. outcome_type lives inside the
+          record's value, not in its key, so ImmuDB's prefix count cannot
+          see it; the only way to count approvals ledger-wide today is to
+          read every record, which is the unbounded cost this phase is
+          bounding rather than adding to. A maintained per-outcome counter
+          would change that, and is deferred.
+
+          What was wrong before: all four were computed from data.entries
+          and none said so, so four numbers that described one page read as
+          if they described the ledger. */}
       {data && (
         <div className="grid grid-cols-4 gap-4">
           <StatCard
-            label="Total Decisions"
+            label="Total Decisions (ledger)"
             value={data.total}
             color="text-foreground"
           />
           <StatCard
-            label="Approved"
+            label="Approved (this page)"
             value={
               data.entries.filter((e) => e.outcome_type === "policy_allow").length
             }
             color="text-emerald-600"
           />
           <StatCard
-            label="Denied"
+            label="Denied (this page)"
             value={
               data.entries.filter(
                 (e) => e.outcome_type === "policy_deny" || e.outcome_type === "schema_deny"
@@ -137,18 +155,38 @@ export default function AuditPage() {
             color="text-red-600"
           />
           <StatCard
-            label="Faults"
+            label="Faults (this page)"
             value={data.entries.filter((e) => e.outcome_type === "fault").length}
             color="text-violet-600"
           />
         </div>
       )}
 
+      {/* P3c3a-2: the page says when it is not the whole ledger. Worded
+          without any recency claim, because there is none to make - this
+          page is in ImmuDB key order, which for tool_call: keys is
+          lexicographic agent-id order, not time order (Phase 3c-3b). */}
+      {data && data.has_more && (
+        <div className="rounded-md border border-border bg-muted/40 px-4 py-3 text-xs text-muted-foreground">
+          Showing {data.entries.length.toLocaleString()} of{" "}
+          {data.total.toLocaleString()} decision records. More records exist
+          behind this page. Rows are ordered by ledger key, not by time, so
+          this page is not the most recent activity.
+        </div>
+      )}
+
       {/* Table */}
       {data && <AuditTable entries={data.entries} />}
 
-      {/* Empty state after load */}
-      {data && data.total === 0 && (
+      {/* Empty state after load.
+
+          P3c3a-1: keyed off the rendered rows, not data.total. total is now
+          the ledger's count of decision records and excludes the
+          synthesized rows for orphaned write-ahead intents (D16), so a
+          ledger holding only those has total === 0 while the table below
+          renders. Keying this on total would have printed "No ledger
+          entries yet" directly above them. */}
+      {data && data.entries.length === 0 && (
         <div className="flex flex-col items-center gap-3 py-20 text-center text-muted-foreground">
           <ShieldAlert className="h-10 w-10 opacity-30" />
           <p className="text-sm font-medium">No ledger entries yet.</p>

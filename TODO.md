@@ -9,6 +9,13 @@ Items explicitly deferred from the hardening sprints. One item is blocking, in t
 ### `GET /audit` returns the wrong records once the ledger exceeds `limit`
 `desc: true` sorts by key, `tool_call:` keys lead with `agent_id`, so a page returns the lexicographically-largest agent ids rather than the newest decisions, and a record written seconds ago can be absent once the ledger exceeds `limit`. Observed during `p3c2-defer` at 211 entries: the newest transaction was 573 and the page's first row was not it (`docs/reports/phase-3c2.md`).
 
+**Still open. This is the ordering half, and it is Phase 3c-3b's.** Two other halves of this entry closed in Phase 3c-3a (`docs/reports/phase-3c3a.md`) and are recorded here so the remainder is not read as larger than it is:
+
+- *The page no longer reports numbers it did not measure.* `total` is the ledger's own count of `tool_call:` keys rather than the page's length, `has_more` states whether records exist behind the page, and each of the four dashboard stat cards is labelled with the scope it is actually computed at. None of that changes which records a page returns, which is what this entry is about.
+- *A tombstone can no longer be hidden from the record it belongs to by an unrelated limit.* The `content_erasure:` join is an exact keyed lookup on the page's own `call_id`s, not a bounded prefix scan.
+
+What remains is exactly the ordering: the page is still served in ImmuDB key order, so it is not the most recent activity, and `has_more` is deliberately worded to claim only that more records exist behind this page - never that more recent ones do. No cursor was introduced in 3c-3a, on purpose: a cursor is a position in an ordering, and this entry is the decision to replace that ordering.
+
 ---
 
 ## Deferred (v1.1.0)
