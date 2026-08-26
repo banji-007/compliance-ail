@@ -590,4 +590,31 @@ All confirmed false, individually, each derived rather than asserted.
 
 ## CI
 
-CI_RUN_ID
+Run **32973956756** (`Integration Tests`), on `4bc0ae6`, PR #12:
+
+```
+================= 322 passed, 9 skipped, 4 warnings in 43.01s ==================
+```
+
+Green, with no failures. The 14 that fail on this host all pass there: CI
+installs `sigstore==4.5.0` from `requirements-test.txt`, which cannot be
+installed into this machine's Python without breaking `spiffe==0.2.5`'s
+`cryptography<47` pin.
+
+Local, for comparison, on a ledger reset the way `make test-integration` and CI
+both reset it:
+
+| | Baseline at `404d1a2` | After |
+| :--- | ---: | ---: |
+| passed | 290 | 308 |
+| failed | 14 | 14 |
+| skipped | 9 | 9 |
+
+The same 14 either side, all `No module named 'sigstore'`. The 18 added are
+`tests/test_deferred_verification.py`.
+
+CI also runs in 43 seconds against a fresh ledger, where this host takes 13
+minutes against an accumulated one. That gap is the reason the key-ordering
+finding above went unnoticed until now: CI never builds a ledger large enough
+for `limit` to start excluding records, so nothing in the pipeline has ever
+exercised the case.
