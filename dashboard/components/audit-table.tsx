@@ -1,13 +1,24 @@
 "use client";
 
-import { useState, useMemo } from "react";
-import { Search, ShieldCheck, ShieldAlert, ShieldQuestion, CircleDashed, HelpCircle } from "lucide-react";
+import { Fragment, useState, useMemo } from "react";
+import {
+  Search,
+  ShieldCheck,
+  ShieldAlert,
+  ShieldQuestion,
+  CircleDashed,
+  HelpCircle,
+  ChevronRight,
+  ChevronDown,
+  Loader2,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import type { BadgeProps } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { formatTimestamp } from "@/lib/utils";
-import type { AuditEntry, OutcomeType } from "@/lib/types";
+import { fetchRecordVerification } from "@/lib/api";
+import type { AuditEntry, OutcomeType, Verification } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -55,14 +66,30 @@ const PROFILE_VARIANT: Record<AuditEntry["profile"], NonNullable<BadgeProps["var
 };
 
 /**
- * Renders a badge distinguishing all four outcome_types (P1-7) — a policy
+ * P3c2-2 (Phase 3c-2): the state of this row's on-demand verification.
+ *
+ * /audit defers verification (D29), so every row arrives `asserted` and the
+ * check for one record happens when a reader expands it. "idle" is not the
+ * same thing as `asserted`: `asserted` is what the server says about the
+ * record, "idle" is what this browser has not yet asked about it.
+ */
+type CheckState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "done"; verification: Verification }
+  | { status: "error"; message: string };
+
+const IDLE: CheckState = { status: "idle" };
+
+/**
+ * Renders a badge distinguishing all four outcome_types (P1-7) - a policy
  * denial (a real compliance violation), a schema rejection (the LLM's
  * payload was malformed, never reached policy), and an infrastructure
  * fault (no decision was made at all) must never look alike. Reasons/
  * fault_class render as smaller text beneath, same as the policy revision.
  */
 function DecisionCell({ entry }: { entry: AuditEntry }) {
-  if (!entry.outcome_type) return <span className="text-muted-foreground text-xs">—</span>;
+  if (!entry.outcome_type) return <span className="text-muted-foreground text-xs">-</span>;
 
   const detail =
     entry.outcome_type === "fault"
@@ -119,15 +146,50 @@ function DecisionCell({ entry }: { entry: AuditEntry }) {
 
 /**
  * Renders one of the five verification states distinctly (P1-7, D2, D8).
- * "asserted" is deliberately the quiet, neutral one — it is not a problem,
+ * "asserted" is deliberately the quiet, neutral one - it is not a problem,
  * it means no check was attempted for this entry. "unverifiable" and
  * "failed" are both problems, but different ones: one is "we could not
  * check", the other is the actual tamper signal. "not_found" (D8, Phase
  * 1.1) is neither - no entry was ever written for this key, so there was
  * never a proof to check in the first place.
+ *
+ * D29 (Phase 3c-2): `asserted` is now what almost every row carries on a
+ * freshly loaded page, because /audit defers verification rather than
+ * running it for the whole page. `check` is this row's on-demand result
+ * once a reader has expanded it, and supersedes the deferred state when
+ * present - the row then shows what was actually checked, rather than what
+ * the page declined to check.
  */
-function VerificationCell({ entry }: { entry: AuditEntry }) {
-  const v = entry.verification;
+function VerificationCell({ entry, check }: { entry: AuditEntry; check: CheckState }) {
+  if (check.status === "loading") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+        Checking
+      </div>
+    );
+  }
+
+  if (check.status === "error") {
+    // The check did not complete, which is not the same as the record
+    // failing one. Rendered as a problem with the check, never as a
+    // verdict on the record.
+    return (
+      <div className="flex items-center gap-1.5 text-xs">
+        <ShieldQuestion className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+        <div className="flex flex-col gap-0.5">
+          <Badge variant="warning" className="w-fit">
+            CHECK FAILED
+          </Badge>
+          <span className="text-[10px] text-muted-foreground break-words leading-tight">
+            {check.message}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  const v: Verification = check.status === "done" ? check.verification : entry.verification;
 
   if (v.state === "verified") {
     return (
@@ -173,7 +235,7 @@ function VerificationCell({ entry }: { entry: AuditEntry }) {
 
   if (v.state === "not_found") {
     // Distinct from "failed" (D8): no proof was ever rejected because there
-    // was never a proof to check — a bug/race signal, not a tamper signal.
+    // was never a proof to check - a bug/race signal, not a tamper signal.
     return (
       <div className="flex items-center gap-1.5 text-xs">
         <HelpCircle className="h-3.5 w-3.5 text-amber-500 shrink-0" />
@@ -191,7 +253,10 @@ function VerificationCell({ entry }: { entry: AuditEntry }) {
     );
   }
 
-  // asserted — quiet by design: we simply did not look.
+  // asserted - quiet by design: nobody has looked at this record. Since D29
+  // that is the ordinary state of a freshly loaded page rather than an
+  // outage artifact, so the badge says what it has always said and the row
+  // beside it carries the control that changes it.
   return (
     <div className="flex items-center gap-1.5 text-xs">
       <CircleDashed className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
@@ -211,6 +276,7 @@ interface Props {
 }
 
 const COLUMNS = [
+  { key: "expand", label: "", width: "w-10" },
   { key: "timestamp", label: "Timestamp", width: "w-40" },
   { key: "agent_id", label: "Agent ID", width: "w-48" },
   { key: "tool_name", label: "Tool Name", width: "w-44" },
@@ -220,6 +286,45 @@ const COLUMNS = [
 
 export function AuditTable({ entries }: Props) {
   const [search, setSearch] = useState("");
+  // P3c2-2: which row is open, and what its on-demand check has produced.
+  // Keyed by ledger_key, the identifier the per-record route takes - not by
+  // row index, which changes under the 30s refetch.
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [checks, setChecks] = useState<Record<string, CheckState>>({});
+
+  async function runCheck(ledgerKey: string) {
+    setChecks((prev) => ({ ...prev, [ledgerKey]: { status: "loading" } }));
+    try {
+      const result = await fetchRecordVerification(ledgerKey);
+      setChecks((prev) => ({
+        ...prev,
+        [ledgerKey]: { status: "done", verification: result.verification },
+      }));
+    } catch (err) {
+      setChecks((prev) => ({
+        ...prev,
+        [ledgerKey]: { status: "error", message: (err as Error).message },
+      }));
+    }
+  }
+
+  function toggleRow(entry: AuditEntry) {
+    const ledgerKey = entry.ledger_key;
+    if (!ledgerKey) return;
+    if (expanded === ledgerKey) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(ledgerKey);
+    const current = checks[ledgerKey];
+    // Re-run a check that errored; never re-run one that answered. A
+    // verification is a statement about a committed record, so repeating it
+    // on every open buys nothing and multiplies the cost this phase exists
+    // to remove.
+    if (!current || current.status === "error") {
+      void runCheck(ledgerKey);
+    }
+  }
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -247,7 +352,7 @@ export function AuditTable({ entries }: Props) {
       <div className="relative max-w-sm">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
-          placeholder="Search agent, tool, decision, verification…"
+          placeholder="Search agent, tool, decision, verification..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="pl-9"
@@ -285,37 +390,98 @@ export function AuditTable({ entries }: Props) {
                 </td>
               </tr>
             ) : (
-              filtered.map((entry, idx) => (
-                <tr
-                  key={`${entry.tx_id}-${idx}`}
-                  className="border-b last:border-0 hover:bg-muted/30 transition-colors"
-                >
-                  <td className="px-4 py-3 text-xs text-muted-foreground whitespace-nowrap">
-                    {formatTimestamp(entry.timestamp)}
-                  </td>
-                  <td className="px-4 py-3 font-mono text-xs max-w-[12rem] truncate">
-                    {entry.agent_id ?? "—"}
-                  </td>
-                  <td className="px-4 py-3 font-medium text-xs">
-                    {entry.tool_name ?? "—"}
-                  </td>
-                  <td className="px-4 py-3 max-w-[14rem]">
-                    <DecisionCell entry={entry} />
-                  </td>
-                  <td className="px-4 py-3">
-                    <VerificationCell entry={entry} />
-                  </td>
-                </tr>
-              ))
+              filtered.map((entry, idx) => {
+                const ledgerKey = entry.ledger_key;
+                const isOpen = ledgerKey != null && expanded === ledgerKey;
+                const check: CheckState = ledgerKey ? checks[ledgerKey] ?? IDLE : IDLE;
+                return (
+                  <Fragment key={`${entry.tx_id}-${idx}`}>
+                    <tr className="border-b last:border-0 hover:bg-muted/30 transition-colors">
+                      <td className="px-2 py-3">
+                        {/* P3c2-2: the expand affordance. Verification is
+                            deferred (D29), so this is what actually asks
+                            for one record to be checked. */}
+                        <button
+                          type="button"
+                          onClick={() => toggleRow(entry)}
+                          disabled={!ledgerKey}
+                          aria-expanded={isOpen}
+                          aria-label={isOpen ? "Collapse record" : "Expand and verify record"}
+                          className="rounded p-1 text-muted-foreground hover:bg-muted disabled:opacity-30"
+                        >
+                          {isOpen ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
+                          )}
+                        </button>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-muted-foreground whitespace-nowrap">
+                        {formatTimestamp(entry.timestamp)}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-xs max-w-[12rem] truncate">
+                        {entry.agent_id ?? "-"}
+                      </td>
+                      <td className="px-4 py-3 font-medium text-xs">
+                        {entry.tool_name ?? "-"}
+                      </td>
+                      <td className="px-4 py-3 max-w-[14rem]">
+                        <DecisionCell entry={entry} />
+                      </td>
+                      <td className="px-4 py-3">
+                        <VerificationCell entry={entry} check={check} />
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr className="border-b bg-muted/20">
+                        <td colSpan={COLUMNS.length} className="px-4 py-3">
+                          <div className="flex flex-col gap-1 text-xs">
+                            <span className="font-mono text-[10px] text-muted-foreground break-all">
+                              ledger_key: {ledgerKey}
+                            </span>
+                            {check.status === "done" && (
+                              <>
+                                <span className="text-muted-foreground">
+                                  state: {check.verification.state}
+                                  {check.verification.state_id != null
+                                    ? ` (ledger state ${check.verification.state_id})`
+                                    : ""}
+                                </span>
+                                {check.verification.detail && (
+                                  <span className="text-muted-foreground break-words">
+                                    {check.verification.detail}
+                                  </span>
+                                )}
+                              </>
+                            )}
+                            {check.status === "loading" && (
+                              <span className="text-muted-foreground">
+                                Asking the verifier for this record.
+                              </span>
+                            )}
+                            {check.status === "error" && (
+                              <span className="text-amber-600 dark:text-amber-400 break-words">
+                                {check.message}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })
             )}
           </tbody>
         </table>
       </div>
 
       <p className="text-xs text-muted-foreground">
-        Showing {filtered.length} of {entries.length} ledger entries — newest
+        Showing {filtered.length} of {entries.length} ledger entries, newest
         first. Verification is a cryptographic inclusion/consistency proof
-        check against ImmuDB's signed state, performed server-side per entry.
+        check against ImmuDB&apos;s signed state, performed server-side for one
+        record at a time when you expand it (D29). A page that has not been
+        expanded has checked nothing, which is what NOT CHECKED means.
       </p>
     </div>
   );

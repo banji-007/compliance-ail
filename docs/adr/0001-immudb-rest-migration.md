@@ -91,9 +91,16 @@ state volume so the new root is accepted on the next startup.
   tool call is DENIED.
 - `PersistentRootService` uses pickle and is not safe for concurrent access
   across multiple uvicorn workers. The verifier runs with `--workers 1`.
-- Per-entry `verifiedGet` on `/audit` is O(n) SDK calls. At the default limit
-  of 100 entries this is acceptable; consider lazy verification (verify on
-  expand) if audit pages grow large.
+- Per-entry `verifiedGet` on `/audit` was O(min(limit, ledger)) SDK calls,
+  not O(n) against the whole ledger, and the "default limit of 100 entries"
+  this bullet called acceptable was a limit no caller ever sent: the
+  dashboard has always requested the full page size on a 30-second poll
+  (`dashboard/app/api/audit/route.ts`), so the measured cost was one verifier
+  round trip per row on the page, twice a minute, per open tab. Phase 3c-2
+  took the lazy verification this bullet proposed (D29,
+  `docs/adr/0006-verification-states.md`): the default page defers, and one
+  record is checked when a reader expands it. `?verify=true` still costs the
+  full per-record scan, by request.
 - **Backlog:** Signing-key rotation requires deleting the verifier state volume.
   The verifier currently does not detect a mismatch between the mounted public
   key and the public key embedded in the loaded `PersistentRootService` state;

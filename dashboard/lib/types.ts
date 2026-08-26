@@ -106,6 +106,15 @@ export interface Verification {
 
 export interface AuditEntry {
   tx_id: number;
+  /**
+   * Base64 raw ImmuDB key for this record (P3a-2). The identifier
+   * GET /audit/bundle takes, and - since D29 (Phase 3c-2) - the one
+   * GET /audit/verify takes when a reader expands a row to check it. The key
+   * carries a random uuid, so it cannot be derived from call_id; a row
+   * without one cannot be verified on demand and its expand control is
+   * disabled.
+   */
+  ledger_key: string | null;
   /** Minted at intercept, independent of ImmuDB's tx numbering (D7). The key
    *  GDPR erasure targets: DELETE /content/{call_id}. */
   call_id: string | null;
@@ -201,4 +210,28 @@ export interface AuditEntry {
 export interface AuditResponse {
   entries: AuditEntry[];
   total: number;
+  /**
+   * D29 (Phase 3c-2): whether the verifier answered a health check at the
+   * moment this response was produced.
+   *
+   * Why it exists. /audit defers verification, so a default page attempts
+   * nothing and no row can come back "unverifiable" - which is what used to
+   * make an outage visible. Without this field a stopped verifier renders
+   * exactly like a healthy one that simply did not look.
+   *
+   * What it does not mean. Not that these rows would verify. The probe and a
+   * later expand are separate calls at separate times, and a probe that
+   * succeeds can be followed by an expand that fails. See
+   * docs/adr/0006-verification-states.md.
+   */
+  verifier_reachable: boolean;
+}
+
+/**
+ * The body of GET /audit/verify?key= (P3c2-1): one record's verification,
+ * checked on demand, in the same object shape /audit puts on every row.
+ */
+export interface RecordVerification {
+  key: string;
+  verification: Verification;
 }

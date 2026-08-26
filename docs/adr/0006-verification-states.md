@@ -101,6 +101,77 @@ write path stays binary and fail-closed - `verifiedSet` passes or the call
 denies (see `docs/adr/0005-outcome-taxonomy.md`'s `verifier_unreachable`
 fault class). These five states describe a *read*, not a write.
 
+### Verification is deferred by default, and the reserved option is taken (D29, Phase 3c-2)
+
+This ADR wrote `asserted` to cover two producers and implemented one. The
+Decision section above says `asserted` "is deliberately not treated as a
+problem by itself - it also covers the case of lazy verification on an
+unexpanded row, which Phase 1 doesn't implement but doesn't want to preclude
+either." Phase 3c-2 implements it.
+
+`GET /audit` no longer verifies per record by default. Every row comes back
+`asserted`, and a reader who wants a specific record checked expands it,
+which calls `GET /audit/verify?key=` for that one record. **This is a change
+to when verification runs, not to what the states mean.** No state is added,
+none is redefined, and `asserted` covers the deferred row for the reason it
+was written to: no `verifiedGet` was attempted for this entry in producing
+this response, which is exactly true of a deferred one.
+
+**Verification stays reachable: `GET /audit?verify=true`.** Deferral is the
+default, not the only behaviour. Two things depend on this. The circuit
+breaker that produced `asserted` before this phase lives on that path, and
+under unconditional deferral it would be unreachable code, leaving the state
+this ADR describes with one producer instead of the two it names. And two
+existing assertions read a real verification state off `/audit`: without the
+parameter, `tests/test_verification.py::test_cross_process` would fail, and
+`tests/test_content_states.py`'s erasure test, which compares the state
+before an erasure to the state after it, would compare `asserted` to
+`asserted` and pass while proving nothing. A weakened assertion that goes
+red is a nuisance; one that stays green is how a phase certifies itself.
+
+**Deferral removes the only outage signal there was, so the response carries
+one field.** Before this phase an unreachable verifier left a fingerprint on
+the page: the first entry's attempt failed and rendered `unverifiable`, and
+the circuit breaker then produced the run of `asserted` rows the Constraints
+section below describes. Defer every attempt and there is no first attempt to
+fail, so nothing is `unverifiable` and an outage renders exactly like a
+healthy stack that simply did not look.
+
+`/audit` therefore reports `verifier_reachable`, from a live `GET /health`
+against the verifier on **every** path, including `?verify=true` where the
+per-record calls would also answer the question. One field, established one
+way, so it cannot mean two things depending on which path produced it. The
+cost is one round trip against the up-to-`limit` this phase removed.
+
+It is one field and not a pair. A `verification_mode` of `scanned` or
+`deferred` would re-encode a distinction this ADR already draws: all rows
+`asserted` with no `unverifiable` already means nothing was attempted. A
+redundant summary of the rows can drift out of agreement with the rows.
+
+**What `verifier_reachable` establishes, exactly.** The verifier answered a
+health check at the moment this response was produced. It does not mean these
+rows would verify. A probe that succeeds can be followed by an expand that
+fails: they are separate calls at separate times, and no field closes that
+gap. The field is named for the reachability it establishes rather than for
+the verification it does not.
+
+**`not_found` is now reachable end to end.** The third Constraints bullet
+below said `not_found` was live-testable only against `verifier/main.py`
+directly, because `/audit`'s own scan lists keys ImmuDB confirms exist and a
+key that is simultaneously scanned and never written is not constructible.
+`GET /audit/verify` takes a key from the caller rather than from a scan, so
+that case is now the ordinary one:
+`tests/test_deferred_verification.py::test_per_record_route_reports_not_found_for_an_unwritten_key`.
+
+`failed` remains the one state with no live path through this control plane.
+The two tamper tests corrupt a client-side `PersistentRootService` in the
+test process and never reach the verifier service; producing a live `failed`
+means corrupting the verifier's own persisted state and restarting it, which
+leaves the stack inconsistent for everything after it. Its enforcing test is
+therefore a mapping unit test against a fabricated verifier body, the same
+treatment `not_found` already had and the same reason `_verification_from_200`
+was extracted as a pure function.
+
 ### Bundle revision attribution is no longer caller-suppliable (D9, Phase 1.2)
 
 A related but distinct integrity gap sat next to this ADR's own subject:
@@ -157,12 +228,24 @@ mechanism T7 actually used (see `docs/reports/phase-1-1.md`'s erratum).
   `asserted` entries, not mostly `unverifiable` ones - by design, but worth
   knowing when reading a response where every entry after the first handful
   says "not checked" rather than "could not check".
-- This ADR does not implement lazy/on-expand verification; `asserted` is
-  currently only produced by the existing scan's circuit breaker, not by any
-  new deferred-check mechanism.
-- `not_found` is a live-testable state in isolation (a fabricated key
-  against `verifier/main.py::verify` directly) but not end-to-end through
-  `/audit`'s own scan+verify flow, for the structural reason above.
+- Lazy/on-expand verification **is** implemented, as of D29 (Phase 3c-2):
+  `GET /audit` defers by default, `GET /audit/verify?key=` checks one record,
+  and `asserted` now has the two producers this document always described -
+  deferral, and the scan's circuit breaker on the `?verify=true` path. This
+  bullet previously said the opposite, correctly, for every phase before
+  3c-2. Bookkeeping on which of the reserved options was taken; the five
+  states are unchanged.
+- The bullet above still describes the `?verify=true` path exactly: a large
+  scan whose verifier goes down early produces one `unverifiable` entry and a
+  run of `asserted` ones behind it. On the deferred path the distinction that
+  matters is a different one, and `verifier_reachable` carries it.
+- `not_found` is reachable end to end as of D29, through
+  `GET /audit/verify?key=` with a key that was never written
+  (`tests/test_deferred_verification.py::test_per_record_route_reports_not_found_for_an_unwritten_key`).
+  It remains unreachable through `/audit`'s own scan+verify flow, for the
+  structural reason above: that scan only ever lists keys ImmuDB confirms
+  exist. `failed` is now the one state with no live path through this control
+  plane at all - see the D29 section for why, and what stands in for it.
 
 ## References
 

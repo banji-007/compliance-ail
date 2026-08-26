@@ -47,14 +47,14 @@ The `workload-registrar` script currently runs exactly once at startup. If it ex
 
 - SPIRE `insecure_bootstrap` and `trust_domain` (`spire/agent/agent.conf`, `spire/server/server.conf`) are documented only in an inline comment, with no project-docs claim and no test (found in the Phase 2 completion pass B config sweep, `docs/reports/phase-2-completion-b.md`).
 - Vault tool round trip is ~15s (a fresh Python interpreter per call, no persistent MCP session); Envoy's route timeout was raised to 45s to accommodate it (`docs/reports/phase-2.md`).
-- Writing a new mapping row can retire a historical baseline entry by making a stem generic; instanced by `docs/reports/phase-1-3.md` row 16 during `p3c1-complete` (`docs/adr/0013-mapping-table-self-check.md`).
+- Writing a new mapping row can retire a historical baseline entry by making a stem generic; instanced by `docs/reports/phase-1-3.md` row 16 during `p3c1-complete` (`docs/adr/0013-mapping-table-self-check.md`). The same coupling runs the other way and is easier to trip: ordinary prose added to a *cited* document can make a word distinctive that was previously absent from it, which rewrites the reason string of a historical baseline entry and fails the build on a row nobody touched. Instanced during `p3c2-defer`: one word in a new README bullet changed `docs/reports/phase-3a.md` row 8's baselined reason from one selected term to two. Resolved by rewording the new prose, not by editing the quarantine record, since the row itself had not changed (`docs/reports/phase-3c2.md`).
 
 ---
 
 ## Structural Expansions (v1.1.0+)
 
-### Phase 3: `/audit` O(n) Verification Cost
-Per-entry synchronous verifier round trip on `GET /audit` is O(n) against ledger size; confirmed to time out tests at ~200 ledger entries (`docs/reports/phase-1-3-redteam.md`).
+### ~~Phase 3: `/audit` O(n) Verification Cost~~ (closed, Phase 3c-2)
+Per-entry synchronous verifier round trip on `GET /audit` was `O(min(limit, ledger))`, not O(n) against ledger size - the bound is the page size whenever the ledger is larger than it, which is the case this item was actually reporting. Confirmed to time out tests at ~200 ledger entries (`docs/reports/phase-1-3-redteam.md`). Closed by D29 (`docs/adr/0006-verification-states.md`): the default page defers verification and one record is checked on expand. `GET /audit?verify=true` still costs the full per-record scan, so the cost is opt-in rather than removed (`docs/reports/phase-3c2.md`).
 
 ### Framework Expansion (PCI-DSS, ISO 27001)
 The current gateway ships with 4 baseline policy frameworks (GDPR, SOC2, FinOps, HIPAA). To expand enterprise commercial viability, the Rego policy library needs to cover additional major compliance standards.

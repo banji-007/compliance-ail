@@ -11,6 +11,7 @@ Endpoints:
   PUT  /tenants/{tenant_id}     — update tenant config (triggers new bundle ETag)
   GET  /bundles/{tenant_id}     — OPA Bundle API (ETag-aware)
   GET  /audit                   — proxy to ImmuDB; returns decoded ledger entries
+  GET  /audit/verify            - one record's verification, on demand (D29)
   GET  /audit/bundle            - one record's portable evidence bundle (D19)
   POST /anchors                 - record an externally anchored checkpoint (D23)
   GET  /anchors/latest          - the newest anchored checkpoint, if any (D23)
@@ -574,6 +575,110 @@ def _verification_from_200(vdata: dict) -> dict:
     }
 
 
+# D29 (Phase 3c-2). Three helpers the deferred-verification path is built
+# from: how long one /verify is given, one round trip mapped to a state, the
+# state a deferred row carries, and the health probe behind
+# verifier_reachable.
+_VERIFIER_VERIFY_TIMEOUT = 10.0
+_VERIFIER_HEALTH_TIMEOUT = 5.0
+
+
+def _verify_one_key(encoded_key: str) -> tuple[dict, bool]:
+    """
+    One /verify round trip against the verifier, mapped to a verification
+    object.
+
+    Returns (verification, transport_ok). transport_ok is False only when the
+    call itself could not be made - the condition get_audit's circuit breaker
+    trips on, so that a scan whose verifier has died stops attempting the
+    rest. A non-200 from a verifier that answered is "unverifiable" with
+    transport_ok True: it answered, it just did not answer with a proof, and
+    the next entry deserves its own attempt.
+
+    Extracted so get_audit's scan loop, its intent-record loop, and
+    GET /audit/verify all make the same call and map it the same way, rather
+    than three copies that can drift - the same reasoning that extracted
+    _verification_from_200 out of the first of them (D2).
+    """
+    try:
+        with httpx.Client(timeout=_VERIFIER_VERIFY_TIMEOUT) as vc:
+            vr = vc.post(
+                f"{VERIFIER_URL}/verify",
+                json={"key": encoded_key},
+                headers={"X-API-Key": _VERIFIER_READ_KEY},
+            )
+    except Exception as vexc:
+        logger.error("Verifier unreachable during verification: %s", vexc)
+        return {
+            "state": "unverifiable",
+            "state_id": None,
+            "detail": str(vexc),
+            "error_class": None,
+        }, False
+
+    if vr.status_code == 200:
+        return _verification_from_200(vr.json()), True
+
+    logger.warning("Verifier returned HTTP %d", vr.status_code)
+    return {
+        "state": "unverifiable",
+        "state_id": None,
+        "detail": f"verifier returned HTTP {vr.status_code}",
+        "error_class": None,
+    }, True
+
+
+def _deferred_verification() -> dict:
+    """
+    The verification object a deferred row carries.
+
+    A fresh dict per row, never one shared object every entry in the response
+    aliases. `asserted` with nothing else set is the honest shape: no
+    verifiedGet was attempted, so there is no state_id to report, no detail to
+    explain, and no error_class - a deferred row must not carry anything a
+    reader could mistake for a diagnosis.
+    """
+    return {"state": "asserted", "state_id": None, "detail": None, "error_class": None}
+
+
+def _probe_verifier_reachable() -> bool:
+    """
+    Whether the verifier answered a health check, right now.
+
+    Why the probe exists at all. Before D29 an unreachable verifier left a
+    fingerprint on an /audit page: the first entry's attempt failed and
+    rendered "unverifiable", and the circuit breaker then produced a run of
+    "asserted" rows behind it. A deferred page attempts nothing, so there is
+    no first attempt to fail, nothing is "unverifiable", and an outage renders
+    exactly like a healthy stack that simply did not look. This is the field
+    that keeps those two apart.
+
+    Why it runs on every path, including ?verify=true where the per-record
+    calls would also answer the question: one field, established one way, so
+    it cannot mean two things depending on which path produced it. The cost is
+    one round trip against the up-to-`limit` D29 removed.
+
+    What it establishes, exactly: the verifier answered GET /health at the
+    moment this response was produced. It does not mean these rows would
+    verify. A probe that succeeds can be followed by an expand that fails -
+    they are separate calls at separate times, and no field closes that gap.
+    Stated here, in docs/adr/0006-verification-states.md, and in the README's
+    Residual Limits, because a boolean named for reachability invites being
+    read as a claim about the records.
+
+    Failure is False, never an exception: this is a field on a response, and a
+    page that cannot reach the verifier is exactly the page that most needs to
+    say so.
+    """
+    try:
+        with httpx.Client(timeout=_VERIFIER_HEALTH_TIMEOUT) as vc:
+            resp = vc.get(f"{VERIFIER_URL}/health")
+        return resp.status_code == 200
+    except Exception as exc:
+        logger.warning("Verifier health probe failed: %s", exc)
+        return False
+
+
 def _payload_state(content_state: str | None, content_row, has_tombstone: bool) -> tuple[str, dict | None]:
     """
     Map a ledger entry's content_state (D7), whether its CallContent row
@@ -621,20 +726,46 @@ def _payload_state(content_state: str | None, content_row, has_tombstone: bool) 
 
 
 @app.get("/audit")
-def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Session = Depends(get_db)):
+def get_audit(
+    limit: int = 100,
+    verify: bool = False,
+    _: None = Depends(_require_read_key),
+    db: Session = Depends(get_db),
+):
     """
     Return audit entries: the structured outcome record from ImmuDB, the
     read-time verification state (D2 - never self-certified by the entry),
     and the raw arguments joined from the erasable content store (D5, D7).
 
-    Scans for all tool_call: keys via REST (no SDK needed for a key listing),
-    then calls the verifier service for each key to compute verification
-    state. See docs/adr/0006-verification-states.md for why this is computed
+    Scans for all tool_call: keys via REST (no SDK needed for a key listing).
+    See docs/adr/0006-verification-states.md for why verification is computed
     here, at read time, rather than stored in the entry. payload_state is
     computed the same way, from the entry's own content_state (D7).
 
+    **Verification is deferred by default (D29, Phase 3c-2).** With
+    `verify=false`, which is the default, no verifier call is made for any
+    entry and every row comes back `asserted` - the state that has always
+    meant "no verifiedGet was attempted for this entry in producing this
+    response", which is exactly true of a deferred row. A reader who wants a
+    specific record checked calls GET /audit/verify?key= for that one record;
+    the dashboard's row-expand control does precisely that.
+
+    `verify=true` restores the pre-D29 behaviour: one verifier round trip per
+    entry, with the circuit breaker below. It is still O(min(limit, ledger))
+    round trips - **this phase makes that cost opt-in rather than removing
+    it** - and it is what the two tests that assert on a real verification
+    state through this route pass (tests/test_verification.py::
+    test_cross_process, and tests/test_content_states.py's erasure test,
+    which compares the state before an erasure to the state after it and
+    would compare "asserted" to "asserted" if this parameter did not exist).
+
     Returns:
-        {"entries": [...], "total": <int>}
+        {"entries": [...], "total": <int>, "verifier_reachable": <bool>}
+
+    verifier_reachable is a live GET /health against the verifier, run on
+    every request including verify=true - see _probe_verifier_reachable for
+    why it is probed rather than inferred, and for the narrow thing it
+    establishes.
 
     Each entry:
         tx_id, call_id, agent_id, timestamp, tool_name  - as recorded; call_id
@@ -666,7 +797,11 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
                           way the row disappeared (e.g. a direct SQL delete
                           bypassing the endpoint)
         verification   - {state, state_id, detail, error_class}; state is one
-                          of verified | failed | unverifiable | asserted | not_found
+                          of verified | failed | unverifiable | asserted |
+                          not_found. On the default (deferred) path this is
+                          always "asserted" with the other three null (D29);
+                          GET /audit/verify?key= returns this same object for
+                          one record, actually checked.
         profile        - conformance profile this record was produced under
                           (P13-8): "observed" or "mediated". See
                           docs/adr/0005-outcome-taxonomy.md.
@@ -794,6 +929,11 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             continue
 
     # --- Verify each entry via the verifier service; join content by call_id ---
+    #
+    # D29: "verify each entry" is now what verify=true asks for. The default
+    # path joins content and computes payload_state exactly as before and
+    # attempts no proof check at all.
+    verifier_reachable = _probe_verifier_reachable()
     verifier_up = True
     entries = []
     for raw in raw_entries:
@@ -803,45 +943,32 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             log_entry: dict        = json.loads(serialized_entry)
             tx_id: int             = int(raw.get("tx", 0))
 
-            if not verifier_up:
-                # A prior entry in this same scan already failed to reach the
-                # verifier - this entry was never attempted at all.
-                verification = {"state": "asserted", "state_id": None, "detail": None, "error_class": None}
+            if not verify:
+                # D29, producer 1 of "asserted": deferral. Nothing was
+                # attempted for this entry because nothing was asked for.
+                # This is the ordinary case since Phase 3c-2, not an outage
+                # artifact - verifier_reachable above is what distinguishes
+                # the two.
+                verification = _deferred_verification()
+            elif not verifier_up:
+                # D29, producer 2 of "asserted": the circuit breaker. A prior
+                # entry in this same scan already failed to reach the verifier
+                # - this entry was never attempted at all. Reachable only on
+                # the verify=true path, which is one of the reasons that path
+                # still exists.
+                verification = _deferred_verification()
             else:
-                try:
-                    with httpx.Client(timeout=10.0) as vc:
-                        vr = vc.post(
-                            f"{VERIFIER_URL}/verify",
-                            json={"key": encoded_key},
-                            headers={"X-API-Key": _VERIFIER_READ_KEY},
-                        )
-                    if vr.status_code == 200:
-                        verification = _verification_from_200(vr.json())
-                        if verification["state"] == "failed":
-                            logger.warning(
-                                "Audit: entry tx=%d failed verification: %s", tx_id, verification["detail"]
-                            )
-                        elif verification["state"] == "not_found":
-                            logger.info(
-                                "Audit: entry tx=%d has no corresponding ImmuDB write (not_found)", tx_id
-                            )
-                    else:
-                        logger.warning("Verifier returned HTTP %d for tx=%d", vr.status_code, tx_id)
-                        verification = {
-                            "state": "unverifiable",
-                            "state_id": None,
-                            "detail": f"verifier returned HTTP {vr.status_code}",
-                            "error_class": None,
-                        }
-                except Exception as vexc:
-                    logger.error("Verifier unreachable during audit: %s", vexc)
+                verification, transport_ok = _verify_one_key(encoded_key)
+                if not transport_ok:
                     verifier_up = False  # stop hammering; remaining entries become "asserted"
-                    verification = {
-                        "state": "unverifiable",
-                        "state_id": None,
-                        "detail": str(vexc),
-                        "error_class": None,
-                    }
+                elif verification["state"] == "failed":
+                    logger.warning(
+                        "Audit: entry tx=%d failed verification: %s", tx_id, verification["detail"]
+                    )
+                elif verification["state"] == "not_found":
+                    logger.info(
+                        "Audit: entry tx=%d has no corresponding ImmuDB write (not_found)", tx_id
+                    )
 
             call_id = log_entry.get("call_id")
             content_row = db.query(CallContent).filter_by(call_id=call_id).first() if call_id else None
@@ -915,25 +1042,16 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             continue
         try:
             encoded_key = intent.get("encoded_key", "")
-            try:
-                with httpx.Client(timeout=10.0) as vc:
-                    vr = vc.post(
-                        f"{VERIFIER_URL}/verify",
-                        json={"key": encoded_key},
-                        headers={"X-API-Key": _VERIFIER_READ_KEY},
-                    )
-                if vr.status_code == 200:
-                    verification = _verification_from_200(vr.json())
-                else:
-                    verification = {
-                        "state": "unverifiable", "state_id": None,
-                        "detail": f"verifier returned HTTP {vr.status_code}", "error_class": None,
-                    }
-            except Exception as vexc:
-                verification = {
-                    "state": "unverifiable", "state_id": None,
-                    "detail": str(vexc), "error_class": None,
-                }
+            if not verify:
+                # D29: a synthesized intent entry defers with the rest of the
+                # page. It is an entry in this response like any other, and a
+                # default page that verified nothing must not have verified
+                # this one either - otherwise the "no per-record verify call"
+                # property would hold only for ledgers with no orphaned
+                # intents in them, which is not a property at all.
+                verification = _deferred_verification()
+            else:
+                verification, _transport_ok = _verify_one_key(encoded_key)
 
             content_row = db.query(CallContent).filter_by(call_id=call_id).first()
             has_tombstone = call_id in tombstoned_call_ids
@@ -966,8 +1084,11 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
             continue
 
     logger.info(
-        "Audit: %d entries; verifier_up=%s by state: verified=%d failed=%d unverifiable=%d asserted=%d not_found=%d",
+        "Audit: %d entries; verify=%s verifier_reachable=%s verifier_up=%s "
+        "by state: verified=%d failed=%d unverifiable=%d asserted=%d not_found=%d",
         len(entries),
+        verify,
+        verifier_reachable,
         verifier_up,
         sum(1 for e in entries if e["verification"]["state"] == "verified"),
         sum(1 for e in entries if e["verification"]["state"] == "failed"),
@@ -975,7 +1096,59 @@ def get_audit(limit: int = 100, _: None = Depends(_require_read_key), db: Sessio
         sum(1 for e in entries if e["verification"]["state"] == "asserted"),
         sum(1 for e in entries if e["verification"]["state"] == "not_found"),
     )
-    return {"entries": entries, "total": len(entries)}
+    return {"entries": entries, "total": len(entries), "verifier_reachable": verifier_reachable}
+
+
+@app.get("/audit/verify")
+def verify_audit_record(key: str, _: None = Depends(_require_read_key)):
+    """
+    Verify one record on demand (P3c2-1, D29).
+
+    `key` is the base64-encoded raw ImmuDB key - exactly the identifier
+    GET /audit reports as `ledger_key` for every entry, exactly what
+    GET /audit/bundle takes, and exactly what the verifier's own /verify
+    takes. Following that precedent rather than inventing an identifier is
+    what makes this work uniformly for every record shape this project
+    writes, with no per-type branch to get wrong for one of them.
+
+    Authorization is Depends(_require_read_key), the same read-scoped
+    credential GET /audit and GET /audit/bundle require (ADR-0007, D21). A
+    caller who can read the record through /audit can already see its
+    verification state, so gating this route with that same key adds no
+    reach; leaving it open would hand the ledger's proof surface to an
+    unauthenticated caller, which is red-team X5's finding one level along.
+
+    Returns 200 with the same verification object /audit puts on every row:
+        {"key": <the key as given>, "verification": {state, state_id, detail, error_class}}
+
+    A key that was never written is a 200 carrying state "not_found", not an
+    HTTP 404. This route reports a verification result; it does not model the
+    record as a missing resource. GET /audit/bundle does return 404 for the
+    same condition, and differently on purpose - a bundle is evidence that a
+    record was committed and its proofs checked, so there is no honest bundle
+    for a key that was never written, whereas "this key names nothing" is a
+    perfectly good answer to "verify this key".
+
+    A verifier that cannot be reached is likewise a 200 carrying
+    "unverifiable", for the same reason: the states exist to distinguish
+    these conditions from each other, and collapsing them into HTTP status
+    codes would undo D2, D8 and D10 at the transport layer.
+
+    This route is what makes `not_found` reachable end to end for the first
+    time. ADR-0006 recorded that it was not, because /audit's own scan only
+    ever lists keys ImmuDB confirms exist, so a key that is simultaneously
+    scanned and never written cannot be constructed. This route takes its key
+    from the caller instead of from a scan.
+    """
+    try:
+        raw_key = base64.b64decode(key, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="key must be base64-encoded raw ImmuDB key bytes")
+    if not raw_key:
+        raise HTTPException(status_code=400, detail="key must not be empty")
+
+    verification, _transport_ok = _verify_one_key(key)
+    return {"key": key, "verification": verification}
 
 
 def _record_type_of(raw_value: bytes) -> str:
