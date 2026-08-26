@@ -289,6 +289,16 @@ export function AuditTable({ entries }: Props) {
   // P3c2-2: which row is open, and what its on-demand check has produced.
   // Keyed by ledger_key, the identifier the per-record route takes - not by
   // row index, which changes under the 30s refetch.
+  //
+  // The footer below no longer claims "newest first". It is not true and was
+  // not true before this phase: control_plane/main.py's ImmuDB scan passes
+  // desc: true, which orders by KEY descending, and a tool_call: key leads
+  // with the agent id. The page is therefore the lexicographically-largest
+  // keys, not the most recent decisions, and once the ledger holds more than
+  // `limit` of them a record written seconds ago can be absent entirely.
+  // Pre-existing and out of this phase's scope - see TODO.md and
+  // docs/reports/phase-3c2.md - but not restated as fact in a line this
+  // phase was already rewriting.
   const [expanded, setExpanded] = useState<string | null>(null);
   const [checks, setChecks] = useState<Record<string, CheckState>>({});
 
@@ -477,8 +487,8 @@ export function AuditTable({ entries }: Props) {
       </div>
 
       <p className="text-xs text-muted-foreground">
-        Showing {filtered.length} of {entries.length} ledger entries, newest
-        first. Verification is a cryptographic inclusion/consistency proof
+        Showing {filtered.length} of {entries.length} ledger entries.
+        Verification is a cryptographic inclusion/consistency proof
         check against ImmuDB&apos;s signed state, performed server-side for one
         record at a time when you expand it (D29). A page that has not been
         expanded has checked nothing, which is what NOT CHECKED means.

@@ -455,6 +455,56 @@ establishes and its gap, and the static-parse limit on the dashboard half.
 
 ---
 
+## A second finding outside the items: `/audit` is not ordered by time
+
+Found while diagnosing nine suite failures that appeared only after the
+measurement seeded the ledger past the page size, and worth more than the
+first finding.
+
+`control_plane/main.py`'s ImmuDB scan passes `desc: true`. That orders by
+**key** descending, and a `tool_call:` key is
+`tool_call:<agent_id>:<uuid>:<tool_name>`, so the ordering is by agent id.
+`GET /audit?limit=N` therefore returns the N lexicographically-largest keys,
+not the N most recent decisions.
+
+While the ledger holds fewer than `limit` matching keys this is invisible,
+because every record is on the page whatever the order. Past that point a
+record written seconds ago is simply absent. Observed directly:
+
+```
+entries: 211
+tx range: 1 - 573
+first 3 keys: tool_call:test_opa_agent:ff04bf53...:provision_cloud_server
+              tool_call:test_opa_agent:e66878a7...:provision_cloud_server
+              tool_call:test_opa_agent:c318c90f...:provision_cloud_server
+tx sorted descending? False
+```
+
+The page leads with `test_opa_agent` because `t` sorts high, and the newest
+transaction, 573, is not on it. This is what failed
+`tests/test_intent_completion_visibility.py::test_real_mediated_call_surfaces_execution_state_completed`
+with `tx_id 571 not found in /audit` once 200 seeded `measure-agent` records
+crowded the page.
+
+**Pre-existing, and untouched by this phase.** The scan is byte-for-byte what
+it was; deferral changed what happens to each entry after the scan, not which
+entries the scan returns. It surfaced here only because measuring the thing
+this phase exists to fix required a ledger larger than the page.
+
+**One consequence was in scope, because this phase was rewriting the line.**
+`dashboard/components/audit-table.tsx`'s footer said "newest first". That was
+already false, and this phase was editing that sentence for other reasons, so
+the claim was removed rather than restated. Nothing else was changed: no
+reordering, no new sort, no widening. The defect is recorded in `TODO.md` with
+the evidence above.
+
+**It also bounds what the measurement table means.** Section 6's figures are
+per-request costs at a given page size and are unaffected. But "200 entries"
+there means "a 200-row page", not "the 200 newest decisions", and the two are
+the same thing only while the ledger fits in the page.
+
+---
+
 ## Pre-registered negatives
 
 All confirmed false, individually, each derived rather than asserted.
@@ -523,7 +573,18 @@ All confirmed false, individually, each derived rather than asserted.
   `No module named 'sigstore'`. `sigstore` cannot be installed into this
   machine's Python without breaking `spiffe==0.2.5`'s `cryptography` pin, and
   it is present in `requirements-test.txt`, so CI covers them. The same 14
-  failed before any change in this phase.
+  failed before any change in this phase, on the same host, from the same
+  clone.
+- **Nine further failures on a ledger left oversized by the measurement.**
+  `tests/test_content_states.py` (five) and
+  `tests/test_intent_completion_visibility.py` (two) among them, all of the
+  form "the record I just wrote is not in /audit". Diagnosed to the key-order
+  finding above rather than to this phase's change, and confirmed by resetting
+  the stack to an empty ledger, which is what `make test-integration` and CI
+  both do, and re-running. The clean-ledger result is the one reported under
+  CI below; the oversized-ledger run is recorded here rather than omitted,
+  because "reset it and it passed" is exactly the shape a real regression also
+  has, and the diagnosis rather than the re-run is what distinguishes them.
 
 ---
 
