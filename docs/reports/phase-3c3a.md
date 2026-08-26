@@ -321,20 +321,43 @@ All false at the end. Each derived individually.
 1. **The three grounding run ids have no artifact.** `p3c3-question`, `p3c3-probe` and `p3c3-scoring` are cited by id only. Their factual content was re-derived (section 2); their reasoning was not recovered and is not reproduced here.
 2. **End-to-end cost could not separate before from after at 2k or 10k.** Section 7.1 says so rather than presenting a difference that is inside the noise. The component breakdown in 7.2 is what carries the claim.
 3. **The dashboard has no JavaScript test harness.** The card labels, the empty-state condition and the truncation notice are held in place by a static parse of the component's own source. That establishes what the source says, not that the browser renders it - the same limit this project already states for D29's expand affordance.
-4. **A first full-suite run reported 60 failures and was discarded as invalid.** A `docker compose build dashboard` was running concurrently for 8.7 minutes of that 14.7 minute run and saturated the host. Every sampled failure passed on re-run in isolation. It is superseded by the hermetic run in section 12 and is recorded here rather than omitted.
+4. **The full suite does not pass on this host, and has nothing to do with this change.** Section 12 records the numbers, the two signatures behind them, and the control that establishes it. An earlier draft of this report attributed a first 60-failure run to host saturation from a concurrent image build; that explanation was wrong and is corrected there.
 5. **`total` counts keys, not successful decodes.** A record the response skips as malformed is still counted. This follows from counting keys and is documented on the field; no test pins it.
 
 ---
 
 ## 12. Suite and CI
 
-Local hermetic run, `docker compose -p p3c3a -f docker-compose.test.yml down -v` first, fresh stack, nothing else running on the host:
+### CI
+
+**Run `33003909093`, on commit `b8e2d24`, conclusion `success`.** The full suite, green. This is the authority for this phase, and it is what the acceptance rests on.
+
+### Local
+
+The full suite does not pass on this host, before or after this change:
 
 ```
-PLACEHOLDER_LOCAL_SUITE
+48 failed, 284 passed, 9 skipped, 3 warnings in 790.26s (0:13:10)
 ```
 
-CI run: PLACEHOLDER_CI
+**No test belonging to this phase is among the failures**, and the checks this phase touches pass locally:
+
+```
+tests/test_audit_read_correctness.py
+tests/test_mapping_tables.py
+tests/test_docs_references_resolve.py
+30 passed in 35.26s
+```
+
+Two signatures account for the local failures, and both are properties of this machine rather than of the code:
+
+**`No module named 'sigstore'`**, in `tools/ail_verify_bundle.py`'s anchor check. `sigstore` cannot be installed into this host's Python: it upgrades `cryptography` to 50.x, which breaks `spiffe==0.2.5`'s own pin (`cryptography<47,>=45`), and its TUF client calls `os.symlink`, which Windows refuses without elevated privileges. CI installs it from `requirements-test.txt` and does not have the problem. This accounts for `test_offline_verify`, `test_writer_signing` and `test_external_anchor`.
+
+**`[Errno 11001] getaddrinfo failed`**, resolving Docker-internal hostnames from the host. Several tests drive `decision_service/main.py` in-process on the host, and that code reaches the control plane, the verifier and ImmuDB by their compose service names (`http://verifier:8003` and so on). Exactly one module sets the override, `tests/test_evidence_bundle.py:78`'s `os.environ.setdefault("CONTROL_PLANE_URL", ...)`, at import - so whether the in-process path resolves anything depends on collection order, and only some of the names are covered at all. This accounts for the `test_opa_integration`, `test_outcome_types`, `test_policy_digest` and `test_response_contract` failures.
+
+**The control.** The same six files, run from a clean checkout of **unmodified `main` at `062e029`** against the same running stack, fail the same tests with the same two signatures - `test_opa_integration`, `test_outcome_types` (including four `test_malformed_tool_args_shape_still_produces_a_record` cases this branch's own run did not even reach), `test_policy_digest`, `test_offline_verify`, `test_writer_signing`, `test_response_contract`. The failures are pre-existing and are not evidence about this change in either direction.
+
+This is recorded rather than smoothed over. It is also worth stating plainly that it makes the local suite a weak instrument on this machine: CI is what established that the suite passes.
 
 ---
 
