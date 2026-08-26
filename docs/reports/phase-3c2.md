@@ -601,6 +601,14 @@ installs `sigstore==4.5.0` from `requirements-test.txt`, which cannot be
 installed into this machine's Python without breaking `spiffe==0.2.5`'s
 `cryptography<47` pin.
 
+That run covers every code and test change in this phase. The branch tip is
+later, because filling in this section is itself a commit: run
+**32974504343** covers `fc1f5c5`, also green, also `322 passed, 9 skipped`.
+`fc1f5c5` differs from `4bc0ae6` only in this file. A report that records its
+own CI run can never name the run for the commit that records it, so the last
+docs-only commit's run id is the one not transcribed here; it is on PR #12
+against the head the PR shows.
+
 Local, for comparison, on a ledger reset the way `make test-integration` and CI
 both reset it:
 
