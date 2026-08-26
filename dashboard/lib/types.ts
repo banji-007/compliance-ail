@@ -209,7 +209,37 @@ export interface AuditEntry {
 
 export interface AuditResponse {
   entries: AuditEntry[];
+  /**
+   * P3c3a-1 (Phase 3c-3a): the LEDGER's count of decision records, taken
+   * from ImmuDB's own count of distinct `tool_call:` keys. Not this page's
+   * length. It does not change when `limit` does.
+   *
+   * Before this phase it was `entries.length`, which meant the four cards
+   * on /audit all described one page while three of them read as
+   * ledger-wide and a caller could not tell a complete ledger of 40 from a
+   * truncated page of 200.
+   *
+   * What it excludes. The synthesized rows for orphaned write-ahead intents
+   * (D16): they are in `entries` but live under a different key prefix, and
+   * whether one is orphaned is only knowable after the control plane's own
+   * completion join. So `entries.length` can exceed `total` on a short
+   * ledger, which is why the empty state below keys off `entries.length`
+   * and not this field.
+   */
   total: number;
+  /**
+   * P3c3a-2 (Phase 3c-3a): whether records exist behind this page. The
+   * control plane fetches one row past `limit` and reports whether that row
+   * was there.
+   *
+   * What it does not mean. Not "more recent records exist". This page is
+   * ordered by ImmuDB key - for `tool_call:` keys, lexicographic agent-id
+   * order - and not by time, which is the defect Phase 3c-3b addresses
+   * (TODO.md). There is deliberately no cursor to go with this flag: a
+   * cursor is a position in an ordering, and the ordering is about to
+   * change.
+   */
+  has_more: boolean;
   /**
    * D29 (Phase 3c-2): whether the verifier answered a health check at the
    * moment this response was produced.

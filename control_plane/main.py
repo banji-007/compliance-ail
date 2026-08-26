@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -725,6 +726,129 @@ def _payload_state(content_state: str | None, content_row, has_tombstone: bool) 
     return "lost", None
 
 
+# ---------------------------------------------------------------------------
+# P3c3a-1 / P3c3a-3 (Phase 3c-3a): reading the ledger, not the page.
+#
+# Two facts GET /audit used to infer from the page it happened to fetch, and
+# now measures directly:
+#
+#   how many decision records the ledger holds - previously len(entries),
+#   which is the page's length and says nothing about the ledger;
+#
+#   which of the page's call_ids have an erasure tombstone - previously a
+#   prefix scan over content_erasure: bounded by the page's own limit, so a
+#   tombstone could be excluded by a limit that had nothing to do with it.
+#
+# Both go through ImmuDB's REST API. Both are described here rather than at
+# their call sites because get_audit is long and these are the only two
+# places it asks ImmuDB a question that is not "give me a page".
+# ---------------------------------------------------------------------------
+
+_TOOL_CALL_PREFIX = b"tool_call:"
+
+# ImmuDB's own hard ceiling on a scan's `limit`, measured against immudb
+# 1.9.5 rather than read off a doc: 2500 is served, 2501 is refused with
+# "result size limit exceeded". POST /api/v2/db/getall does not inherit it -
+# a 3000-key getall was served in the same probe - which is one more reason
+# P3c3a-3's tombstone join is a getall rather than a scan.
+_MAX_SCAN_LIMIT = 2500
+
+
+def _ledger_decision_count(client: httpx.Client, token: str) -> int:
+    """
+    How many `tool_call:` keys the ledger holds, ledger-wide.
+
+    GET /api/v2/db/count/{prefix} counts distinct keys under a prefix, not
+    versions of them. That is the right count here for a reason that is a
+    property of how records are written rather than a coincidence: every
+    ledger key carries a fresh uuid (ledger/immudb_ledger.py::log_tool_call
+    mints `tool_call:{agent_id}:{uuid4}:{tool_name}`), so no key is ever
+    written twice and distinct-key count and record count are the same
+    number.
+
+    The prefix is `tool_call:` and not `tool_call`. The trailing colon is
+    load-bearing: `tool_call_intent:` records live under their own prefix
+    (D16), and `tool_call` without the colon would capture them, because
+    `_` sorts inside the prefix just as `:` does. With the colon they are
+    excluded, which is what this count wants - an intent record is not a
+    decision.
+
+    Cost. This is a walk over the prefix, bounded by the ledger rather than
+    by the page, on a request the dashboard polls every 30 seconds per open
+    tab. It is sub-linear but unbounded, and it grows with the ledger
+    forever. See docs/reports/phase-3c3a.md for the measured figures and
+    README's Residual Limits for the standing statement. A maintained
+    counter can replace this later without changing the response contract,
+    because the contract is the number, not how it was obtained.
+    """
+    prefix_b64 = base64.b64encode(_TOOL_CALL_PREFIX).decode()
+    resp = client.get(
+        f"{IMMUDB_URL}/api/v2/db/count/{urllib.parse.quote(prefix_b64, safe='')}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+    # immudb returns uint64 as a JSON string, per protobuf's JSON mapping.
+    return int(resp.json().get("count", 0))
+
+
+def _tombstoned_call_ids(client: httpx.Client, token: str, call_ids: set[str]) -> set[str]:
+    """
+    Which of exactly these call_ids have a content_erasure tombstone.
+
+    P3c3a-3. This replaces a prefix scan over `content_erasure:` that ran
+    under GET /audit's own `limit`. The two have nothing to do with each
+    other: a page of 200 decisions and the 200 lexicographically-largest
+    tombstones are different sets, so a tombstone for a record on the page
+    could be excluded by a bound that was never about it. The record then
+    rendered `lost` where it should have read `erased` (an Article 17
+    erasure reported as an operational incident), or `present` with its
+    payload attached where it should have read `erasure_conflict` (P13-4's
+    finding, undone at read time). Phase 1.2 made erasure a positive
+    provable fact; a limit on the read side could take that back.
+
+    Exact by construction rather than by tuning. A tombstone's key is
+    `content_erasure:{call_id}` (control_plane/main.py::erase_content), and
+    call_id is on every entry, so the exact key for every call_id on the
+    page is derivable without a search. POST /api/v2/db/getall takes that
+    key list and returns the entries that exist, omitting the ones that do
+    not - which is precisely the membership test both consumers of this set
+    perform. No limit applies to it.
+
+    Classification still goes through `record_type`, not the key prefix
+    alone - D11's own discipline, unchanged by where the bytes came from.
+
+    There is no orphan-tombstone direction to lose: nothing reads this set
+    for tombstones whose call_id is not on the page.
+    """
+    if not call_ids:
+        return set()
+
+    resp = client.post(
+        f"{IMMUDB_URL}/api/v2/db/getall",
+        json={
+            "keys": [
+                base64.b64encode(f"content_erasure:{call_id}".encode()).decode()
+                # sorted() only so the request is reproducible between
+                # identical calls; getall imposes no ordering requirement.
+                for call_id in sorted(call_ids)
+            ]
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+
+    tombstoned: set[str] = set()
+    for raw in resp.json().get("entries", []):
+        try:
+            value = json.loads(base64.b64decode(raw["value"]).decode())
+            if value.get("record_type") == "content_erasure" and value.get("call_id"):
+                tombstoned.add(value["call_id"])
+        except Exception as exc:
+            logger.warning("Skipping malformed tombstone entry: %s", exc)
+            continue
+    return tombstoned
+
+
 @app.get("/audit")
 def get_audit(
     limit: int = 100,
@@ -760,7 +884,31 @@ def get_audit(
     would compare "asserted" to "asserted" if this parameter did not exist).
 
     Returns:
-        {"entries": [...], "total": <int>, "verifier_reachable": <bool>}
+        {"entries": [...], "total": <int>, "has_more": <bool>,
+         "verifier_reachable": <bool>}
+
+    **`total` is the ledger's count, not this page's length (P3c3a-1, Phase
+    3c-3a).** It is ImmuDB's own count of distinct `tool_call:` keys, taken
+    on every request, and it does not change when `limit` does. Before this
+    phase it was len(entries), so a complete ledger of 40 and a truncated
+    page of 200 were the same number to a caller.
+
+    What `total` does not count, stated because the difference is real: the
+    synthesized rows for orphaned write-ahead intents (D16). Those rows are
+    in `entries` but live under `tool_call_intent:`, and whether one is
+    orphaned is only knowable after the completion join below, so no key
+    count can include them. `total` is therefore a count of decision
+    records, and `len(entries)` can exceed it on a short ledger holding an
+    orphaned intent. It also counts records this response skipped as
+    malformed, for the same reason: it counts keys, not successful decodes.
+
+    **`has_more` says whether anything was left behind (P3c3a-2).** Both
+    scans fetch one row past the page and report whether that row existed.
+    It is not a claim about recency: this page is ordered by ImmuDB key,
+    which for `tool_call:` keys means lexicographic agent-id order, not
+    time order (TODO.md, and Phase 3c-3b). `has_more` means more records
+    exist behind this page, never that more recent ones do. There is
+    deliberately no cursor - see the scan block below.
 
     verifier_reachable is a live GET /health against the verifier, run on
     every request including verify=true - see _probe_verifier_reachable for
@@ -795,7 +943,13 @@ def get_audit(
                           either way); with no tombstone, a present row is
                           "present" and an absent one is "lost" - some other
                           way the row disappeared (e.g. a direct SQL delete
-                          bypassing the endpoint)
+                          bypassing the endpoint). P3c3a-3 (Phase 3c-3a):
+                          the tombstone lookup is an exact getall on this
+                          page's own call_ids, so no `limit` can hide a
+                          tombstone from the record it belongs to - it used
+                          to be a prefix scan bounded by the page's limit,
+                          which could render an erased record "lost" and a
+                          conflicted one "present", payload attached
         verification   - {state, state_id, detail, error_class}; state is one
                           of verified | failed | unverifiable | asserted |
                           not_found. On the default (deferred) path this is
@@ -829,6 +983,35 @@ def get_audit(
         )
 
     # --- Scan ImmuDB for all tool_call: keys (REST; scan needs no proof) ---
+    #
+    # P3c3a-2 (Phase 3c-3a): each scan below asks for one row more than the
+    # page. The extra row is never returned to the caller; only the fact
+    # that it existed is, as `has_more`. That is the entire mechanism -
+    # fetch limit + 1, return limit, set a flag.
+    #
+    # Deliberately not a cursor, and the absence is load-bearing rather
+    # than an omission. A cursor names a position in an ordering, and the
+    # ordering this page is served in is exactly what Phase 3c-3b replaces:
+    # `desc: True` sorts by key, tool_call: keys lead with agent_id, so
+    # this page arrives in lexicographic agent-id order and not in time
+    # order (TODO.md). A cursor minted against that ordering would either
+    # break when the ordering changes or freeze the ordering this phase is
+    # deliberately leaving open.
+    # ImmuDB's scan refuses a limit above 2500 outright ("result size limit
+    # exceeded", HTTP 500), measured live against immudb 1.9.5 - see
+    # docs/reports/phase-3c3a.md. That ceiling is why `limit + 1` cannot be
+    # asked for unconditionally: GET /audit?limit=2500 served a page before
+    # this phase, and a bare limit + 1 would have turned it into a 502.
+    #
+    # Clamping the scan alone would be worse than the bug it avoids - the
+    # extra row would vanish and has_more would silently read false at
+    # exactly the largest page. So the page shrinks with it: page_limit is
+    # the caller's limit everywhere below 2500, and 2499 at or above it,
+    # which keeps the +1 row available and keeps has_more exact at every
+    # limit. A caller asking for 2500 gets 2499 rows and has_more, not a
+    # 2500-row page that lies about what is behind it.
+    scan_limit = max(1, min(limit + 1, _MAX_SCAN_LIMIT))
+    page_limit = scan_limit - 1
     try:
         with httpx.Client(timeout=30.0) as client:
             login_resp = client.post(
@@ -847,51 +1030,113 @@ def get_audit(
             scan_resp = client.post(
                 f"{IMMUDB_URL}/api/v2/db/scan",
                 json={
-                    "prefix": base64.b64encode(b"tool_call:").decode(),
+                    "prefix": base64.b64encode(_TOOL_CALL_PREFIX).decode(),
                     "desc": True,
-                    "limit": limit,
+                    "limit": scan_limit,
                 },
                 headers={"Authorization": f"Bearer {token}"},
             )
             scan_resp.raise_for_status()
             raw_entries = scan_resp.json().get("entries", [])
 
-            # D11 (Phase 1.2): a second scan, over content_erasure: keys,
-            # never tool_call: - this is what keeps a tombstone structurally
-            # out of the decision entries built below, rather than relying
-            # on a filter that could be gotten wrong. Classification of what
-            # counts as a tombstone still goes through record_type, not the
-            # key prefix alone (D11's own "discriminate on a field" point).
-            tombstone_scan_resp = client.post(
-                f"{IMMUDB_URL}/api/v2/db/scan",
-                json={
-                    "prefix": base64.b64encode(b"content_erasure:").decode(),
-                    "desc": True,
-                    "limit": limit,
-                },
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            tombstone_scan_resp.raise_for_status()
-            raw_tombstones = tombstone_scan_resp.json().get("entries", [])
-
-            # D16 (Phase 2 completion pass): a third scan, over
+            # D16 (Phase 2 completion pass): a second scan, over
             # tool_call_intent: keys - the write a mediated tool's execution
             # is gated behind (ledger/immudb_ledger.py::log_tool_intent),
             # never tool_call:. Joined against the decision entries below by
-            # call_id, the same way tombstones are joined, so an intent with
-            # no matching completion record can be surfaced instead of
-            # silently missing from this response.
+            # call_id, so an intent with no matching completion record can
+            # be surfaced instead of silently missing from this response.
+            #
+            # P3c3a-3 removed what used to be the second of three scans
+            # here, over content_erasure:. The tombstone join is no longer a
+            # search at all - see _tombstoned_call_ids above.
             intent_scan_resp = client.post(
                 f"{IMMUDB_URL}/api/v2/db/scan",
                 json={
                     "prefix": base64.b64encode(b"tool_call_intent:").decode(),
                     "desc": True,
-                    "limit": limit,
+                    "limit": scan_limit,
                 },
                 headers={"Authorization": f"Bearer {token}"},
             )
             intent_scan_resp.raise_for_status()
             raw_intents = intent_scan_resp.json().get("entries", [])
+
+            # P3c3a-2: truncation is a measured fact about this response,
+            # not an inference the caller is left to make from a row count
+            # that happens to equal the limit.
+            #
+            # Both scans put rows into `entries` below - decision records
+            # directly, and orphaned intents as synthesized rows (D16) - so
+            # a truncation in either one hides rows from this response, and
+            # has_more reports either. What it does not report is which:
+            # it is one bit about this response, not a description of where
+            # the boundary fell. It is also not a claim about recency. This
+            # page is not ordered by time (see the cursor note above), so
+            # has_more means more records exist behind this page, never
+            # that more recent ones do.
+            has_more = len(raw_entries) > page_limit or len(raw_intents) > page_limit
+            raw_entries = raw_entries[:page_limit]
+            raw_intents = raw_intents[:page_limit]
+
+            # P3c3a-1: the ledger's count, asked of the ledger. Before this,
+            # `total` was len(entries) - the page's own length - so a full
+            # ledger of 40 and a truncated page of 200 were indistinguishable
+            # to a caller, and the four dashboard cards labelled with it all
+            # described one page while reading as ledger-wide.
+            ledger_decision_count = _ledger_decision_count(client, token)
+
+            # D16: intent records keyed by call_id, for the completion join
+            # below. A record_type check (not just the key prefix) mirrors
+            # D11's own tombstone-classification discipline.
+            #
+            # P3c3a-3 moved this decode, and the decision decode after it,
+            # inside the client block: the tombstone join needs the page's
+            # call_ids before any row is built, and it needs this same
+            # authenticated client to ask about them.
+            intent_by_call_id: dict[str, dict] = {}
+            for raw in raw_intents:
+                try:
+                    value = json.loads(base64.b64decode(raw["value"]).decode())
+                    if value.get("record_type") != "decision_intent" or not value.get("call_id"):
+                        continue
+                    intent_by_call_id[value["call_id"]] = {
+                        **value,
+                        "tx_id": int(raw.get("tx", 0)),
+                        "encoded_key": raw.get("key", ""),
+                    }
+                except Exception as exc:
+                    logger.warning("Skipping malformed intent entry: %s", exc)
+                    continue
+
+            # P3c3a-3: decoding the decision records is now its own pass,
+            # for the same reason. A record that will not decode is skipped
+            # with a warning here instead of in the build loop below - same
+            # behaviour, one step earlier.
+            decoded_entries: list[tuple[str, dict, int]] = []
+            for raw in raw_entries:
+                try:
+                    decoded_entries.append((
+                        raw.get("key", ""),
+                        json.loads(base64.b64decode(raw["value"]).decode()),
+                        int(raw.get("tx", 0)),
+                    ))
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc
+                    )
+                    continue
+
+            # P3c3a-3: exactly the call_ids this response will render, and
+            # nothing else. Both sources are included because both produce
+            # rows carrying a payload_state: the decision records, and the
+            # orphaned intents synthesized from intent_by_call_id below.
+            page_call_ids = {
+                log_entry["call_id"]
+                for _key, log_entry, _tx in decoded_entries
+                if log_entry.get("call_id")
+            }
+            page_call_ids |= set(intent_by_call_id)
+            tombstoned_call_ids = _tombstoned_call_ids(client, token, page_call_ids)
 
     except httpx.HTTPStatusError as exc:
         logger.error("ImmuDB HTTP error during audit scan: %s", exc)
@@ -899,34 +1144,6 @@ def get_audit(
     except Exception as exc:
         logger.error("ImmuDB unavailable for audit scan: %s", exc)
         raise HTTPException(status_code=503, detail=f"ImmuDB unavailable: {exc}")
-
-    tombstoned_call_ids: set[str] = set()
-    for raw in raw_tombstones:
-        try:
-            value = json.loads(base64.b64decode(raw["value"]).decode())
-            if value.get("record_type") == "content_erasure" and value.get("call_id"):
-                tombstoned_call_ids.add(value["call_id"])
-        except Exception as exc:
-            logger.warning("Skipping malformed tombstone entry: %s", exc)
-            continue
-
-    # D16: intent records keyed by call_id, for the completion join below.
-    # A record_type check (not just the key prefix) mirrors D11's own
-    # tombstone-classification discipline.
-    intent_by_call_id: dict[str, dict] = {}
-    for raw in raw_intents:
-        try:
-            value = json.loads(base64.b64decode(raw["value"]).decode())
-            if value.get("record_type") != "decision_intent" or not value.get("call_id"):
-                continue
-            intent_by_call_id[value["call_id"]] = {
-                **value,
-                "tx_id": int(raw.get("tx", 0)),
-                "encoded_key": raw.get("key", ""),
-            }
-        except Exception as exc:
-            logger.warning("Skipping malformed intent entry: %s", exc)
-            continue
 
     # --- Verify each entry via the verifier service; join content by call_id ---
     #
@@ -936,13 +1153,10 @@ def get_audit(
     verifier_reachable = _probe_verifier_reachable()
     verifier_up = True
     entries = []
-    for raw in raw_entries:
+    # P3c3a-3: these were decoded above, so the tombstone join could be
+    # built from their call_ids in the same authenticated client block.
+    for encoded_key, log_entry, tx_id in decoded_entries:
         try:
-            encoded_key: str       = raw.get("key", "")
-            serialized_entry: str  = base64.b64decode(raw["value"]).decode()
-            log_entry: dict        = json.loads(serialized_entry)
-            tx_id: int             = int(raw.get("tx", 0))
-
             if not verify:
                 # D29, producer 1 of "asserted": deferral. Nothing was
                 # attempted for this entry because nothing was asked for.
@@ -1025,7 +1239,7 @@ def get_audit(
                 "execution_state": "completed" if call_id in intent_by_call_id else "n/a",
             })
         except Exception as exc:
-            logger.warning("Skipping malformed ledger entry (tx=%s): %s", raw.get("tx"), exc)
+            logger.warning("Skipping malformed ledger entry (tx=%s): %s", tx_id, exc)
             continue
 
     # D16: any intent record whose call_id never showed up as a completion
@@ -1084,9 +1298,12 @@ def get_audit(
             continue
 
     logger.info(
-        "Audit: %d entries; verify=%s verifier_reachable=%s verifier_up=%s "
+        "Audit: %d entries of %d ledger records (has_more=%s); verify=%s "
+        "verifier_reachable=%s verifier_up=%s "
         "by state: verified=%d failed=%d unverifiable=%d asserted=%d not_found=%d",
         len(entries),
+        ledger_decision_count,
+        has_more,
         verify,
         verifier_reachable,
         verifier_up,
@@ -1096,7 +1313,16 @@ def get_audit(
         sum(1 for e in entries if e["verification"]["state"] == "asserted"),
         sum(1 for e in entries if e["verification"]["state"] == "not_found"),
     )
-    return {"entries": entries, "total": len(entries), "verifier_reachable": verifier_reachable}
+    # P3c3a-1 / P3c3a-2: `total` is the ledger's count of decision records,
+    # not this page's length, and `has_more` says whether anything was left
+    # behind. Before this phase the caller got one number that answered
+    # neither question and read as if it answered both.
+    return {
+        "entries": entries,
+        "total": ledger_decision_count,
+        "has_more": has_more,
+        "verifier_reachable": verifier_reachable,
+    }
 
 
 @app.get("/audit/verify")
