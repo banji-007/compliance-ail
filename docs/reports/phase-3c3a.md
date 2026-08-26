@@ -310,9 +310,9 @@ All false at the end. Each derived individually.
 | Counting `tool_call:` keys takes 19.8 ms at 2k, 57.0 ms at 10k and 225.7 ms at 40k, while every other call the endpoint makes stays flat | `python tools/audit_read_cost_probe.py`, transcribed in section 7.2 | **command, marked: no test covers this** |
 | A tombstone `getall` over a page's keys is cheaper than the prefix scan it replaced and does not grow with the ledger | `python tools/audit_read_cost_probe.py`, transcribed in section 7.2 | **command, marked: no test covers this** |
 | ImmuDB refuses a scan limit above 2500 and imposes no such ceiling on `getall` | `python tools/immudb_read_api_probe.py`, transcribed in section 2 | **command, marked: no test covers this** |
-| The ledger count is a walk bounded by the ledger, recurring every 30 seconds per open tab, and grows with the ledger forever | `readME.md` section 5, Residual Limits | residual limit |
-| `has_more` means more records exist behind this page and never that more recent ones do, because the page is ordered by ledger key | `readME.md` section 5, Residual Limits | residual limit |
-| A response can carry more rows than `limit` asked for, because orphan-intent rows are appended after the limit is applied | `readME.md` section 5, Residual Limits | residual limit |
+| The ledger count is a walk bounded by the ledger, recurring every 30 seconds per open tab, and grows with the ledger forever | `readME.md` §5, Residual Limits | residual limit |
+| `has_more` means more records exist behind this page and never that more recent ones do, because the page is ordered by ledger key | `readME.md` §5, Residual Limits | residual limit |
+| A response can carry more rows than `limit` asked for, because orphan-intent rows are appended after the limit is applied | `readME.md` §5, Residual Limits | residual limit |
 
 ---
 
