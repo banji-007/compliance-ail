@@ -330,7 +330,9 @@ All false at the end. Each derived individually.
 
 ### CI
 
-**Run `33003909093`, on commit `b8e2d24`, conclusion `success`.** The full suite, green. This is the authority for this phase, and it is what the acceptance rests on.
+**Run `33003909093`, on commit `b8e2d24`, conclusion `success`.** The full suite, green. This is the run that covers the code and the tests, and it is what the acceptance rests on.
+
+**Run `33005960999`, on the branch tip `92b0469`, conclusion `success`.** Named alongside it because that commit adds this section, and a report whose own commit was never built is a claim about a tree nobody ran.
 
 ### Local
 
