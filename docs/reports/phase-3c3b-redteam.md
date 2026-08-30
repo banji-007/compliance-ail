@@ -4,7 +4,7 @@
 **Environment:** scratch clone, Compose project `p3c3bred`.
 **Baseline before attacking:** `tests/test_audit_ordering.py` 24 passed.
 
-Seven of ten claims refuted. The two most serious: a write the verifier reports as not having happened has in fact committed, indexed, and advanced the counter; and the ordering fault is not permanent, it self-clears as newer traffic pushes the corruption off the page.
+Eight of ten claims refuted (C1, C2, C3, C5, C6, C7, C8, C10); C4 and C9 held, as did C5's second attack. The two most serious: a write the verifier reports as not having happened has in fact committed, indexed, and advanced the counter; and the ordering fault is not permanent, it self-clears as newer traffic pushes the corruption off the page.
 
 ---
 
@@ -222,6 +222,36 @@ Still unexplained. Bounded a little tighter than before.
 **Two stale comments at HEAD contradict the shipped design.** `control_plane/main.py:896` ("History is therefore scored in (0, 1), never at or below zero") and `:1233` ("backfilled positions are fractional, so int() would collapse every one of them to 0"). The backfill assigns `float(tx)`, integers at or above 1. Both survive from the pre-`f4944b0` ranking design and would mislead the next reader about the seam.
 
 **`AIL_RESERVED_POSITIONS` is declared by no service** in `docker-compose.test.yml` or `docker-compose.yml`, while four modules read it independently and nothing checks agreement at runtime. `anchor_service`, which owns reconciliation, is absent from the test compose file entirely, so its copy of the reserve is never exercised by the suite. (This confirms and extends could-not-verify item 3.)
+
+## Reproduction
+
+Every refutation above was reproduced independently on clean stacks built from `b9f6a1d`,
+Compose project `p3c3brepro`, host ports remapped (18080/18003/18002/18010) so an unrelated
+`p3c3c` stack could keep its own. Baseline on each fresh stack: `tests/test_audit_ordering.py`
+24 passed. The poisoned `p3c3bred` ledger was destroyed, not reused.
+
+Identical to the original run: C2 (five records at two positions each after one pass; passes
+2 and 3 idempotent), C3 (`allocated: 5, indexed: 5` becomes `allocated: 0, backfilled: 5`,
+verdict clean), C5a (limit=1 serves a clean 200, limit>=2 faults), C5b/C10 (every limit
+returns to 200 with the disagreement still indexed and outside the top-2500 window), C6c
+(`KeyError: 'score'`), C7 (`verified: false, tx_id: null` with record, counter advance and
+index entry all present; `/decide` DENIED while the ledger holds `policy_allow`), C8
+(tx committed, counter unmoved, absent from the view and from `/audit`).
+
+Three deviations, none affecting a verdict:
+
+- **C6 needs a virgin ledger.** Running the suite first leaves a deliberate hole from
+  `test_a_consumed_position_with_no_index_entry_is_detected` (`missing_count: 1`), which
+  offsets the arithmetic and hides the point. On a virgin ledger the numbers are
+  unambiguous: a decision record indexed into the intent view leaves the verdict `clean`,
+  and an unallocated position gives `allocated: 6, indexed: 7` - still `clean`.
+- **C9 gave up 42 of 60 rather than 29 of 60.** Contention differs run to run. The
+  conclusion is unchanged: zero leaked records, zero index entries, positions unique and
+  gapless.
+- **C2 duplicated four records on one page rather than two.** Where the seam falls inside
+  the page depends on row counts. The mechanism is the same.
+
+The `total`-versus-page-rows mismatch reproduced as well: `HTTP 200 rows=2499 total=10`.
 
 ## Environment cleanup: partly blocked
 
