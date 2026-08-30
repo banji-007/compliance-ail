@@ -34,6 +34,7 @@ See docs/adr/0012-writer-signing-and-external-anchoring.md.
 
 import hashlib
 import json
+import base64
 import logging
 import os
 import sys
@@ -210,6 +211,7 @@ def run_forever() -> None:
     )
 
     last_anchored_tx = None
+    last_reconciled_at = 0.0
     while True:
         try:
             anchored = anchor_once(signing_key, verifying_key, last_anchored_tx)
@@ -225,7 +227,157 @@ def run_forever() -> None:
                 "Anchoring cycle failed (fail-open by D23, writes are unaffected): %s: %s",
                 type(exc).__name__, exc,
             )
+
+        # P3c3b-6: on its own interval, in its own try, so a reconciliation
+        # failure cannot stop anchoring and an anchoring failure cannot stop
+        # reconciliation. Neither gates a write.
+        now = time.monotonic()
+        if now - last_reconciled_at >= RECONCILE_INTERVAL_SECONDS:
+            last_reconciled_at = now
+            try:
+                reconcile_once()
+            except Exception as exc:
+                logger.error(
+                    "Reconciliation pass failed (reports only, writes are unaffected): %s: %s",
+                    type(exc).__name__, exc,
+                )
+
         time.sleep(INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# P3c3b-6 (Phase 3c-3b): sequence reconciliation.
+# ---------------------------------------------------------------------------
+#
+# What gaplessness buys. D32 allocates positions under a compare-and-set, and
+# a rejected precondition writes nothing at all - no record, no counter
+# advance, no index entry. So a sequence number is consumed only by a commit
+# that actually happened, and the allocated positions are dense. That turns
+# reconciliation into arithmetic over the index alone rather than a full key
+# scan of the ledger: if the counter says N and the views hold N positions,
+# every allocation is accounted for.
+#
+# And it makes a hole *evidence*. On a sequence where a crash could burn a
+# number, a missing position means nothing in particular. Here it means a
+# position was committed and its index entry is not there, which is either
+# index corruption or a record removed from a view - both worth a person
+# looking.
+#
+# Why it lives here. This service is already this shape: a periodic loop that
+# observes the ledger, reports, and never gates a write. Reconciliation is a
+# detector, so running it in the project's one deliberately fail-open
+# subsystem costs nothing that matters - a missed pass denies no call and
+# loses no record, and the next pass sees the same hole, because an
+# append-only ledger does not heal. Putting it anywhere on the write path
+# would be strictly worse: it would let a reporting failure deny traffic.
+
+SEQUENCE_KEY = "ail_seq:commit"
+
+# Must match verifier/main.py::_VIEW_SETS and control_plane/main.py.
+VIEW_SETS = ("ail_view:decision:v1", "ail_view:intent:v1")
+
+IMMUDB_URL = os.getenv("IMMUDB_URL", "http://immudb:8080")
+IMMUDB_USER = os.getenv("IMMUDB_USER", "immudb")
+IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD", "immudb")
+
+RECONCILE_INTERVAL_SECONDS = float(os.getenv("AIL_RECONCILE_INTERVAL_SECONDS", "900"))
+
+_ZSCAN_PAGE = 2500
+
+
+def _immudb_login(client) -> dict:
+    resp = client.post(f"{IMMUDB_URL}/api/v2/login", json={
+        "user": base64.b64encode(IMMUDB_USER.encode()).decode(),
+        "password": base64.b64encode(IMMUDB_PASSWORD.encode()).decode(),
+        "database": base64.b64encode(b"defaultdb").decode(),
+    })
+    resp.raise_for_status()
+    return {"Authorization": f"Bearer {resp.json()['token']}"}
+
+
+def collect_positions(client, headers) -> set[float]:
+    """Every position held across every view, paged past zscan's 2500 cap."""
+    positions: set[int] = set()
+    for view_set in VIEW_SETS:
+        min_score = None
+        while True:
+            body = {"set": base64.b64encode(view_set.encode()).decode(),
+                    "desc": False, "limit": _ZSCAN_PAGE}
+            if min_score is not None:
+                body["minScore"] = {"score": min_score}
+            resp = client.post(f"{IMMUDB_URL}/api/v2/db/zscan", json=body, headers=headers)
+            if resp.status_code != 200:
+                break
+            rows = resp.json().get("entries", [])
+            if not rows:
+                break
+            before = len(positions)
+            for row in rows:
+                # `.get`, because protobuf omits a zero-valued score field.
+                positions.add(float(row.get("score", 0.0)))
+            min_score = float(rows[-1]["score"])
+            if len(rows) < _ZSCAN_PAGE or len(positions) == before:
+                break
+    return positions
+
+
+def reconcile_once() -> dict:
+    """One pass. Returns what was found; never raises on a hole.
+
+    A hole is a finding to report, not an exception to propagate - this loop
+    reports, it does not gate.
+    """
+    import httpx
+
+    with httpx.Client(timeout=60.0) as client:
+        headers = _immudb_login(client)
+
+        # getall, not get: ImmuDB has no POST /api/v2/db/get, only
+        # GET /api/v2/db/get/{key} and POST /api/v2/db/getall. The missing
+        # route answers 404 for every key, which would make this report
+        # "the counter has never been written" forever.
+        resp = client.post(f"{IMMUDB_URL}/api/v2/db/getall",
+                           json={"keys": [base64.b64encode(SEQUENCE_KEY.encode()).decode()]},
+                           headers=headers)
+        entries = resp.json().get("entries", []) if resp.status_code == 200 else []
+        if not entries:
+            return {"state": "no_sequence", "detail": "the counter has never been written",
+                    "allocated": 0, "indexed": 0, "backfilled": 0,
+                    "missing": [], "missing_count": 0}
+        allocated = int(base64.b64decode(entries[0]["value"]).decode())
+
+        positions = collect_positions(client, headers)
+
+        # Only positions the live counter handed out are reconciled. The CAS
+        # allocates integers from 1 up; the backfill places history in the
+        # open interval (0, 1) on purpose (see tools/ail_backfill_index.py),
+        # and those were never allocated by the counter, so reconciling them
+        # against it would report a shortfall on every pass.
+        live = {int(n) for n in positions if n >= 1 and float(n).is_integer()}
+        missing = sorted(set(range(1, allocated + 1)) - live)
+
+        result = {
+            "state": "clean" if not missing else "holes",
+            "allocated": allocated,
+            "indexed": len(live),
+            "backfilled": len(positions) - len(live),
+            "missing": missing[:100],
+            "missing_count": len(missing),
+        }
+        if missing:
+            logger.error(
+                "Sequence reconciliation found %d hole(s): the counter allocated %d "
+                "position(s) and the views hold %d. A position is consumed only by a "
+                "commit that happened, so each hole is a committed record missing from "
+                "its view index. First few: %s",
+                len(missing), allocated, len(live), missing[:20],
+            )
+        else:
+            logger.info(
+                "Sequence reconciliation clean: %d allocated, %d indexed, %d backfilled",
+                allocated, len(live), result["backfilled"],
+            )
+        return result
 
 
 def run_once() -> int:

@@ -95,27 +95,40 @@ def _b64(value) -> str:
 _WRITE_CLIENT = httpx.Client(timeout=30.0)
 
 
-def _verifier_write(key: str, value: dict) -> None:
-    """One verified ledger write, through the verifier's own /write - the
-    same route tests/test_content_states.py::_write_tombstone_directly uses,
-    with the same write-scoped credential D21 requires."""
+def _verifier_write(key: str, value: dict, view: str | None = None) -> None:
+    """One verified ledger write, through the verifier, with the
+    write-scoped credential D21 requires.
+
+     D32 (Phase 3c-3b): /write-ordered, because a decision or intent
+     record now takes a commit position in the same transaction that
+     commits it, and a record with no position is absent from every
+     ordered page. `view` picks which view index it lands in; a
+     tombstone is neither and keeps the plain /write route.
+    """
+    body = {"key": _b64(key), "value": _b64(json.dumps(value, separators=(",", ":")))}
+    route = "/write"
+    if view is not None:
+        route = "/write-ordered"
+        body["view"] = view
     resp = _WRITE_CLIENT.post(
-        f"{VERIFIER_URL}/write",
-        json={
-            "key": _b64(key),
-            "value": _b64(json.dumps(value, separators=(",", ":"))),
-        },
+        f"{VERIFIER_URL}{route}",
+        json=body,
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
     )
     resp.raise_for_status()
     assert resp.json().get("verified"), f"write not verified: {resp.json()}"
 
 
+def _verifier_write_decision(key: str, value: dict) -> None:
+    """A decision record, which since D32 means the ordered write path."""
+    _verifier_write(key, value, view="decision")
+
+
 def _write_decision_record(call_id: str, *, agent_id: str, content_state: str = "present") -> str:
     """A well-formed `tool_call:` decision record, keyed exactly the way
     ledger/immudb_ledger.py::log_tool_call keys one."""
     key = f"tool_call:{agent_id}:{uuid.uuid4().hex}:query_database"
-    _verifier_write(key, {
+    _verifier_write_decision(key, {
         "record_type": "decision",
         "call_id": call_id,
         "agent_id": agent_id,

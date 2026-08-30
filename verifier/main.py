@@ -52,6 +52,7 @@ import hashlib
 import logging
 import os
 import pathlib
+import threading
 from contextlib import asynccontextmanager
 
 import grpc
@@ -272,6 +273,26 @@ class WriteResponse(BaseModel):
     detail: str | None = None
 
 
+class OrderedWriteRequest(BaseModel):
+    """D32 (Phase 3c-3b): a write that also takes a position in a view index.
+
+    `view` names which view index this record belongs in - the shared
+    sequence is allocated once and every view scores from it, so positions
+    are comparable across views and a later view needs no second backfill.
+    """
+    key: str    # base64-encoded raw key bytes
+    value: str  # base64-encoded raw value bytes
+    view: str   # logical view name, e.g. "decision" or "intent"
+
+
+class OrderedWriteResponse(BaseModel):
+    tx_id: int | None
+    seq: int | None
+    verified: bool
+    attempts: int = 0
+    detail: str | None = None
+
+
 class AnchorState(BaseModel):
     """
     D23/P3b-1: the externally anchored checkpoint a caller wants a record
@@ -431,6 +452,232 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
     except Exception as exc:
         logger.error("verifiedSet error: %s", exc)
         return WriteResponse(tx_id=None, verified=False, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# D32 (Phase 3c-3b): the ordered write path.
+# ---------------------------------------------------------------------------
+#
+# The problem this exists for. `/audit` used to page the ledger with a key
+# walk under `desc: true`, and a `tool_call:` key leads with agent_id, so the
+# page returned the lexicographically-largest agent ids and called them
+# recent. A record written seconds ago could be absent once the ledger
+# exceeded `limit`. ImmuDB's `scan` has no ordering parameter, `TxScan` is
+# not routed over REST (verified live, Phase 3c-3b probe), and no key this
+# project writes is temporal or monotonic, so no parameter produces a
+# time-ordered page. `zscan` is routed and orders by a caller-supplied score.
+#
+# Why the score is neither a clock nor a per-writer counter. A timestamp is
+# globally comparable and wrong under skew. A per-writer sequence is not an
+# ordering at all: `p3c3-scoring` had four writers each claim positions 1 to
+# 15, and signing that only proves the writer *said* position 3, not that
+# position 3 is where the record belongs. The score here is allocated from a
+# single counter under a compare-and-set the ledger itself enforces, so a
+# writer that read a stale counter is rejected outright and any position it
+# does commit is the unique next one from the state it read.
+#
+# What one call commits. A single ExecAll carries three operations - the
+# record, the advanced counter, and the zAdd into the view index - gated by
+# a KeyNotModifiedAfterTX precondition on the counter. All three land in one
+# transaction or none do (nentries=3, one tx id, verified live), which is
+# what makes "a record committed without its index entry" unrepresentable
+# rather than merely unlikely.
+#
+# Why the SDK's own execAll() is not used. immudb-py 1.5.0's execAll wrapper
+# builds ExecAllRequest(Operations=..., noWait=...) and has no preconditions
+# parameter at all (immudb/handler/execAll.py, read live), so the whole
+# mechanism is unreachable through it. This calls the generated gRPC stub
+# with the SDK's own protobuf types instead. That is a narrower thing than
+# ADR-001's warning about hand-rolling `Alh()`: no verification code is
+# reimplemented here, only a request the wrapper cannot express.
+#
+# Verification. There is no verifiedExecAll in immudb-py 1.5.0, so the proof
+# check `verifiedSet` used to run inside the write call is issued separately
+# here, as a verifiedGet on the record key immediately after the commit. It
+# runs the same inclusion and consistency proofs through the same SDK code,
+# and it raises to DENY on the same conditions - the guarantee moved from
+# inside the write call to just after it, and did not weaken. Confirmed live
+# that a verifiedGet on an ExecAll-written key succeeds and that the
+# consistency proof keeps advancing across ExecAll transactions.
+
+# Outside `tool_call:`, `tool_call_intent:` and `content_erasure:` on
+# purpose: those three prefixes are counted or scanned by
+# control_plane/main.py, and a counter living inside one of them would land
+# in Phase 3c-3a's ledger count as though it were a decision.
+SEQUENCE_KEY = b"ail_seq:commit"
+
+# Versioned, and named for the view rather than for the ledger, because the
+# index is a view over the ledger and not the ledger's own ordering. A
+# second view (incident-first, say) is a second zset scored from this same
+# counter, which is why it would need no second backfill.
+_VIEW_SETS = {
+    "decision": b"ail_view:decision:v1",
+    "intent":   b"ail_view:intent:v1",
+}
+
+# D34: the retry budget is an availability parameter, not a correctness one.
+# An exhausted budget is a failed ledger write, which the existing rule
+# turns into a denied call - so raising this trades latency for availability
+# and lowering it can deny traffic. `p3c3-scoring` saw zero writers give up
+# at 8 concurrent with a cap of 300.
+MAX_CAS_ATTEMPTS = int(os.getenv("AIL_SEQUENCE_MAX_ATTEMPTS", "300"))
+
+# D34: the writer caches (seq, tx) from its own last successful commit and
+# reads the counter only at cold start or after a rejection. Reading it
+# every write cost about 30 percent in `p3c3-scoring`; caching cost about 6.
+_seq_cache: tuple[int, int] | None = None
+_seq_lock = threading.Lock()
+
+# D34's two write-path costs, both reachable. Default on, which is the
+# cheaper one; setting this to 0 makes every write read the counter first.
+# It exists so the difference D34 states is a figure this deployment can
+# reproduce rather than one taken on trust, and so an operator debugging a
+# suspected cache-coherence problem can turn the cache off without a
+# rebuild. Correctness does not depend on it either way: the CAS rejects a
+# stale read whether it came from the cache or from the ledger.
+_SEQ_CACHE_ENABLED = os.getenv("AIL_SEQUENCE_CACHE", "1") != "0"
+
+
+def _read_counter(client):
+    """The counter's value and the transaction it was last modified at.
+
+    Both halves are needed: the value is the last allocated position, and
+    the tx is what the KeyNotModifiedAfterTX precondition names. Returns
+    None when the counter has never been written, which is the cold-start
+    case the KeyMustNotExist precondition covers.
+    """
+    got = client.get(SEQUENCE_KEY)
+    if got is None:
+        return None
+    return int(got.value.decode()), int(got.tx)
+
+
+def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
+    """One CAS-gated ExecAll. Returns (tx_id, seq, attempts).
+
+    Raises after MAX_CAS_ATTEMPTS rejections, which the caller turns into a
+    failed write and the middleware turns into a denied call.
+    """
+    from immudb.grpc import schema_pb2 as schema
+
+    global _seq_cache
+    stub = client._stub
+    attempts = 0
+
+    while attempts < MAX_CAS_ATTEMPTS:
+        attempts += 1
+
+        with _seq_lock:
+            cached = _seq_cache if _SEQ_CACHE_ENABLED else None
+        if cached is None:
+            observed = _read_counter(client)
+        else:
+            observed = cached
+
+        if observed is None:
+            # First allocation ever. KeyMustNotExist is the precondition that
+            # makes exactly one writer win this, verified live: the second
+            # such ExecAll is rejected with "precondition failed:
+            # KeyMustNotExist".
+            next_seq = 1
+            precondition = schema.Precondition(
+                keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(
+                    key=SEQUENCE_KEY
+                )
+            )
+        else:
+            last_seq, last_tx = observed
+            next_seq = last_seq + 1
+            precondition = schema.Precondition(
+                keyNotModifiedAfterTX=schema.Precondition.KeyNotModifiedAfterTXPrecondition(
+                    key=SEQUENCE_KEY, txID=last_tx
+                )
+            )
+
+        request = schema.ExecAllRequest(
+            Operations=[
+                schema.Op(kv=schema.KeyValue(key=key, value=value)),
+                schema.Op(kv=schema.KeyValue(key=SEQUENCE_KEY, value=str(next_seq).encode())),
+                schema.Op(zAdd=schema.ZAddRequest(
+                    set=view_set, score=float(next_seq), key=key, boundRef=False,
+                )),
+            ],
+            preconditions=[precondition],
+            noWait=False,
+        )
+
+        try:
+            resp = stub.ExecAll(request)
+        except Exception as exc:
+            if "precondition failed" in str(exc):
+                # Someone else advanced the counter. Everything this attempt
+                # would have written was refused together, so there is
+                # nothing to undo - drop the stale cache and read fresh.
+                with _seq_lock:
+                    _seq_cache = None
+                continue
+            raise
+
+        tx_id = int(resp.id)
+        with _seq_lock:
+            _seq_cache = (next_seq, tx_id)
+        return tx_id, next_seq, attempts
+
+    raise RuntimeError(
+        f"sequence allocation gave up after {attempts} rejected attempts; "
+        "the ledger write did not happen"
+    )
+
+
+@app.post("/write-ordered", response_model=OrderedWriteResponse)
+def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write_key)):
+    """
+    Write a record, allocate its commit position, and index it, atomically.
+
+    Same contract as POST /write for the caller: verified false or a
+    transport error means the write did not happen, and
+    ledger/immudb_ledger.py turns that into a raise, which the decision
+    service turns into a denied call. Nothing about the fail-closed path
+    changed; what changed is that the record now also carries a position
+    the ledger itself allocated.
+    """
+    view_set = _VIEW_SETS.get(payload.view)
+    if view_set is None:
+        # Fail closed on an unknown view rather than inventing a set name:
+        # a typo would otherwise silently create a view nothing reads, and
+        # the record would be absent from every ordered page.
+        return OrderedWriteResponse(
+            tx_id=None, seq=None, verified=False,
+            detail=f"unknown view {payload.view!r}; known views: {sorted(_VIEW_SETS)}",
+        )
+
+    from immudb.exceptions import ErrCorruptedData
+
+    key   = base64.b64decode(payload.key)
+    value = base64.b64decode(payload.value)
+    try:
+        client = _get_client()
+        tx_id, seq, attempts = _ordered_commit(client, key, value, view_set)
+
+        # The proof check verifiedSet used to run inside the write call.
+        # Issued here because immudb-py 1.5.0 has no verifiedExecAll; it is
+        # the same SDK verification code over the same inclusion and
+        # consistency proofs, and it raises on the same conditions.
+        client.verifiedGet(key)
+
+        logger.info(
+            "Verified ordered write: tx=%d seq=%d view=%s attempts=%d",
+            tx_id, seq, payload.view, attempts,
+        )
+        return OrderedWriteResponse(tx_id=tx_id, seq=seq, verified=True, attempts=attempts)
+    except ErrCorruptedData:
+        logger.error("ordered write: inclusion or consistency proof failed")
+        return OrderedWriteResponse(
+            tx_id=None, seq=None, verified=False, detail="proof verification failed",
+        )
+    except Exception as exc:
+        logger.error("ordered write error: %s", exc)
+        return OrderedWriteResponse(tx_id=None, seq=None, verified=False, detail=str(exc))
 
 
 class CurrentStateResponse(BaseModel):

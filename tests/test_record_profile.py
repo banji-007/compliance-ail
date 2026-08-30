@@ -178,11 +178,14 @@ def test_audit_forged_profile_less_record_renders_as_unknown_not_observed():
         "content_state": "unavailable",
         # deliberately no "profile" key
     }
+    # D32 (Phase 3c-3b): /write-ordered, because a record of this kind now
+    # takes a commit position in the same transaction that commits it, and
+    # a record with no position is absent from every ordered page.
     write_resp = httpx.post(
-        f"{os.getenv('VERIFIER_URL', 'http://localhost:8003')}/write",
-        json={"key": b64(key), "value": b64(json.dumps(entry))},
+        f"{os.getenv('VERIFIER_URL', 'http://localhost:8003')}/write-ordered",
+        json={"key": b64(key), "value": b64(json.dumps(entry)), "view": "decision"},
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
-        timeout=15,
+        timeout=30,
     )
     write_resp.raise_for_status()
     assert write_resp.json().get("verified"), write_resp.json()

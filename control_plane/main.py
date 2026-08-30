@@ -753,6 +753,96 @@ _TOOL_CALL_PREFIX = b"tool_call:"
 # P3c3a-3's tombstone join is a getall rather than a scan.
 _MAX_SCAN_LIMIT = 2500
 
+# D32 (Phase 3c-3b): the view indexes the ordered page selects through, and
+# the shared counter that scores them. Named to match
+# verifier/main.py::_VIEW_SETS - one counter, one position per commit, one
+# zset per view, so a later view is a new zset over the same numbers rather
+# than a second backfill.
+#
+# zscan carries the same 2500 ceiling scan does (verified live), so the
+# limit+1 handling P3c3a-2 established applies here unchanged.
+_VIEW_DECISION = b"ail_view:decision:v1"
+_VIEW_INTENT   = b"ail_view:intent:v1"
+
+
+class OrderingFault(Exception):
+    """D33 (Phase 3c-3b): the index and the ledger disagree about order.
+
+    zscan returns the caller's score and the resolved `entry.tx` in the same
+    response, so checking that they agree costs no extra call. Under D32's
+    CAS this is no longer a defence against a writer that can misorder - the
+    ledger refuses to commit an out-of-order position at all. It is a cheap
+    assertion that the enforcement is still in place, and it is what would
+    catch the precondition having been dropped.
+
+    **A disagreement is a fault, not a sort order.** Reordering the page to
+    match the transaction ids would hide exactly the condition worth
+    reporting: an index that no longer describes the ledger it indexes. So
+    this raises, `/audit` answers 500, and nobody is shown a page that looks
+    fine.
+    """
+
+
+# A position handed out by the CAS is an integer, and the first one is 1.
+# Everything strictly below that came from the offline backfill
+# (tools/ail_backfill_index.py), which places history in (0, 1).
+_FIRST_ALLOCATED_POSITION = 1.0
+
+
+def _assert_score_order_matches_commit_order(rows: list[tuple[float, int]]) -> None:
+    """D33. `rows` is [(score, tx_id)] in the order zscan returned them, which
+    is score-descending.
+
+    A position is allocated under the CAS in the same transaction that commits
+    the record, so a higher position must name a higher transaction id. An
+    inversion between adjacent rows is the fault.
+
+    **What this covers, stated precisely.** Only positions the CAS allocated,
+    which are the integers from 1 up. Backfilled history is scored in (0, 1)
+    by an offline pass that assigns order from the transaction ids of records
+    already committed, and those records were not ordered by the CAS at all -
+    a record written before the index existed can carry a higher transaction
+    id than a record indexed after it, so comparing the two would report a
+    fault about a rule that never applied to either. D33 is an assertion that
+    the CAS enforcement is in place; it is scoped to the rows the CAS
+    produced, and it is not weakened for them.
+    """
+    allocated = [(s, tx) for s, tx in rows if s >= _FIRST_ALLOCATED_POSITION]
+    for (score_a, tx_a), (score_b, tx_b) in zip(allocated, allocated[1:]):
+        if not (score_a > score_b and tx_a > tx_b):
+            raise OrderingFault(
+                f"the view index and the ledger disagree: position {score_a} resolves to "
+                f"transaction {tx_a} and position {score_b} resolves to transaction {tx_b}, "
+                "so the index no longer describes the order the ledger committed in"
+            )
+
+
+def _zscan_view(client, token: str, view_set: bytes, limit: int) -> list[dict]:
+    """Newest-first rows from a view index.
+
+    Each row carries the score, the resolved entry's key, its transaction id
+    and its value, so the ordered page needs no second lookup to build a row
+    and D33's comparison is free.
+
+    One measured constraint on what may be used as a position: `desc: True`
+    silently omits negatively-scored members. A backfill that placed history
+    below zero would produce records that exist, are indexed, and are still
+    absent from every page - which is the defect this index exists to remove,
+    reintroduced by the migration meant to fix it. History is therefore
+    scored in (0, 1), never at or below zero.
+    """
+    resp = client.post(
+        f"{IMMUDB_URL}/api/v2/db/zscan",
+        json={
+            "set": base64.b64encode(view_set).decode(),
+            "desc": True,          # newest first: highest score is the latest commit
+            "limit": limit,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+    return resp.json().get("entries", [])
+
 
 def _ledger_decision_count(client: httpx.Client, token: str) -> int:
     """
@@ -1027,39 +1117,63 @@ def get_audit(
             if not token:
                 raise ValueError("No auth token in ImmuDB login response")
 
-            scan_resp = client.post(
-                f"{IMMUDB_URL}/api/v2/db/scan",
-                json={
-                    "prefix": base64.b64encode(_TOOL_CALL_PREFIX).decode(),
-                    "desc": True,
-                    "limit": scan_limit,
-                },
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            scan_resp.raise_for_status()
-            raw_entries = scan_resp.json().get("entries", [])
-
-            # D16 (Phase 2 completion pass): a second scan, over
-            # tool_call_intent: keys - the write a mediated tool's execution
-            # is gated behind (ledger/immudb_ledger.py::log_tool_intent),
-            # never tool_call:. Joined against the decision entries below by
-            # call_id, so an intent with no matching completion record can
-            # be surfaced instead of silently missing from this response.
+            # P3c3b-3 (Phase 3c-3b): the page is selected through the view
+            # index, not by walking keys.
             #
-            # P3c3a-3 removed what used to be the second of three scans
-            # here, over content_erasure:. The tombstone join is no longer a
-            # search at all - see _tombstoned_call_ids above.
-            intent_scan_resp = client.post(
-                f"{IMMUDB_URL}/api/v2/db/scan",
-                json={
-                    "prefix": base64.b64encode(b"tool_call_intent:").decode(),
-                    "desc": True,
-                    "limit": scan_limit,
-                },
-                headers={"Authorization": f"Bearer {token}"},
+            # What it replaces and why. This was `scan` over the `tool_call:`
+            # prefix under `desc: True`, which walks keys - and a
+            # `tool_call:` key leads with agent_id, so the page returned the
+            # lexicographically-largest agent ids and called them recent. A
+            # record written seconds ago was absent once the ledger exceeded
+            # `limit` (observed at 211 entries during p3c2-defer: the newest
+            # transaction was 573 and the page's first row was not it).
+            # `scan` has no ordering parameter and `TxScan` is not routed
+            # over REST, so no parameter fixes this - the ordering has to
+            # come from somewhere the ledger enforces, which is D32's
+            # CAS-allocated sequence.
+            #
+            # `desc: True` here means highest score first, and the score is
+            # the commit position, so this is newest first in the ledger's
+            # own commit order rather than in an accident of key layout.
+            raw_entries = _zscan_view(client, token, _VIEW_DECISION, scan_limit)
+
+            # D16 (Phase 2 completion pass), now through the intent view
+            # (P3c3b-7). The write a mediated tool's execution is gated
+            # behind (ledger/immudb_ledger.py::log_tool_intent) lands in its
+            # own view index, scored from the same shared counter. Joined
+            # against the decision entries below by call_id, so an intent
+            # with no matching completion record is surfaced instead of
+            # silently missing from this response.
+            #
+            # Why a view and not a bounded walk of `tool_call_intent:`. The
+            # join needs a bound either way, because the intent key's uuid is
+            # generated fresh at immudb_ledger.py and exists nowhere but in
+            # the key, so no per-row lookup can construct it and the orphan
+            # direction has to enumerate. Bounding a key walk would bound it
+            # by lexicographic agent id, which is the very defect this phase
+            # exists to remove - the stated bound would not mean recency. Over
+            # the view it does: this is the newest `scan_limit` intents.
+            #
+            # P3c3a-3 removed what used to be a third scan here, over
+            # content_erasure:. The tombstone join is not a search at all -
+            # see _tombstoned_call_ids above.
+            raw_intents = _zscan_view(client, token, _VIEW_INTENT, scan_limit)
+
+            # D33: the index selects, the record proves. Checked before the
+            # page is built, on both views, so a disagreement never reaches a
+            # reader as a quietly reordered page.
+            # `.get("score", 0.0)`, and float rather than int, both for
+            # reasons measured on the wire: protobuf's JSON mapping omits a
+            # zero-valued field entirely, so a score of exactly 0 arrives
+            # with no "score" key at all, and backfilled positions are
+            # fractional, so int() would collapse every one of them to 0 and
+            # manufacture a disagreement out of nothing.
+            _assert_score_order_matches_commit_order(
+                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_entries]
             )
-            intent_scan_resp.raise_for_status()
-            raw_intents = intent_scan_resp.json().get("entries", [])
+            _assert_score_order_matches_commit_order(
+                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_intents]
+            )
 
             # P3c3a-2: truncation is a measured fact about this response,
             # not an inference the caller is left to make from a row count
@@ -1096,13 +1210,17 @@ def get_audit(
             intent_by_call_id: dict[str, dict] = {}
             for raw in raw_intents:
                 try:
-                    value = json.loads(base64.b64decode(raw["value"]).decode())
+                    # P3c3b-3: a zscan row nests the resolved record under
+                    # "entry" and carries its score alongside. The key, value
+                    # and tx all come from there.
+                    entry = raw["entry"]
+                    value = json.loads(base64.b64decode(entry["value"]).decode())
                     if value.get("record_type") != "decision_intent" or not value.get("call_id"):
                         continue
                     intent_by_call_id[value["call_id"]] = {
                         **value,
-                        "tx_id": int(raw.get("tx", 0)),
-                        "encoded_key": raw.get("key", ""),
+                        "tx_id": int(entry.get("tx", 0)),
+                        "encoded_key": entry.get("key", ""),
                     }
                 except Exception as exc:
                     logger.warning("Skipping malformed intent entry: %s", exc)
@@ -1115,10 +1233,15 @@ def get_audit(
             decoded_entries: list[tuple[str, dict, int]] = []
             for raw in raw_entries:
                 try:
+                    # P3c3b-3: same shape as the intent rows above. The list
+                    # order is zscan's, which is the commit order, and it is
+                    # preserved all the way to the response - nothing below
+                    # re-sorts.
+                    entry = raw["entry"]
                     decoded_entries.append((
-                        raw.get("key", ""),
-                        json.loads(base64.b64decode(raw["value"]).decode()),
-                        int(raw.get("tx", 0)),
+                        entry.get("key", ""),
+                        json.loads(base64.b64decode(entry["value"]).decode()),
+                        int(entry.get("tx", 0)),
                     ))
                 except Exception as exc:
                     logger.warning(
@@ -1138,6 +1261,12 @@ def get_audit(
             page_call_ids |= set(intent_by_call_id)
             tombstoned_call_ids = _tombstoned_call_ids(client, token, page_call_ids)
 
+    except OrderingFault as exc:
+        # D33: surfaced, never smoothed over. Reordering to match the
+        # transaction ids would hide the one condition this check exists to
+        # find, so the page is refused instead of quietly corrected.
+        logger.error("Audit ordering fault: %s", exc)
+        raise HTTPException(status_code=500, detail=f"audit ordering fault: {exc}")
     except httpx.HTTPStatusError as exc:
         logger.error("ImmuDB HTTP error during audit scan: %s", exc)
         raise HTTPException(status_code=502, detail=f"ImmuDB returned {exc.response.status_code}")
