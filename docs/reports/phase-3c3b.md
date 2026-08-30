@@ -426,7 +426,9 @@ All false at the end. Each derived individually.
 
 ### CI
 
-**Run `33310810871`, on commit `aa0904d`, conclusion `success`.** The full suite, green. This is the authority for this phase and what the acceptance rests on.
+**Run `33318081351`, on commit `f4944b0`, conclusion `success`.** The full suite, green, covering the review pass in section 3b. This is the authority for this phase and what the acceptance rests on.
+
+Earlier green runs on this branch: `33310810871` (`aa0904d`, the phase as first built) and `33310961568` (its report commit).
 
 ### Local
 
