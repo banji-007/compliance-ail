@@ -88,9 +88,38 @@ consistency proof keeps advancing across `ExecAll` transactions. **The
 guarantee moved; it did not weaken.** Measured cost of the move: none
 distinguishable from noise (`docs/reports/phase-3c3b.md`, section 7.1).
 
-### Scores are positive and fractional below 1
+### The seam between history and live traffic
 
-Two measured constraints, both discovered by trying the obvious thing first:
+The boundary is a number, not a cursor:
+
+    positions 1 .. RESERVED_POSITIONS      backfilled history, score == entry.tx
+    positions RESERVED_POSITIONS + 1 ..    allocated by the CAS
+
+**A historical record's position is its own `entry.tx`.** That is the ledger's
+own commit order for it, already recorded and needing no reconstruction. The
+live counter is seeded above the reserve - `verifier/main.py` starts a fresh
+counter at `RESERVED_POSITIONS + 1`, and `tools/ail_backfill_index.py` raises
+an existing counter that is still running below the reserve, under the same
+precondition every allocation uses - so every live position is strictly
+greater than every historical one and the page is monotone across the
+boundary by construction.
+
+Why `entry.tx` and not a rank within the backfill pass. Ranking was the first
+implementation: history sorted by tx, then mapped onto evenly spaced values in
+(0, 1). It is monotone within one pass and not across two, because a second
+pass computes a different rank against a different denominator and interleaves
+with the first. A position that *is* the transaction id is stable however many
+passes run and in whatever order, so re-running after finding more history
+extends the ordering rather than disturbing it, and no cursor is needed to say
+where history ends.
+
+`RESERVED_POSITIONS` defaults to 1e9 and must exceed every historical
+transaction id. The backfill refuses to run rather than guess if it finds a
+record at or above it, because scoring history on top of live positions would
+interleave the two and fault D33.
+
+Two measured constraints ruled out the obvious alternatives, both discovered
+by trying them:
 
 - `zscan` under `desc: true` **silently omits negatively-scored members**,
   and an explicit `minScore` does not bring them back. A backfill that placed
@@ -100,9 +129,9 @@ Two measured constraints, both discovered by trying the obvious thing first:
 - A score of exactly `0` comes back with **no `score` field at all**, because
   protobuf's JSON mapping omits zero-valued fields.
 
-So the CAS allocates integers from 1 up, and `tools/ail_backfill_index.py`
-places history in the open interval (0, 1). History sorts below live traffic,
-which is correct: it is older, and the page is newest-first.
+Transaction ids start at 1, so both are avoided by construction. Records
+sharing one transaction share a position, which is honest: they are one
+commit, and the page presents them adjacently in an unspecified order.
 
 ## D33. The index selects, the record proves
 
@@ -117,10 +146,32 @@ phase's own "drop the precondition" mutation left 48 writes sharing 10
 positions, and the resulting duplicate scores made every sufficiently deep
 page fault.
 
-**A disagreement is a fault, not a sort order.** `/audit` answers 500.
-Reordering the page to match the transaction ids would hide precisely the
-condition worth reporting - an index that no longer describes the ledger it
-indexes - and would show a reader a page that looks fine.
+**A disagreement is a fault, not a sort order.** Reordering the page to
+match the transaction ids would hide precisely the condition worth reporting -
+an index that no longer describes the ledger it indexes - and would show a
+reader a page that looks fine.
+
+**It is a chosen response with a structured body, not an escaping exception.**
+`/audit` answers `500` with:
+
+    {"detail": {"error": "audit_ordering_fault",
+                "message": "<the two positions and the transactions they resolve to>",
+                "view": "decision" | "intent",
+                "disagreement": {"higher_position": {"position", "transaction"},
+                                 "lower_position":  {"position", "transaction"}},
+                "page_served": false,
+                "transient": false,
+                "remediation": "<what to do>"}}
+
+`500` and not `4xx`, because nothing about the request is wrong; `500` and not
+`503`, because the condition will not heal on its own - the ledger is
+append-only and a position once written cannot be withdrawn, so the "try again
+shortly" that `503` promises would be false. `page_served` and `transient` are
+stated in the body rather than left for a caller to infer from a status code,
+so no reader mistakes the fault for an empty ledger or for a blip worth
+retrying. The handler is deliberately the first in `get_audit`: anything
+broader above it would swallow the fault into a `503 ImmuDB unavailable` and
+tell a reader something false.
 
 **What the check covers, stated precisely.** Only positions the CAS
 allocated, which are the integers from 1 up. Backfilled history was ordered
@@ -178,8 +229,14 @@ writers gave up at 8 concurrent in either this phase's measurements or
 - `has_more` now means more *recent* records exist behind the page, which is
   a stronger claim than the one Phase 3c-3a shipped. README's Residual Limits
   states the new meaning rather than leaving both alive.
-- A position is a float64 score, so positions stay exact to 2^53. At one
-  write per second that is about 285 million years.
+- A position is a float64 score, so positions stay exact to 2^53. With the
+  reserve at 1e9 and one write per second, that is about 285 million years.
+- `POST /write` is unchanged and still live: `control_plane/main.py::
+  _write_tombstone` uses it. A tombstone is not a decision and is never a row
+  on the ordered page - it is joined by keyed lookup - so it takes no
+  position. If it took one, that position would sit in no view index and
+  reconciliation would report it as a hole on every pass. The split between
+  the two routes is asserted by tests rather than left to convention.
 
 ## References
 

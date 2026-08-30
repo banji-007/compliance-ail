@@ -69,6 +69,10 @@ SEQUENCE_KEY   = "ail_seq:commit"
 VIEW_DECISION  = "ail_view:decision:v1"
 VIEW_INTENT    = "ail_view:intent:v1"
 
+# The seam. Positions 1..RESERVED belong to backfilled history, scored at each
+# record's own transaction id; the CAS allocates from RESERVED + 1 upward.
+RESERVED_POSITIONS = int(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+
 requires_stack = pytest.mark.needs_stack("immudb", "verifier", "control_plane")
 
 _CLIENT = httpx.Client(timeout=60.0)
@@ -537,27 +541,33 @@ def test_the_order_check_accepts_agreement_and_rejects_disagreement():
     """
     cp = _load_ordering_check()
 
-    # Newest first, as zscan returns them: score descending, tx descending.
-    cp._assert_score_order_matches_commit_order([(9.0, 900), (8.0, 880), (7.0, 12)])
+    R = cp._RESERVED_POSITIONS
+
+    # Newest first, as zscan returns them: position descending, tx descending.
+    cp._assert_score_order_matches_commit_order(
+        [(R + 9.0, 900), (R + 8.0, 880), (R + 7.0, 12)])
 
     with pytest.raises(cp.OrderingFault) as caught:
-        cp._assert_score_order_matches_commit_order([(9.0, 100), (8.0, 880)])
+        cp._assert_score_order_matches_commit_order([(R + 9.0, 100), (R + 8.0, 880)])
     assert "disagree" in str(caught.value)
 
     # A single row, and none, cannot disagree with anything.
-    cp._assert_score_order_matches_commit_order([(1.0, 1)])
+    cp._assert_score_order_matches_commit_order([(R + 1.0, 1)])
     cp._assert_score_order_matches_commit_order([])
 
-    # Backfilled history is scored in (0, 1) by an offline pass, never by the
-    # CAS, so a pre-index record carrying a higher transaction id than a
-    # record indexed after it is not a disagreement about any rule that
-    # applied to either. Those rows are outside what D33 asserts, and a page
-    # mixing them with allocated positions must still pass.
-    cp._assert_score_order_matches_commit_order([(2.0, 500), (1.0, 400), (0.75, 900), (0.5, 20)])
+    # Backfilled history occupies the reserve, scored at each record's own
+    # transaction id by an offline pass and never by the CAS, so a pre-index
+    # record carrying a higher transaction id than a record indexed after it
+    # is not a disagreement about any rule that applied to either. Those rows
+    # are outside what D33 asserts, and a page mixing them with allocated
+    # positions must still pass.
+    cp._assert_score_order_matches_commit_order(
+        [(R + 2.0, 500), (R + 1.0, 400), (900.0, 900), (20.0, 20)])
 
     # Scoping them out must not scope out a real inversion above them.
     with pytest.raises(cp.OrderingFault):
-        cp._assert_score_order_matches_commit_order([(2.0, 100), (1.0, 400), (0.5, 20)])
+        cp._assert_score_order_matches_commit_order(
+            [(R + 2.0, 100), (R + 1.0, 400), (20.0, 20)])
 
 
 def test_a_disagreement_is_a_fault_and_never_a_reordering():
@@ -569,7 +579,8 @@ def test_a_disagreement_is_a_fault_and_never_a_reordering():
     it indexes. This test is what stops a later "just sort it" fix.
     """
     cp = _load_ordering_check()
-    rows = [(9.0, 100), (8.0, 880)]
+    R = cp._RESERVED_POSITIONS
+    rows = [(R + 9.0, 100), (R + 8.0, 880)]
     snapshot = list(rows)
 
     with pytest.raises(cp.OrderingFault):
@@ -602,9 +613,10 @@ def test_the_audit_read_path_runs_the_order_check_on_every_view():
         f"the intent view; found {calls} call(s). Dropping one would leave a "
         "view whose disagreement with the ledger nothing would notice."
     )
-    assert "raise HTTPException(status_code=500" in source[source.index("except OrderingFault"):][:400], (
-        "an ordering fault must reach the caller as a fault"
-    )
+    # What happens to the fault once raised is held by
+    # test_the_ordering_fault_is_answered_and_never_escapes, which checks the
+    # handler ordering and the exact response rather than a substring within
+    # an arbitrary window. This test holds only that both views are checked.
 
 
 @requires_stack
@@ -615,6 +627,168 @@ def test_a_real_page_passes_the_order_check():
         _new_decision()
     page = _audit(limit=50)
     assert page["entries"], "empty page"
+
+
+def test_the_ordering_fault_has_a_structured_face():
+    """
+    A disagreement is answered with a chosen response, not an escaping
+    exception.
+
+    The body names the error, the view, and the two positions that disagreed
+    with the transactions they resolve to, and it says out loud that no page
+    was served and that the condition will not heal. A caller must not be
+    left inferring either from a bare status code.
+
+    Tested through the body builder rather than by fabricating a live
+    disagreement: ImmuDB zsets are append-only, so a bad score written into a
+    real view would fault every subsequent page in the session.
+    """
+    cp = _load_ordering_check()
+    R = cp._RESERVED_POSITIONS
+
+    with pytest.raises(cp.OrderingFault) as caught:
+        cp._assert_score_order_matches_commit_order(
+            [(R + 9.0, 100), (R + 8.0, 880)], view="decision")
+
+    body = cp._ordering_fault_body(caught.value)
+
+    assert body["error"] == "audit_ordering_fault", body
+    assert body["view"] == "decision", body
+    assert body["page_served"] is False, (
+        "a caller must not be able to read this as an empty ledger"
+    )
+    assert body["transient"] is False, (
+        "the ledger is append-only and a written score cannot be withdrawn, "
+        "so a caller must not be invited to retry"
+    )
+    assert body["disagreement"]["higher_position"] == {
+        "position": R + 9.0, "transaction": 100}, body
+    assert body["disagreement"]["lower_position"] == {
+        "position": R + 8.0, "transaction": 880}, body
+    assert body["remediation"], "a fault with no stated next step is a dead end"
+
+    # The whole body must survive the JSON encoding the response goes through.
+    json.dumps(body)
+
+
+def test_the_ordering_fault_is_answered_and_never_escapes():
+    """
+    The handler catches OrderingFault before any broader handler, and answers
+    500 with the structured body rather than letting it reach the framework.
+
+    Static parse, for the same append-only reason as above. What it holds is
+    the wiring: that the fault has a handler at all, that the handler is
+    ahead of the generic ones (Python takes the first matching except, so an
+    `except Exception` placed above this would swallow the fault into a 503
+    "ImmuDB unavailable" and tell a reader something false), and that the
+    body is the structured one.
+    """
+    source = (REPO_ROOT / "control_plane" / "main.py").read_text(encoding="utf-8")
+    body = source[source.index("def get_audit("):]
+    body = body[:body.index(chr(10) + "@app.")]
+
+    handlers = [line.strip() for line in body.splitlines()
+                if line.startswith("    except ")]
+    assert handlers, "get_audit has no exception handlers at all"
+    assert handlers[0].startswith("except OrderingFault"), (
+        "the ordering fault must be the first handler; anything broader above "
+        f"it would swallow the fault. handlers, in order: {handlers}"
+    )
+    assert "raise HTTPException(status_code=500, detail=_ordering_fault_body(exc))" in body, (
+        "the fault must be answered with the structured body"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The two write routes, and what still uses each
+# ---------------------------------------------------------------------------
+
+@requires_stack
+def test_the_plain_write_route_still_exists_and_still_works():
+    """
+    `POST /write` did not go away when the ordered route arrived, and it is
+    not vestigial: `control_plane/main.py::_write_tombstone` is a live caller.
+
+    Phase 3c-2's lesson was that quietly leaving a path uncovered is how a
+    producer dies unnoticed. This is the direct check that the route still
+    accepts a write and still verifies it.
+    """
+    key = f"content_erasure:p3c3b-route-{uuid.uuid4().hex}"
+    body = _write_unordered(key, json.dumps({
+        "record_type": "content_erasure", "call_id": uuid.uuid4().hex,
+        "timestamp": "2026-08-30T00:00:00", "actor": "p3c3b-route-test",
+    }, separators=(",", ":")))
+
+    assert body["verified"] is True, body
+    assert body["tx_id"], body
+
+    headers = _immudb_headers()
+    assert key in _getall(headers, [key]), "the write reported success and is not in the ledger"
+
+
+@requires_stack
+def test_a_plain_write_takes_no_position_and_a_tombstone_is_not_a_view_row():
+    """
+    The split between the two routes, asserted rather than assumed.
+
+    A tombstone is not a decision and is never a row on the audit page - it
+    is joined by keyed lookup - so it takes no commit position. That is a
+    choice, and this is what stops it drifting: if a tombstone ever started
+    allocating, it would consume positions that reconciliation expects to
+    find in a view index and every pass would report holes.
+    """
+    headers = _immudb_headers()
+    before = _counter(headers)
+
+    key = f"content_erasure:p3c3b-nopos-{uuid.uuid4().hex}"
+    _write_unordered(key, json.dumps({
+        "record_type": "content_erasure", "call_id": uuid.uuid4().hex,
+        "timestamp": "2026-08-30T00:00:00", "actor": "p3c3b-route-test",
+    }, separators=(",", ":")))
+
+    after = _counter(headers)
+    assert after == before, (
+        f"a plain /write moved the sequence counter: {before} -> {after}. "
+        "Only the ordered route may allocate."
+    )
+
+    for view in (VIEW_DECISION, VIEW_INTENT):
+        indexed = {base64.b64decode(r["key"]).decode()
+                   for r in _zscan(headers, view, limit=2500)}
+        assert key not in indexed, f"a tombstone was indexed into {view}"
+
+
+def test_each_record_kind_is_written_through_the_route_that_matches_it():
+    """
+    Static parse of the production callers, so a record kind cannot quietly
+    change routes.
+
+    A decision and an intent must take the ordered route, because a record
+    with no position is absent from every ordered page. A tombstone must take
+    the plain one, because allocating for it would consume a position no view
+    holds.
+    """
+    ledger = (REPO_ROOT / "ledger" / "immudb_ledger.py").read_text(encoding="utf-8")
+    control = (REPO_ROOT / "control_plane" / "main.py").read_text(encoding="utf-8")
+
+    assert ledger.count('/write-ordered"') == 2, (
+        "the ledger client must write both the decision record and the intent "
+        "record through the ordered route"
+    )
+    assert '"view": "decision"' in ledger, "the decision write must name its view"
+    assert '"view": "intent"' in ledger, "the intent write must name its view"
+    assert '{self.verifier_url}/write"' not in ledger, (
+        "no ledger record kind may take the plain route from here"
+    )
+
+    tombstone = control[control.index("def _write_tombstone"):]
+    tombstone = tombstone[:tombstone.index(chr(10) + "def ")]
+    assert '/write"' in tombstone, "the tombstone write must take the plain route"
+    assert "/write-ordered" not in tombstone, (
+        "a tombstone must not allocate a commit position: it is never a row on "
+        "the ordered page, and the position would be one reconciliation then "
+        "reports as a hole forever"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +836,80 @@ def test_a_record_written_before_the_index_appears_in_the_ordered_page_after_bac
         "a pre-index record is still absent from the ordered page after the "
         f"backfill ran. backfill reported: {summary}"
     )
+
+
+@requires_stack
+def test_the_seam_is_monotone_across_the_boundary():
+    """
+    Every backfilled position is below every allocated one, and each side is
+    ordered by commit within itself.
+
+    This is the property the reserve exists for. History is scored at each
+    record's own `entry.tx`, which is at most RESERVED_POSITIONS; the counter
+    is seeded above the reserve, so its allocations start at
+    RESERVED_POSITIONS + 1. The boundary is a number, not a cursor, and it
+    does not move when a second backfill pass runs.
+    """
+    import ail_backfill_index
+
+    # A record from before the index, and one after it.
+    agent = f"0000-p3c3b-seam-{uuid.uuid4().hex[:8]}"
+    old_key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
+    _write_unordered(old_key, _decision_value(uuid.uuid4().hex, agent))
+    ail_backfill_index.backfill()
+    _new_decision()
+
+    headers = _immudb_headers()
+    rows = _zscan(headers, VIEW_DECISION, limit=2500)
+    scores = [float(r.get("score", 0.0)) for r in rows]
+
+    history = [x for x in scores if x <= RESERVED_POSITIONS]
+    live = [x for x in scores if x > RESERVED_POSITIONS]
+
+    assert history, "no backfilled history to check the seam against"
+    assert live, "no allocated positions to check the seam against"
+    assert max(history) < min(live), (
+        f"the seam is not monotone: highest historical position {max(history)} "
+        f"is not below lowest allocated position {min(live)}"
+    )
+    assert all(float(x).is_integer() for x in live), (
+        "an allocated position is not an integer, so it did not come from the counter"
+    )
+
+    # Within history, the position IS the transaction id, so score order and
+    # commit order are the same order by construction.
+    by_score = sorted(
+        ((float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in rows
+         if float(r.get("score", 0.0)) <= RESERVED_POSITIONS)
+    )
+    assert [score for score, _tx in by_score] == [float(tx) for _score, tx in by_score], (
+        "a backfilled position is not its record's transaction id, so the "
+        f"historical ordering is not the ledger's: {by_score[:5]}"
+    )
+
+
+@requires_stack
+def test_the_counter_is_seeded_above_the_reserve():
+    """
+    A position the CAS hands out is never inside the range history is scored
+    into, whether or not a backfill ever ran.
+
+    Two ways that holds: a fresh counter starts at RESERVED_POSITIONS + 1
+    (verifier/main.py), and a counter already running below the reserve is
+    raised to it by the backfill before it writes any score
+    (tools/ail_backfill_index.py::seed_counter_above_reserve). Without this,
+    a deployment that had been allocating before the reserve existed would
+    have live positions sitting on top of history.
+    """
+    headers = _immudb_headers()
+    _key, result = _new_decision()
+
+    assert result["seq"] > RESERVED_POSITIONS, (
+        f"the CAS allocated position {result['seq']}, which is inside the "
+        f"reserve of {RESERVED_POSITIONS} that backfilled history occupies"
+    )
+    observed = _counter(headers)
+    assert observed is not None and observed[0] > RESERVED_POSITIONS, observed
 
 
 @requires_stack

@@ -79,6 +79,85 @@ The standing rules say escalate rather than substitute, and the instruction says
 
 ---
 
+## 3b. Review pass (`p3c3b-order`, second sitting)
+
+Four questions were put to this phase before the red-team brief. Two were
+answerable from the code as it stood; two were requirements it did not yet
+meet, and the code changed to meet them.
+
+**The backfill seam, rebuilt.** As first shipped, history was scored by its
+*rank* within one backfill pass, mapped onto evenly spaced values in the open
+interval (0, 1), with the live counter starting at 1 by default. That put
+history below live traffic, but the reserve was implicit, the scores were not
+derived from `entry.tx`, and a second pass against a different denominator
+could interleave with the first - a limitation this report previously recorded
+under could-not-verify rather than fixing.
+
+It now works the way the seam should: positions 1 through
+`RESERVED_POSITIONS` (default 1e9) are reserved for history, **a historical
+record's position is its own `entry.tx`**, and the live counter is seeded
+above the reserve - `verifier/main.py` starts a fresh counter at
+`RESERVED_POSITIONS + 1`, and the backfill raises an existing counter that is
+still below the reserve, under the same precondition every allocation uses.
+The boundary is a number and it does not move. Re-running the backfill now
+extends the ordering instead of disturbing it, so the cross-run caveat is
+gone rather than documented. The backfill refuses to run if any historical
+transaction id reaches the reserve, rather than scoring history on top of
+live positions.
+
+Verified live:
+
+```
+counter        : 1000000896
+history        : 20 positions, max 928.0
+live           : 882 positions, min 1000000001.0
+monotone seam  : True
+history score == its tx: True (sample [(116.0, 116), (118.0, 118), (123.0, 123)])
+```
+
+**The fault's face.** The 500 was already a chosen response and not an
+escaping exception - `except OrderingFault` was the first handler in
+`get_audit` and raised `HTTPException(500, detail=...)`. But the body was a
+single prose string, which is not a face a caller can act on. It is now
+structured, and the two things a caller would otherwise have to infer from a
+status code are stated:
+
+```json
+{"detail": {"error": "audit_ordering_fault",
+            "message": "...position 1000005896.0 resolves to transaction 944 and...",
+            "view": "decision",
+            "disagreement": {"higher_position": {"position": 1000005896.0, "transaction": 944},
+                             "lower_position":  {"position": 1000000896.0, "transaction": 944}},
+            "page_served": false,
+            "transient": false,
+            "remediation": "..."}}
+```
+
+`500` and not `4xx` because nothing about the request is wrong, and not `503`
+because the condition will not heal: the ledger is append-only and a position
+once written cannot be withdrawn, so `503`'s implicit "try again shortly"
+would be false.
+
+**`POST /write` is alive, routed to, and covered.** It did not go away. Its
+one production caller is `control_plane/main.py::_write_tombstone`. A
+tombstone is not a decision and is never a row on the ordered page, so it
+takes no position - and if it took one, that position would sit in no view
+index and reconciliation would report it as a hole on every pass. Coverage
+was already there incidentally (`test_verifier_auth.py` on its auth,
+`test_content_states.py` on the tombstone round trip, `test_evidence_bundle.py`
+and `test_anchored_export.py` on export) but nothing asserted the *split*.
+Three tests now do, including a static parse of the production callers, so a
+record kind cannot change routes unnoticed.
+
+**The intent index allocates from the shared counter.** Confirmed in the
+code, not from memory: `_ordered_commit(client, key, value, view_set)` takes
+the view set as a parameter and uses the module-level `SEQUENCE_KEY`
+unconditionally. There is exactly one sequence key in the verifier and no
+second counter anywhere. One counter, one gapless check, positions comparable
+across both views.
+
+---
+
 ## 4. Verdict per item
 
 | Item | Verdict |
@@ -148,7 +227,7 @@ Same stack, the fix restored, clean ledger:
 
 ## 6. Enforcing tests and mutations
 
-`tests/test_audit_ordering.py`, 17 tests. Mutations applied one at a time, each with its own rebuild, each reverted before the next.
+`tests/test_audit_ordering.py`, 24 tests. Mutations applied one at a time, each with its own rebuild, each reverted before the next.
 
 | Mutation | Change | Named test | Result |
 | :--- | :--- | :--- | :--- |
@@ -158,6 +237,8 @@ Same stack, the fix restored, clean ledger:
 | m4, P3c3b-4 | ignore the comparison | `test_the_order_check_accepts_agreement_and_rejects_disagreement` | **Failed** |
 | m5, P3c3b-5 | skip the backfill for one record | `test_a_record_written_before_the_index_appears_in_the_ordered_page_after_backfill` | **Failed** |
 | m6, P3c3b-6 | report a hole as clean | `test_a_consumed_position_with_no_index_entry_is_detected` | **Failed** |
+| m7, seam | score history by rank in (0, 1) instead of by `entry.tx` | `test_the_seam_is_monotone_across_the_boundary` | **Failed** |
+| m8, seam | start the counter at 1 instead of above the reserve | `test_the_counter_is_seeded_above_the_reserve` | **Failed** |
 
 ```
 m1-precondition: APPLIED
@@ -182,10 +263,27 @@ E  AssertionError: a pre-index record is still absent from the ordered page
 
 m6-clean: APPLIED
 E  AssertionError: a consumed position with no index entry was reported clean:
-   {'state': 'clean', 'allocated': 833, 'indexed': 826, 'missing': [94, 196,
-    298, 400, 641, 773, 833], 'missing_count': 7}
+   {'state': 'clean', 'allocated': 9, 'indexed': 8, 'backfilled': 0,
+    'missing': [1000000009], 'missing_count': 1}
 E  assert 'clean' == 'holes'
+
+m7-rankscore: APPLIED
+E  AssertionError: a backfilled position is not its record's transaction id, so
+   the historical ordering is not the ledger's: [(0.5, 1)]
+E  assert [0.5] == [1.0]
+
+m8-noseed: APPLIED
+E  AssertionError: the CAS allocated position 1, which is inside the reserve of
+   1000000000 that backfilled history occupies
+E  assert 1 > 1000000000
 ```
+
+Two of these poison the ledger they run against and the order matters. m1
+leaves duplicate positions, which D33 then faults on, so a later mutation's
+named test fails for m1's reason rather than its own - m5 did exactly that on
+the first pass and was re-run against a wiped ledger to fail for its own
+reason. Each figure above is from a run where the named test failed for the
+mutation it names.
 
 ### 6.1 A mutation that got through, and what was wrong with the test
 
@@ -299,6 +397,13 @@ All false at the end. Each derived individually.
 | Eight concurrent writers move no more traffic than one, and no writer exhausts the retry budget | `python tools/ail_ordering_cost_probe.py`, transcribed in section 7.2 | **command, marked: no test covers this** |
 | An ordered selection costs nothing measurable over the key walk it replaces | `python tools/ail_ordering_cost_probe.py`, transcribed in section 7.3 | **command, marked: no test covers this** |
 | ImmuDB refuses an ExecAll whose counter precondition is stale, and omits negatively-scored members from a descending zscan | `python tools/immudb_read_api_probe.py`, and section 2's transcript | **command, marked: no test covers this** |
+| Every backfilled position is below every allocated one, and a historical position is its record's transaction id | `tests/test_audit_ordering.py::test_the_seam_is_monotone_across_the_boundary` | test |
+| The compare-and-set never allocates a position inside the range history is scored into | `tests/test_audit_ordering.py::test_the_counter_is_seeded_above_the_reserve` | test |
+| An ordering fault answers with a named error, the disagreeing pair, and that no page was served and the condition is not transient | `tests/test_audit_ordering.py::test_the_ordering_fault_has_a_structured_face` | test |
+| The ordering fault is handled ahead of every broader handler and answered with that body | `tests/test_audit_ordering.py::test_the_ordering_fault_is_answered_and_never_escapes` | test |
+| The plain write route still accepts a write and still verifies it | `tests/test_audit_ordering.py::test_the_plain_write_route_still_exists_and_still_works` | test |
+| A plain write moves no counter and puts nothing in a view index | `tests/test_audit_ordering.py::test_a_plain_write_takes_no_position_and_a_tombstone_is_not_a_view_row` | test |
+| Decisions and intents take the ordered route and tombstones take the plain one | `tests/test_audit_ordering.py::test_each_record_kind_is_written_through_the_route_that_matches_it` | test |
 | The page is ordered by commit, so `has_more` means more recent records exist behind it | `readME.md` §5, Residual Limits | residual limit |
 | Ordering the ledger serialises writing it, and the retry budget can deny traffic | `readME.md` §5, Residual Limits | residual limit |
 
@@ -308,9 +413,12 @@ All false at the end. Each derived individually.
 
 1. **The three grounding run ids have no artifact.** Section 2. Every mechanism was re-derived; the reasoning behind the three probe passes was not recovered.
 2. **D33's fault could not be demonstrated by a fixture.** ImmuDB zsets are append-only, so a fabricated bad score is permanent and would fault every later page in the session. The live evidence in 6.4 is real but arrived from a mutation rather than by design, and it is command-backed rather than tested.
-3. **The backfill's ordering guarantee holds within one run, not across runs.** A second run over records written after the first places them in (0, 1) against a larger denominator, so two batches can interleave. Stated rather than defended: it is a one-time migration, every write after it takes a CAS-allocated position, and the second run is expected to index nothing. `test_the_backfill_is_idempotent` holds that expectation.
+3. **The reserve has to be set above the ledger's highest transaction id, and set the same way in three services.** `AIL_RESERVED_POSITIONS` defaults to 1e9 in the verifier, the control plane and the anchor service, and a mismatch between them would put the seam in different places for the writer, the reader and the reconciler. Nothing checks that the three agree at runtime; the backfill checks only its own copy against the ledger, and refuses to run if a historical transaction reaches it.
+
+   (The cross-run interleaving this item previously recorded is gone: a historical position is now its own transaction id, which is stable however many passes run.)
 4. **The serialisation ceiling was measured at 8 writers on one host, against one decision-service process.** It was not measured at the replica counts a real deployment might use, because no such deployment exists: `docker-compose.yml` runs one writer and the chart runs none.
-5. **Positions are float64 and exact to 2^53.** At one write per second that is about 285 million years, so it is stated rather than guarded.
+5. **Positions are float64 and exact to 2^53.** With the reserve at 1e9 and one write per second that is about 285 million years, so it is stated rather than guarded.
+6. **One test run failed two tests and could not be reproduced.** During the review pass, one run of `tests/test_audit_ordering.py` failed `test_the_plain_write_route_still_exists_and_still_works` and the backfill test, and the same run's teardown probe reported immudb unreachable. Investigated rather than retried: immudb was `running`, exit 0, `OOMKilled: false`, `RestartCount: 0`, and neither the verifier nor the control plane logged any error for that window. Five consecutive runs since have passed. The run immediately followed a full `docker compose up --build`, which matches the host-load flakes Phase 3c-3a already recorded. **It is not explained, only bounded**: no server-side trace, not reproducible, and the failure surface was client-side. Recorded rather than dropped.
 
 ---
 
@@ -344,6 +452,8 @@ Three failures in that run were this phase's own and are fixed:
 
 ### The quarantine entry this phase removed, and why
 
+A dated erratum is appended to `docs/reports/phase-1-3.md` saying this, so a reader of that report's errata sees the retirement without having to know which later phase caused it.
+
 `tools/mapping_check.py` reported one baselined failure that no longer fails: `docs/reports/phase-1-3.md` row 14, quarantined with the reason "readME.md section 4.1 contains none of the claim's distinctive terms (sequence)".
 
 **This phase did not fix that row.** What happened is the coupling `TODO.md` already records: class (b) selects a claim's distinctive terms by document frequency across the corpus, so ordinary prose added to any cited document can change which terms are selected for an unrelated row. This phase introduced the word "sequence" into ADR-0014, this report and README, which is enough to stop "sequence" being distinctive, and row 14 stops failing as a side effect. README section 4.1 still does not contain the word.
@@ -364,7 +474,8 @@ The entry is deleted. If the statistics shift back, the row reappears as a **new
 | `anchor_service/main.py` | `reconcile_once`, and a separately-intervalled call in the existing loop. |
 | `tools/ail_backfill_index.py` | New. The one-time migration. |
 | `tools/ail_ordering_cost_probe.py` | New. Section 7's figures. |
-| `tests/test_audit_ordering.py` | New, 17 tests. |
+| `tests/test_audit_ordering.py` | New, 24 tests. |
+| `docs/reports/phase-1-3.md` | Dated erratum: row 14 left the baseline without being fixed. |
 | `tests/test_audit_read_correctness.py`, `test_deferred_verification.py`, `test_verification.py`, `test_intent_completion_visibility.py`, `test_record_profile.py` | Fixtures updated to the current write path. No assertion changed. |
 | `docs/adr/0014-ordered-audit-view-index.md` | New. D32, D33, D34. |
 | `TODO.md` | The Blocking entry closes. |

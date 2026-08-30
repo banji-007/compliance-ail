@@ -506,6 +506,29 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
 # in Phase 3c-3a's ledger count as though it were a decision.
 SEQUENCE_KEY = b"ail_seq:commit"
 
+# The seam between backfilled history and live traffic, made explicit.
+#
+# Positions 1 through RESERVED_POSITIONS belong to history: a record written
+# before the index existed is scored at its own `entry.tx`, which is the
+# ledger's own commit order for it and needs no reconstruction. The live
+# counter is seeded above the reserve, so its first allocation is
+# RESERVED_POSITIONS + 1 and every live position is strictly greater than
+# every historical one.
+#
+# What that buys over the alternative. Scoring history by its rank within one
+# backfill pass (which is what this did first) is monotone only within that
+# pass: a second pass over records written since would compute a different
+# rank against a different denominator and interleave with the first. A score
+# that *is* the transaction id is stable no matter how many passes run, in
+# what order, or how much history each one finds - so the seam is monotone
+# across the boundary permanently, and no cursor is needed to describe where
+# history ends and live traffic begins. The boundary is a number.
+#
+# The reserve has to exceed every historical transaction id or history would
+# collide with live positions. tools/ail_backfill_index.py refuses to run
+# rather than guess if it ever finds a record above the reserve.
+RESERVED_POSITIONS = int(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+
 # Versioned, and named for the view rather than for the ledger, because the
 # index is a view over the ledger and not the ledger's own ordering. A
 # second view (incident-first, say) is a second zset scored from this same
@@ -579,7 +602,13 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
             # makes exactly one writer win this, verified live: the second
             # such ExecAll is rejected with "precondition failed:
             # KeyMustNotExist".
-            next_seq = 1
+            #
+            # It starts above the reserve, not at 1, so the range history is
+            # scored into stays free even on a deployment that never runs a
+            # backfill. Making that conditional on whether history exists
+            # would put the seam in one place on one deployment and another
+            # place on the next.
+            next_seq = RESERVED_POSITIONS + 1
             precondition = schema.Precondition(
                 keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(
                     key=SEQUENCE_KEY

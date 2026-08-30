@@ -780,16 +780,72 @@ class OrderingFault(Exception):
     reporting: an index that no longer describes the ledger it indexes. So
     this raises, `/audit` answers 500, and nobody is shown a page that looks
     fine.
+
+    It carries the pair it disagreed about, so the response can name it
+    rather than hand a reader a sentence to parse. See
+    _ordering_fault_body.
     """
 
+    def __init__(self, message: str, *, view: str,
+                 higher: tuple[float, int], lower: tuple[float, int]):
+        super().__init__(message)
+        self.view = view
+        # (position, transaction) for the two adjacent rows that disagreed,
+        # `higher` being the one the index placed later in commit order.
+        self.higher = higher
+        self.lower = lower
 
-# A position handed out by the CAS is an integer, and the first one is 1.
-# Everything strictly below that came from the offline backfill
-# (tools/ail_backfill_index.py), which places history in (0, 1).
-_FIRST_ALLOCATED_POSITION = 1.0
+
+# The condition is deliberately a 500 and deliberately not a 503. It is a
+# server-side integrity failure rather than a bad request, so it is not 4xx;
+# and it will not heal on its own, because the ledger is append-only and a
+# score that has been written cannot be withdrawn, so it is not the "try
+# again shortly" that 503 promises. `transient: false` says that in the body
+# rather than leaving a caller to infer it from a retry that never succeeds.
+ORDERING_FAULT_ERROR = "audit_ordering_fault"
 
 
-def _assert_score_order_matches_commit_order(rows: list[tuple[float, int]]) -> None:
+def _ordering_fault_body(exc: "OrderingFault") -> dict:
+    """The response body for a disagreement between the index and the ledger.
+
+    Factored out of the handler so the shape a caller sees is testable
+    without fabricating a live disagreement: ImmuDB zsets are append-only, so
+    a test that wrote a bad score into a real view would leave every
+    subsequent page in the session faulted.
+    """
+    return {
+        "error": ORDERING_FAULT_ERROR,
+        "message": str(exc),
+        "view": exc.view,
+        "disagreement": {
+            "higher_position": {"position": exc.higher[0], "transaction": exc.higher[1]},
+            "lower_position": {"position": exc.lower[0], "transaction": exc.lower[1]},
+        },
+        # Both stated rather than implied. No page was served, so a caller
+        # must not treat this as an empty ledger; and retrying will return
+        # the same fault, so a caller must not treat it as a blip.
+        "page_served": False,
+        "transient": False,
+        "remediation": (
+            "The view index does not describe the order the ledger committed in. "
+            "Do not reorder or ignore it. Run the sequence reconciliation in "
+            "anchor_service to find what else is affected, and see "
+            "docs/adr/0014-ordered-audit-view-index.md."
+        ),
+    }
+
+
+# The seam. Positions 1 through _RESERVED_POSITIONS belong to backfilled
+# history, scored at each record's own transaction id
+# (tools/ail_backfill_index.py); the CAS allocates from _RESERVED_POSITIONS + 1
+# upward. Must match verifier/main.py::RESERVED_POSITIONS.
+_RESERVED_POSITIONS = int(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+_FIRST_ALLOCATED_POSITION = float(_RESERVED_POSITIONS + 1)
+
+
+def _assert_score_order_matches_commit_order(
+    rows: list[tuple[float, int]], view: str = "unknown"
+) -> None:
     """D33. `rows` is [(score, tx_id)] in the order zscan returned them, which
     is score-descending.
 
@@ -798,14 +854,19 @@ def _assert_score_order_matches_commit_order(rows: list[tuple[float, int]]) -> N
     inversion between adjacent rows is the fault.
 
     **What this covers, stated precisely.** Only positions the CAS allocated,
-    which are the integers from 1 up. Backfilled history is scored in (0, 1)
-    by an offline pass that assigns order from the transaction ids of records
-    already committed, and those records were not ordered by the CAS at all -
-    a record written before the index existed can carry a higher transaction
-    id than a record indexed after it, so comparing the two would report a
-    fault about a rule that never applied to either. D33 is an assertion that
-    the CAS enforcement is in place; it is scoped to the rows the CAS
-    produced, and it is not weakened for them.
+    which are the integers above the reserve. Backfilled history occupies the
+    reserve, scored at each record's own transaction id by an offline pass,
+    and those records were never ordered by the CAS - a record written before
+    the index existed can carry a higher transaction id than a record indexed
+    after it, so comparing the two would report a fault about a rule that
+    never applied to either. D33 is an assertion that the CAS enforcement is
+    in place; it is scoped to the rows the CAS produced, and it is not
+    weakened for them.
+
+    Within the reserve the same relation does hold - a historical score *is*
+    its transaction id, so score order and commit order are the same order by
+    construction there - but it is not asserted here, because it would be
+    asserting that a number equals itself.
     """
     allocated = [(s, tx) for s, tx in rows if s >= _FIRST_ALLOCATED_POSITION]
     for (score_a, tx_a), (score_b, tx_b) in zip(allocated, allocated[1:]):
@@ -813,7 +874,10 @@ def _assert_score_order_matches_commit_order(rows: list[tuple[float, int]]) -> N
             raise OrderingFault(
                 f"the view index and the ledger disagree: position {score_a} resolves to "
                 f"transaction {tx_a} and position {score_b} resolves to transaction {tx_b}, "
-                "so the index no longer describes the order the ledger committed in"
+                "so the index no longer describes the order the ledger committed in",
+                view=view,
+                higher=(score_a, tx_a),
+                lower=(score_b, tx_b),
             )
 
 
@@ -1169,10 +1233,12 @@ def get_audit(
             # fractional, so int() would collapse every one of them to 0 and
             # manufacture a disagreement out of nothing.
             _assert_score_order_matches_commit_order(
-                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_entries]
+                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_entries],
+                view="decision",
             )
             _assert_score_order_matches_commit_order(
-                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_intents]
+                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_intents],
+                view="intent",
             )
 
             # P3c3a-2: truncation is a measured fact about this response,
@@ -1265,8 +1331,16 @@ def get_audit(
         # D33: surfaced, never smoothed over. Reordering to match the
         # transaction ids would hide the one condition this check exists to
         # find, so the page is refused instead of quietly corrected.
-        logger.error("Audit ordering fault: %s", exc)
-        raise HTTPException(status_code=500, detail=f"audit ordering fault: {exc}")
+        #
+        # A chosen response, not an escaping exception: a structured body
+        # naming the error, the view, the two positions that disagreed and
+        # the transactions they resolve to, and saying plainly that no page
+        # was served and that the condition is not transient.
+        logger.error(
+            "Audit ordering fault in view %s: position %s -> tx %s, position %s -> tx %s",
+            exc.view, exc.higher[0], exc.higher[1], exc.lower[0], exc.lower[1],
+        )
+        raise HTTPException(status_code=500, detail=_ordering_fault_body(exc))
     except httpx.HTTPStatusError as exc:
         logger.error("ImmuDB HTTP error during audit scan: %s", exc)
         raise HTTPException(status_code=502, detail=f"ImmuDB returned {exc.response.status_code}")

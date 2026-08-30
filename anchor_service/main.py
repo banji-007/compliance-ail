@@ -273,6 +273,12 @@ def run_forever() -> None:
 
 SEQUENCE_KEY = "ail_seq:commit"
 
+# Must match verifier/main.py::RESERVED_POSITIONS. Positions at or below the
+# reserve were placed by the offline backfill and were never handed out by
+# the counter, so reconciling them against it would report a shortfall on
+# every pass.
+RESERVED_POSITIONS = int(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+
 # Must match verifier/main.py::_VIEW_SETS and control_plane/main.py.
 VIEW_SETS = ("ail_view:decision:v1", "ail_view:intent:v1")
 
@@ -348,19 +354,24 @@ def reconcile_once() -> dict:
 
         positions = collect_positions(client, headers)
 
-        # Only positions the live counter handed out are reconciled. The CAS
-        # allocates integers from 1 up; the backfill places history in the
-        # open interval (0, 1) on purpose (see tools/ail_backfill_index.py),
-        # and those were never allocated by the counter, so reconciling them
-        # against it would report a shortfall on every pass.
-        live = {int(n) for n in positions if n >= 1 and float(n).is_integer()}
-        missing = sorted(set(range(1, allocated + 1)) - live)
+        # Only positions the live counter handed out are reconciled: the
+        # integers above the reserve. Everything at or below it was placed by
+        # the backfill at a record's own transaction id and was never
+        # allocated, so counting it here would report a shortfall every pass.
+        live = {int(n) for n in positions
+                if n > RESERVED_POSITIONS and float(n).is_integer()}
+        backfilled = len(positions) - len(live)
+
+        # An empty counter reads as RESERVED_POSITIONS, so this range is empty
+        # before the first allocation rather than spanning the whole reserve.
+        first = RESERVED_POSITIONS + 1
+        missing = sorted(set(range(first, allocated + 1)) - live)
 
         result = {
             "state": "clean" if not missing else "holes",
-            "allocated": allocated,
+            "allocated": max(0, allocated - RESERVED_POSITIONS),
             "indexed": len(live),
-            "backfilled": len(positions) - len(live),
+            "backfilled": backfilled,
             "missing": missing[:100],
             "missing_count": len(missing),
         }
