@@ -318,7 +318,7 @@ All false at the end. Each derived individually.
 
 ### CI
 
-PLACEHOLDER_CI
+**Run `33310810871`, on commit `aa0904d`, conclusion `success`.** The full suite, green. This is the authority for this phase and what the acceptance rests on.
 
 ### Local
 
