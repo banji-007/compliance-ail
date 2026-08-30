@@ -17,14 +17,6 @@
       "claim": "Erasure semantics strengthened this phase"
     },
     {
-      "key": "docs/reports/phase-1-3.md#14#b#readME.md section 4.1 contains none of the claim's distinctive terms (sequence)",
-      "report": "docs/reports/phase-1-3.md",
-      "row": 14,
-      "class": "b",
-      "reason": "readME.md section 4.1 contains none of the claim's distinctive terms (sequence)",
-      "claim": "Environment setup, boot sequence, three worked demo requests"
-    },
-    {
       "key": "docs/reports/phase-1-3.md#15#b#readME.md section 4.5 contains none of the claim's distinctive terms (message)",
       "report": "docs/reports/phase-1-3.md",
       "row": 15,

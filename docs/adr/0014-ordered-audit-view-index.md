@@ -86,7 +86,7 @@ into an exception, and the decision service denies the call. Confirmed live
 that a `verifiedGet` on an `ExecAll`-written key succeeds and that the
 consistency proof keeps advancing across `ExecAll` transactions. **The
 guarantee moved; it did not weaken.** Measured cost of the move: none
-distinguishable from noise (see the report).
+distinguishable from noise (`docs/reports/phase-3c3b.md`, section 7.1).
 
 ### Scores are positive and fractional below 1
 

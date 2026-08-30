@@ -316,7 +316,41 @@ All false at the end. Each derived individually.
 
 ## 12. Suite and CI
 
-PLACEHOLDER_SUITE
+### CI
+
+PLACEHOLDER_CI
+
+### Local
+
+The full suite does not pass on this host, before or after this change, for two reasons that are properties of the machine rather than of the code. Both were established in Phase 3c-3a against a clean checkout of unmodified `main`, and are recorded in `docs/reports/phase-3c3a.md` section 12: `sigstore` cannot be installed into this host's Python without breaking `spiffe==0.2.5`'s `cryptography` pin, and several tests drive `decision_service/main.py` in-process on the host where its compose service names do not resolve (`[Errno 11001] getaddrinfo failed`).
+
+```
+51 failed, 298 passed, 9 skipped in 1097.17s (0:18:17)
+```
+
+**Every test belonging to this phase passed**, and so did the checks this phase touches:
+
+```
+tests/test_audit_ordering.py                17 passed
+tests/test_mapping_tables.py
+tests/test_docs_references_resolve.py       20 passed
+```
+
+Three failures in that run were this phase's own and are fixed:
+
+- `test_docs_references_resolve.py::test_every_referenced_docs_path_exists_in_this_commit` - the new files were not committed yet.
+- `test_docs_references_resolve.py::test_no_dangling_definite_document_references` - ADR-0014 said "see the report" without naming a path.
+- Two `test_mapping_tables.py` failures - the new report's two Residual Limits citations needed heading pins, and one stale quarantine entry (below).
+
+### The quarantine entry this phase removed, and why
+
+`tools/mapping_check.py` reported one baselined failure that no longer fails: `docs/reports/phase-1-3.md` row 14, quarantined with the reason "readME.md section 4.1 contains none of the claim's distinctive terms (sequence)".
+
+**This phase did not fix that row.** What happened is the coupling `TODO.md` already records: class (b) selects a claim's distinctive terms by document frequency across the corpus, so ordinary prose added to any cited document can change which terms are selected for an unrelated row. This phase introduced the word "sequence" into ADR-0014, this report and README, which is enough to stop "sequence" being distinctive, and row 14 stops failing as a side effect. README section 4.1 still does not contain the word.
+
+The precedent in `docs/reports/phase-3c2.md` was to reword the new prose rather than edit the quarantine record. That was the right move there and is the wrong move here, and the difference is worth stating: in the 3c-2 case the row still failed under a changed reason, so rewording restored the exact quarantined string. Here the row passes outright, so there is no failure left to quarantine - and the checker's own message says such an entry "must be deleted", because a baseline that keeps entries which no longer fail becomes a list of things that used to be wrong. Rewording would also have meant removing this phase's central technical term from three documents.
+
+The entry is deleted. If the statistics shift back, the row reappears as a **new** failure and fails the build, which is the property that makes deleting it safe.
 
 ---
 
