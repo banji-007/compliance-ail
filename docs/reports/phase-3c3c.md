@@ -367,9 +367,9 @@ All false at the end. Each was confirmed individually and derived from its own e
 | An ordered write that committed reports its real transaction and its real position | `tests/test_ledger_faults.py::test_a_committed_ordered_write_is_reported_as_committed` | test |
 | A plain write that committed reports its real transaction | `tests/test_ledger_faults.py::test_a_committed_plain_write_is_reported_as_committed` | test |
 | A committed write whose proof failed is qualified by a signed fault record in the ledger | `tests/test_ledger_faults.py::test_a_committed_unverified_record_is_qualified_by_a_fault_record` | test |
-| A second fault for one call_id retains the first as a prior version | `tests/test_ledger_faults.py::test_a_second_fault_for_one_call_id_does_not_lose_the_first` | test |
+| A second fault for one call_id retains the first as a prior version | superseded by D38 (Phase 3c-3d); see the erratum below | **marked: superseded by D38 and no test asserts it** |
 | Repairing the trust anchor does not erase the record's fault from the page | `tests/test_ledger_faults.py::test_repairing_the_trust_anchor_does_not_erase_the_fault` | test |
-| The decision path cannot reach the write path that needs no proof | `tests/test_ledger_faults.py::test_the_unverified_write_path_refuses_a_decision_record` | test |
+| The decision path cannot reach the write path that needs no proof | `tests/test_ledger_faults.py::test_the_unverified_write_path_checks_the_bytes_it_writes` | test |
 | A decision record is refused at the plain write route | `tests/test_ledger_faults.py::test_a_decision_record_is_refused_at_the_plain_write_route` | test |
 | An intent record is refused at the plain write route | `tests/test_ledger_faults.py::test_an_intent_record_is_refused_at_the_plain_write_route` | test |
 | A decision record written under another key prefix is still refused | `tests/test_ledger_faults.py::test_a_decision_record_under_a_disguised_key_is_still_refused` | test |
@@ -472,3 +472,43 @@ Two things about it. **It was invisible locally**, because every local invocatio
 ### Local
 
 Section 11 item 5 records the local figure and why it is not the signal.
+
+---
+
+## Erratum, 2026-09-01 (Phase 3c-3d)
+
+Two rows of section 10's table changed. Neither claim was over-stated when it
+was written; what changed is the system underneath one of them.
+
+**Row 4, "A second fault for one call_id retains the first as a prior
+version", is superseded.** It was true and it was not enough. `getall` returns
+the head, a prefix scan returns one row per distinct key, and this report's own
+`ledger_fault.count` came from `revision` - so a reader of the page or of a
+scan saw the last fault for a call_id and none of the others. Measured in
+Phase 3c-3d: three faults for one call_id, one row, two hidden. D38 replaced
+the key with
+`ledger_fault:{committed_tx_id:020d}:{identity}:{nonce}`, so a second fault
+about one record is a second record rather than a second version of one, and
+the test that asserted the old behaviour was replaced by
+`tests/test_fault_key_and_page_read.py::test_three_faults_about_one_record_all_survive_and_none_is_shadowed`.
+The row's backing is marked rather than repointed, because a test asserting
+the new behaviour does not back the old claim.
+
+**Row 6's test was renamed, and its claim stands.**
+`test_the_unverified_write_path_refuses_a_decision_record` is now
+`test_the_unverified_write_path_checks_the_bytes_it_writes`, because P3c3d-12
+found that the guard inspected a parallel `record` argument while the bytes
+committed were `value`: driven live, a `record` claiming `ledger_fault` with a
+decision record as `value` wrote `tool_call:a3probe001` with
+`record_type=decision`. The guard reads the bytes it is about to write now,
+and the test drives it rather than parsing it. The backing cell is repointed;
+the Claim cell is untouched.
+
+Also worth recording here rather than only in the later report: this report's
+section 10 row on the unverified write path being reachable from exactly one
+caller was backed by a line count that a binding with no parentheses defeats,
+which is how the red team found a second caller where the parse saw one. It is
+an AST reference count now
+(`tests/test_ledger_faults.py::test_the_unverified_write_path_has_exactly_one_caller_including_aliases`).
+
+See `docs/reports/phase-3c3d.md`.
