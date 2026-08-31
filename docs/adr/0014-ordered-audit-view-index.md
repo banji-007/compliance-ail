@@ -327,6 +327,60 @@ survives. Each pass writes its verdict to `AIL_RECONCILE_REPORT_PATH`, which
 is how a test observes the running service rather than its own in-process
 call.
 
+## D39. The ordered route carries the refusals, and a record key is written once
+
+Added in Phase 3c-3d, closing red-team A2 and A4 and the unlisted finding the
+same report called the most serious thing it found.
+
+`_refuse_reason_for_plain_write` was wired into `POST /write` and was called
+from nowhere else, so `/write-ordered` refused nothing at all. Every bound
+P3c3c-2 established was therefore a true statement about a route no decision
+takes any more. Measured (`docs/reports/phase-3c3d-keyprobe.md` section 12): a
+caller holding only `VERIFIER_WRITE_KEY` wrote a `ledger_fault:` key that
+`/audit` rendered as the ledger's own account of another record's standing,
+with an attacker-chosen `fault_class`, `committed_tx_id` and timestamp; and
+because the ordered route allocates a position, the same write became a page
+row with `outcome_type: null`, so `entries` exceeded `total`.
+
+**The two routes are deliberately not symmetric, and the shared refusal is
+narrower than "the same set".** `POST /write` refuses a `decision` because a
+decision with no commit position is absent from every ordered page, and
+`/write-ordered` exists to write exactly those. What the two share is the
+`ledger_fault` refusal, and that one is not a statement about which route a
+record belongs on: a fault record is this service's own account of its own
+failed proof, and one arriving from a caller on any route is an unverified
+assertion about another record's standing. Both conditions again - key prefix
+and `record_type` - because each covers the other's blind spot.
+`_REFUSED_KEY_PREFIXES` matches on `ledger_fault:`, which is still a prefix of
+D38's composite shape, so this refusal covers both key shapes unchanged: D39
+and D38 are independent.
+
+**A record key is written once.** Re-writing an existing key through the
+ordered route is not an update. The key gets a second index entry at a second
+position and both resolve to the key's current transaction, which D33 reads as
+a disagreement, so `/audit` is refused at every limit for as long as the pair
+is in the window. Measured: two ordinary well-formed writes, both
+`verified: true, committed: true`, no corruption and no privileged access, and
+HTTP 500 at limits 1, 5, 200 and 2500. The record key now carries a
+`KeyMustNotExist` precondition in the same `ExecAll`, so the losing write
+commits nothing at all and answers 409. Nothing this project writes wants a
+second version of a record key: every ledger key carries a fresh uuid, and the
+tombstone key is written once per erasure.
+
+ImmuDB names the precondition type and not the key it was about, so the one
+unretryable cause is told apart from the two retryable ones by asking the
+ledger whether the record key is present. A read that cannot run answers "not
+present", which retries; the precondition is what refuses, so a wrong answer
+there costs an attempt and never admits a second write.
+
+**What is not closed, stated rather than implied.** A caller holding the write
+key can still write a key of some other shape into a view, and it becomes a
+page row. Refusing that would mean requiring the key prefix to match the
+requested view, which would also refuse the writes
+`tests/test_reconciliation.py` uses to prove the reconciler finds a record
+indexed into the wrong view - the D37 check would lose its enforcing test.
+That is a decision this phase raises rather than takes.
+
 ## D34. The serialisation ceiling is accepted, documented, and measured
 
 The CAS globally serialises the ledger write path: every write contends on

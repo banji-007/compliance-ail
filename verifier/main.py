@@ -688,7 +688,58 @@ def _write_fault_record(client, *, record_key: bytes, record_value: bytes,
 # service about this service's own failed proof, and one arriving from
 # outside would be an unverified assertion about another record's standing.
 _REFUSED_ON_PLAIN_WRITE = frozenset({"decision", "decision_intent", FAULT_RECORD_TYPE})
-_REFUSED_KEY_PREFIXES = (b"tool_call:", b"tool_call_intent:", FAULT_KEY_PREFIX.encode())
+FAULT_KEY_PREFIX_BYTES = FAULT_KEY_PREFIX.encode()
+_REFUSED_KEY_PREFIXES = (b"tool_call:", b"tool_call_intent:", FAULT_KEY_PREFIX_BYTES)
+
+
+# D39 (Phase 3c-3d): what POST /write-ordered refuses, and why it is not the
+# same set POST /write refuses.
+#
+# The two routes are not symmetric and cannot be. `POST /write` refuses a
+# `decision` because a decision with no commit position is absent from every
+# ordered page; `/write-ordered` exists to write exactly those, so applying
+# the plain route's set here would refuse the route's own purpose. What the
+# two share is the `ledger_fault` refusal, and that one is not about which
+# route a record belongs on at all: a fault record is this service's own
+# account of its own failed proof, and one arriving from a caller on ANY
+# route is an unverified assertion about another record's standing.
+#
+# Measured on the unrefused route (docs/reports/phase-3c3d-keyprobe.md
+# section 12), a caller holding only VERIFIER_WRITE_KEY wrote a
+# `ledger_fault:` key that `/audit` rendered as the ledger's own account of a
+# record's standing, with an attacker-chosen fault_class, committed_tx_id and
+# timestamp; and because the ordered route allocates a position, the same
+# write became a page row with `outcome_type: null`, so `entries` exceeded
+# `total`.
+#
+# Both conditions again, for the same reason the plain route has two: the key
+# prefix sees a record whose `record_type` was omitted or renamed, and
+# `record_type` sees a fault record written under any key. FAULT_KEY_PREFIX
+# is still a prefix of the composite shape D38 introduces, so this refusal
+# covers both key shapes with no change - D39 and D38 are independent.
+def _refuse_reason_for_ordered_write(key: bytes, value: bytes) -> str | None:
+    """Why this record may not take POST /write-ordered, or None if it may."""
+    if key.startswith(FAULT_KEY_PREFIX_BYTES):
+        return (
+            f"key prefix {FAULT_KEY_PREFIX!r} is written by this service about its "
+            "own failed proof and is never accepted from a caller, on this route "
+            "or on POST /write"
+        )
+    try:
+        parsed = json.loads(value.decode())
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    # `==` rather than a set membership test: a record_type that is not
+    # hashable must refuse, not raise (P3c3d-9).
+    if parsed.get("record_type") == FAULT_RECORD_TYPE:
+        return (
+            f"a {FAULT_RECORD_TYPE!r} record is written by this service about its own "
+            "failed proof and is never accepted from a caller, on this route or on "
+            "POST /write"
+        )
+    return None
 
 
 def _refuse_reason_for_plain_write(key: bytes, value: bytes) -> str | None:
@@ -945,6 +996,28 @@ RESERVED_POSITIONS = validate_reserve(os.getenv("AIL_RESERVED_POSITIONS", "10000
 RESERVE_KEY = b"ail_seq:reserve"
 
 
+class RecordKeyExists(RuntimeError):
+    """This record key is already in the ledger, so the write is refused.
+
+    D39 (Phase 3c-3d). Re-writing an existing key through the ordered route
+    is not an update: the record gets a SECOND index entry at a SECOND
+    position, and both entries resolve to the key's current transaction.
+    D33's order check requires strictly increasing transaction with
+    increasing position, so two positions on one transaction is a
+    disagreement and `/audit` is refused at every limit for as long as the
+    pair stays in the window. Reproduced live before the fix: two ordinary
+    well-formed writes, both `verified: true, committed: true`, no
+    corruption and no privileged access, and the whole audit page denied.
+
+    Nothing this project writes wants a second version of a record key -
+    every ledger key carries a fresh uuid (ledger/immudb_ledger.py) and the
+    tombstone key is written once per erasure - so the write is refused
+    rather than accommodated. Refused before anything commits: the
+    KeyMustNotExist precondition is part of the same ExecAll, so a losing
+    writer wrote nothing at all.
+    """
+
+
 class ReserveMismatch(RuntimeError):
     """The ledger's bound reserve is not the reserve this service is configured
     with. Fail closed: a writer allocating against one seam and a reader
@@ -1014,6 +1087,21 @@ def _read_counter(client):
     return int(got.value.decode()), int(got.tx)
 
 
+def _record_key_present(client, key: bytes) -> bool:
+    """Is a record already committed under this key.
+
+    Asked only after a precondition failure, to tell the one unretryable
+    cause apart from the two retryable ones (D39). A read that cannot run
+    answers False, which retries - the KeyMustNotExist precondition is what
+    actually refuses, so a wrong answer here costs an attempt and never
+    admits a second write.
+    """
+    try:
+        return client.get(key) is not None
+    except Exception:
+        return False
+
+
 def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
     """One CAS-gated ExecAll. Returns (tx_id, seq, attempts).
 
@@ -1078,6 +1166,14 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
                 )
             )
 
+        # D39: the record key is written once. This is the enforcement, not
+        # a read-then-write check - a pre-read races and this does not,
+        # because the ledger evaluates it inside the same ExecAll that would
+        # do the writing.
+        record_key_precondition = schema.Precondition(
+            keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(key=key)
+        )
+
         operations = [
             schema.Op(kv=schema.KeyValue(key=key, value=value)),
             schema.Op(kv=schema.KeyValue(key=SEQUENCE_KEY, value=str(next_seq).encode())),
@@ -1085,7 +1181,7 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
                 set=view_set, score=float(next_seq), key=key, boundRef=False,
             )),
         ]
-        preconditions = [precondition]
+        preconditions = [precondition, record_key_precondition]
 
         if bound_reserve is None:
             # D36: bind it here, in the same transaction, under
@@ -1116,6 +1212,21 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
             resp = stub.ExecAll(request)
         except Exception as exc:
             if "precondition failed" in str(exc):
+                # D39: three preconditions can fail here and only two of them
+                # are worth retrying. ImmuDB names the precondition type and
+                # not the key it was about, so the one that is not retryable
+                # is identified by asking the ledger: if the record key is
+                # present, this attempt lost to it and every later attempt
+                # would lose to it too, permanently.
+                if _record_key_present(client, key):
+                    raise RecordKeyExists(
+                        f"a record is already committed under this key "
+                        f"({key.decode('utf-8', 'replace')}); the ordered route "
+                        "writes a record key once. A second write would give the "
+                        "key a second index entry at a second position, both "
+                        "resolving to the key's current transaction, which the "
+                        "order check reads as a disagreement at every limit."
+                    ) from exc
                 # Someone else advanced the counter, or bound the reserve
                 # first. Everything this attempt would have written was
                 # refused together, so there is nothing to undo - drop both
@@ -1162,6 +1273,13 @@ def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write
     happen". It now answers with the real transaction, the real position and
     committed: true, and writes a `ledger_fault:` record so the record's
     standing is durable rather than recomputed from a repairable anchor.
+
+    D39 (Phase 3c-3d): this route refuses things now. Until this phase it
+    refused nothing at all, so every bound P3c3c-2 established sat on the
+    plain route only and a caller holding VERIFIER_WRITE_KEY authored the
+    ledger's own account of another record's standing by taking this one.
+    Two refusals: a `ledger_fault` record or key on any route, and a record
+    key that is already in the ledger.
     """
     view_set = _VIEW_SETS.get(payload.view)
     if view_set is None:
@@ -1180,12 +1298,28 @@ def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write
     key   = base64.b64decode(payload.key)
     value = base64.b64decode(payload.value)
 
+    # D39 (Phase 3c-3d): refused at the route, before anything commits. A
+    # 400 rather than committed: false, for the same reason POST /write
+    # answers 400 - this is a caller asking for something that is never
+    # allowed, not a ledger that failed.
+    refusal = _refuse_reason_for_ordered_write(key, value)
+    if refusal is not None:
+        logger.error("Refused an ordered write: %s", refusal)
+        raise HTTPException(status_code=400, detail=refusal)
+
     # Split from the commit deliberately: everything before this line can
     # fail without anything having been written, and everything after it
     # has a committed transaction to report.
     try:
         client = _get_client()
         tx_id, seq, attempts = _ordered_commit(client, key, value, view_set)
+    except RecordKeyExists as exc:
+        # D39: nothing was written - the ExecAll carrying this write was
+        # refused whole - so this is a refusal and not a failed write. 409
+        # rather than 400 because the request is well-formed and the
+        # conflict is with the ledger's existing state.
+        logger.error("Refused an ordered write: %s", exc)
+        raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:
         logger.error("ordered write error: %s", exc)
         return OrderedWriteResponse(

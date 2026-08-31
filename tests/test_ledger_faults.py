@@ -41,6 +41,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
+from anchor_helpers import anchor as _anchor  # noqa: E402
 from compose_helpers import (  # noqa: E402
     COMPOSE_PROJECT, compose, requires_docker_cli, wait_for_health,
 )
@@ -132,46 +133,6 @@ def _write_plain(key: str, value: str) -> httpx.Response:
     return _CLIENT.post(f"{VERIFIER_URL}/write",
                         json={"key": _b64(key), "value": _b64(value)},
                         headers={"X-API-Key": VERIFIER_WRITE_KEY})
-
-
-# The trust-anchor surgery, run inside the verifier container because the
-# state file lives on its volume and PersistentRootService reads it only at
-# init - which is why every mode below is followed by a restart.
-_ANCHOR_SCRIPT = r'''
-import pickle, shutil, sys
-P = "/data/verifier-state/immudb.state"
-B = "/data/verifier-state/immudb.state.p3c3c-bak"
-mode = sys.argv[1] if len(sys.argv) > 1 else "show"
-if mode == "corrupt":
-    shutil.copyfile(P, B)
-    with open(P, "rb") as f:
-        states = pickle.load(f)
-    for db, st in states.items():
-        h = bytearray(st.txHash)
-        h[0] ^= 0xFF
-        st.txHash = bytes(h)
-    with open(P, "wb") as f:
-        pickle.dump(states, f)
-    print("corrupted")
-elif mode == "restore":
-    shutil.copyfile(B, P)
-    print("restored")
-'''
-
-
-def _anchor(mode: str) -> None:
-    """Corrupt or restore the verifier's persisted trust anchor, and restart."""
-    result = compose("exec", "-T", "verifier", "python", "-", mode,
-                     stdin=_ANCHOR_SCRIPT, check=False)
-    assert result.returncode == 0, (
-        f"could not {mode} the trust anchor in project {COMPOSE_PROJECT!r}: "
-        f"{result.stdout[-400:]} {result.stderr[-400:]}"
-    )
-    compose("restart", "verifier")
-    assert wait_for_health(f"{VERIFIER_URL}/health"), (
-        "the verifier did not come back after a restart; every later test in "
-        "this session would fail against a dead service"
-    )
 
 
 @pytest.fixture(scope="module")
