@@ -87,10 +87,22 @@ SEQUENCE_KEY = "ail_seq:commit"
 RESERVE_KEY = "ail_seq:reserve"
 
 
+# P3c3d-9 (Phase 3c-3d): the first integer a float64 cannot follow.
+# zscan scores are float64, so no position at or above this is distinct
+# from its neighbour. Same constant and same rule as
+# verifier/main.py::MAX_POSITION.
+MAX_POSITION = 2 ** 53
+
+
 def validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
-    """A reserve is a positive integer. Anything else refuses.
+    """A reserve is a positive integer below 2**53. Anything else refuses.
 
     Same rule and same words as verifier/main.py::validate_reserve.
+
+    P3c3d-9 (Phase 3c-3d) added the upper bound: a reserve at or above 2**53
+    makes allocated positions unrepresentable as distinct float64 scores.
+    Measured, six writes produced four scores and /audit was dead at every
+    limit from the sixth write on a virgin ledger.
     """
     try:
         value = int(str(raw).strip())
@@ -102,6 +114,14 @@ def validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
             "every allocated position would be at or below zero too, and zscan "
             "under desc omits negatively-scored members and reports a zero score "
             "as no score at all."
+        )
+    if value >= MAX_POSITION:
+        raise SystemExit(
+            f"{source} must be below 2**53 ({MAX_POSITION}); got {value}. A position is a "
+            "float64 score in a zset, and above 2**53 consecutive integers are "
+            "not distinct scores: allocated positions collapse onto each other, "
+            "the write response names a position the index does not hold, and "
+            "the order check reads the collapse as a disagreement at every limit."
         )
     return value
 

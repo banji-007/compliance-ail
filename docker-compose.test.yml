@@ -82,6 +82,13 @@ services:
       # docker-compose.yml's ail-control-plane service for why there is one
       # per writer.
       - AIL_WRITER_SIGNING_KEY=/keys/writer-control-plane.key
+      # D41 (Phase 3c-3d): the public half of the key the verifier signs
+      # fault records with. A ledger fault is presented on /audit as
+      # authoritative metadata about ANOTHER record's standing, so it is
+      # checked before it is rendered; a decision record's own state is
+      # reported as `asserted` and is never self-certified (D2), which is
+      # why that check is not extended to every row.
+      - AIL_FAULT_WRITER_PUBLIC_KEY=/keys/writer-verifier.pub
       # D36 (Phase 3c-3c): declared, not left to four independent defaults.
       # The reserve is bound into the ledger at first allocation and every
       # reader refuses on disagreement, so this value and the verifier's and
@@ -169,7 +176,12 @@ services:
       # why. tests/ run on the host (localhost), which this still reaches.
       - "127.0.0.1:8003:8003"
     environment:
-      - IMMUDB_ADDR=immudb:3322
+      # Substituted at invocation time so a test can put an interposer
+      # between this service and ImmuDB without changing anything on disk
+      # (P3c3d-6: the attack that proves `committed` is a fact about the
+      # ledger needs the write to commit and the NEXT RPC on the same
+      # connection to fail). Default unchanged.
+      - IMMUDB_ADDR=${IMMUDB_ADDR:-immudb:3322}
       - IMMUDB_USER=${IMMUDB_USER:-immudb}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
       - IMMUDB_SIGNING_PUBKEY=/keys/signing.pub

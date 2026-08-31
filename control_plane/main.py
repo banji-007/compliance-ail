@@ -51,7 +51,9 @@ for _provenance_parent in (
             sys.path.insert(0, _provenance_parent)
         break
 
-from provenance.record_signature import load_signing_key, sign_record  # noqa: E402
+from provenance.record_signature import (  # noqa: E402
+    load_signing_key, load_verifying_key, sign_record, verify_record,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -501,7 +503,7 @@ def _write_tombstone(call_id: str) -> None:
     # (the record is there) from a record that genuinely is not in the tree.
     # A compromised server defeats both, which is why this is stated as
     # confirming presence rather than as re-verifying anything.
-    if not _tombstone_present_in_ledger(call_id):
+    if not _tombstone_present_in_ledger(call_id, result.get("tx_id")):
         raise RuntimeError(
             "Tombstone write reported committed but no record is present under "
             f"content_erasure:{call_id}; refusing the erasure"
@@ -517,15 +519,34 @@ def _write_tombstone(call_id: str) -> None:
             "error_class": result.get("error_class")}
 
 
-def _tombstone_present_in_ledger(call_id: str) -> bool:
-    """Is there a content_erasure record under this call_id's exact key.
+def _tombstone_present_in_ledger(call_id: str, expected_tx: int | None) -> bool:
+    """Is THIS call's content_erasure record under this call_id's exact key.
 
     An exact `getall` against ImmuDB's own REST route, not a verified read:
     this is called precisely when a proof has failed, so a verified read
     would fail the same way and answer a different question than the one
     being asked. What it establishes is narrow and is used narrowly - a
-    record exists under this key.
+    record exists under this key, at this transaction.
+
+    **P3c3d-7 (Phase 3c-3d): at this transaction.** It used to ask only
+    whether a tombstone existed, so a tombstone written by some earlier
+    erasure satisfied a later call's confirmation - the confirmation would
+    pass for a write that never landed. `expected_tx` is the transaction the
+    write response named, and the entry the ledger holds has to be at it.
+    Narrow, and it is a correctness question on the GDPR path: this
+    confirmation is the only thing standing between a refused-looking write
+    and a deleted row.
+
+    No transaction to check against is not a confirmation. It fails closed,
+    the same rule the exception handler below applies.
     """
+    if not expected_tx:
+        logger.error(
+            "Could not confirm the tombstone for call_id=%s: the write response "
+            "named no transaction, so there is nothing to confirm it against",
+            call_id,
+        )
+        return False
     try:
         with httpx.Client(timeout=15) as client:
             login = client.post(f"{IMMUDB_URL}/api/v2/login", json={
@@ -553,8 +574,17 @@ def _tombstone_present_in_ledger(call_id: str) -> bool:
             value = json.loads(base64.b64decode(raw["value"]).decode())
         except Exception:
             continue
-        if value.get("record_type") == "content_erasure" and value.get("call_id") == call_id:
-            return True
+        if value.get("record_type") != "content_erasure" or value.get("call_id") != call_id:
+            continue
+        if int(raw.get("tx", 0)) != int(expected_tx):
+            logger.error(
+                "A content_erasure record exists for call_id=%s at transaction %s, "
+                "and this call's write reported transaction %s. That is a different "
+                "tombstone; refusing to treat it as confirmation of this one.",
+                call_id, raw.get("tx"), expected_tx,
+            )
+            continue
+        return True
     return False
 
 
@@ -866,6 +896,47 @@ _VIEW_INTENT   = b"ail_view:intent:v1"
 _FAULT_KEY_PREFIX  = "ledger_fault:"
 _FAULT_RECORD_TYPE = "ledger_fault"
 
+# D38 (Phase 3c-3d). The verifier's copy is verifier/main.py's
+# FAULT_KEY_TX_PAD and fault_key_tx_bound, and what has to agree between the
+# two modules is the whole key format and not just the prefix: the writer
+# builds `ledger_fault:{tx:020d}:{identity}:{nonce}` and this module builds
+# the window bounds `[ledger_fault:{lo:020d}, ledger_fault:{hi+1:020d})` from
+# the same rule. A pad that disagreed would produce a window that silently
+# excludes the faults it was asked for.
+# tests/test_ledger_vocabulary.py compares what the two produce.
+_FAULT_KEY_TX_PAD = 20
+
+
+def _fault_key_tx_bound(tx_id: int) -> str:
+    """`ledger_fault:{tx_id:020d}` - a bound for the page's range read."""
+    return f"{_FAULT_KEY_PREFIX}{tx_id:0{_FAULT_KEY_TX_PAD}d}"
+
+
+# D41 (Phase 3c-3d): the key a fault record has to be signed by before this
+# service renders it as another record's standing. Path, not key material -
+# the public half, mounted read-only like every other file this service
+# reads from /keys.
+_FAULT_WRITER_PUBLIC_KEY = os.getenv("AIL_FAULT_WRITER_PUBLIC_KEY",
+                                     "/keys/writer-verifier.pub")
+
+
+class BoundedReadFault(Exception):
+    """D42 (Phase 3c-3d): a bounded read returned something outside its bound.
+
+    ImmuDB's REST route drops an unrecognised field without comment, so a
+    bounded read whose bound is misspelled becomes an unbounded read at HTTP
+    200 and nothing in the response distinguishes the two - `endkey` for
+    `endKey` is the whole distance between a correct read and a wrong one
+    (docs/reports/phase-3c3d-keyprobe.md section 2). The assertion that bites
+    is therefore on what came back, not on what was sent: a dropped bound
+    only reveals itself when something out-of-window arrives.
+
+    Raised rather than logged. A page whose fault join silently widened is a
+    page that could name the wrong record's standing, and this project's rule
+    for a check that cannot be trusted is to refuse rather than serve with a
+    caveat.
+    """
+
 
 class OrderingFault(Exception):
     """D33 (Phase 3c-3b): the index and the ledger disagree about order.
@@ -979,12 +1050,24 @@ def _ordering_fault_body(exc: "OrderingFault") -> dict:
 # disagrees with the bound one - paging against a different seam than the
 # writer allocated against would put live positions inside the reserve,
 # where D33 does not check them and reconciliation does not count them.
+# P3c3d-9 (Phase 3c-3d): the first integer a float64 cannot follow.
+# zscan scores are float64, so no position at or above this is distinct
+# from its neighbour. Same constant and same rule as
+# verifier/main.py::MAX_POSITION.
+MAX_POSITION = 2 ** 53
+
+
 def _validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
-    """A reserve is a positive integer. Anything else refuses at load.
+    """A reserve is a positive integer below 2**53. Anything else refuses at load.
 
     Same rule and same words as verifier/main.py::validate_reserve. Three
     copies because three images do not import each other; the value bound
     into the ledger is what actually keeps them honest.
+
+    P3c3d-9 (Phase 3c-3d) added the upper bound: a reserve at or above 2**53
+    makes allocated positions unrepresentable as distinct float64 scores.
+    Measured, six writes produced four scores and /audit was dead at every
+    limit from the sixth write on a virgin ledger.
     """
     try:
         value = int(str(raw).strip())
@@ -996,6 +1079,14 @@ def _validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
             "every allocated position would be at or below zero too, and zscan "
             "under desc omits negatively-scored members and reports a zero score "
             "as no score at all."
+        )
+    if value >= MAX_POSITION:
+        raise RuntimeError(
+            f"{source} must be below 2**53 ({MAX_POSITION}); got {value}. A position is a "
+            "float64 score in a zset, and above 2**53 consecutive integers are "
+            "not distinct scores: allocated positions collapse onto each other, "
+            "the write response names a position the index does not hold, and "
+            "the order check reads the collapse as a disagreement at every limit."
         )
     return value
 
@@ -1153,12 +1244,276 @@ def _ledger_decision_count(client: httpx.Client, token: str) -> int:
     return int(resp.json().get("count", 0))
 
 
+# --- Phase 3c-3d: the page-side fault read ---------------------------------
+#
+# Three things happen below and they are separate on purpose.
+#
+#   _fault_writer_key      D41: the one key a fault must be signed by before
+#                          this page presents it as another record's standing.
+#   _rendered_fault        D41 + D11: decode, classify, check the signature.
+#   _faults_in_tx_window   D38 + D42: one paginated, half-open range scan over
+#                          the page's own transaction window.
+#
+# The legacy exact `getall` is unchanged and stays fused with the tombstone
+# join (P3c3d-4). It keeps exactly today's keys - no keys are added to it,
+# because under D38's nonce a new-shape key is not derivable from a page row
+# and cannot go into a `getall` at all. The whole added cost is the range
+# read: two round trips per page against one before.
+
+_fault_writer_key_cache = None
+_fault_writer_key_loaded = False
+
+
+def _fault_writer_key():
+    """The verifier's writer public key, or None if it could not be loaded.
+
+    Cached, including the failure: the path comes from this process's own
+    environment and does not change under it, and retrying a missing file on
+    every page would be a per-request stat for a condition an operator has to
+    fix anyway. Logged once, at error, because the consequence is that no
+    fault renders.
+    """
+    global _fault_writer_key_cache, _fault_writer_key_loaded
+    if _fault_writer_key_loaded:
+        return _fault_writer_key_cache
+    _fault_writer_key_loaded = True
+    try:
+        _fault_writer_key_cache = load_verifying_key(_FAULT_WRITER_PUBLIC_KEY)
+    except Exception as exc:
+        logger.error(
+            "Could not load the fault writer's public key from %s (%s: %s). No "
+            "ledger fault will be rendered on any audit page until this is "
+            "fixed: a fault is presented as authoritative metadata about "
+            "another record, and an unchecked one is an assertion by whoever "
+            "wrote it.",
+            _FAULT_WRITER_PUBLIC_KEY, type(exc).__name__, exc,
+        )
+        _fault_writer_key_cache = None
+    return _fault_writer_key_cache
+
+
+def _rendered_fault(raw: dict) -> tuple[str, dict] | None:
+    """One ledger entry to (committed_key, the object a page row carries).
+
+    None if the entry is not a fault record, or is a fault this service will
+    not present.
+
+    **D41: a fault is verified before it is rendered as a record's standing,
+    and this is deliberately not what happens to a decision record.** That
+    asymmetry is a considered boundary, not an oversight, and is stated here
+    rather than left to be inferred. `/audit` renders a decision record
+    without checking its writer signature, and at the default `verify=false`
+    without checking its inclusion proof either - but a record's own state is
+    explicitly reported as `asserted` and is never self-certified (D2,
+    ADR-0006), whereas a fault is presented as authoritative metadata about
+    *another* record. Extending this check to every row on the default page
+    would be the per-record round trip D29 removed, and it must not be
+    extended.
+
+    The ceiling, stated with it: every service mounts `./keys:/keys:ro`, so a
+    fingerprint names a key and not a component (ADR-0012, corrected in Phase
+    3c-3c). This establishes that a fault was signed by the writer key the
+    verifier signs faults with, and the D22 mount split is what would make
+    that a statement about which process wrote it. Worth having and bounded.
+    """
+    try:
+        value = json.loads(base64.b64decode(raw["value"]).decode())
+    except Exception as exc:
+        logger.warning("Skipping an unreadable page-side fault entry: %s", exc)
+        return None
+    if not isinstance(value, dict) or value.get("record_type") != _FAULT_RECORD_TYPE:
+        return None
+
+    committed_key = value.get("committed_key")
+    if not committed_key or not isinstance(committed_key, str):
+        logger.warning(
+            "Skipping a fault record that does not name the record it qualifies"
+        )
+        return None
+
+    verifying_key = _fault_writer_key()
+    if verifying_key is None or not verify_record(value, verifying_key):
+        logger.error(
+            "Refusing to render a ledger fault for %s: its writer signature is "
+            "absent or does not check out against %s. It is in the ledger and "
+            "readable there; what it is not is this page's account of that "
+            "record's standing.",
+            committed_key, _FAULT_WRITER_PUBLIC_KEY,
+        )
+        return None
+
+    return committed_key, {
+        "fault_class": value.get("fault_class"),
+        "error_class": value.get("error_class"),
+        "committed_tx_id": value.get("committed_tx_id"),
+        "committed_position": value.get("committed_position"),
+        "timestamp": value.get("timestamp"),
+        "ledger_key": raw.get("key", ""),
+    }
+
+
+def _merge_fault(faults: dict, committed_key: str, rendered: dict,
+                 entry_tx: int, count: int) -> None:
+    """Fold one fault into the page's map, newest-first and counted.
+
+    **The `/audit` contract this settles (P3c3d-11).** With more than one
+    fault per record now possible, `ledger_fault` could be a list or stay one
+    object. It stays one object - the most recent fault, by the ledger's own
+    transaction for the fault record itself - with `count` reporting how many
+    faults exist for that record. Reasons: the field answers "what is this
+    record's standing", which the most recent fault is; a list would put an
+    unbounded structure on every row of a 2500-row page for a field that is
+    null on almost all of them; and no consumer changes, which was checked
+    rather than assumed (`ledger_fault` appears nowhere in `dashboard/` and no
+    test asserts `count`). What is lost is naming the older faults from the
+    page; they are readable in the ledger under their own keys, and the write
+    response that produced each one names it in `fault_record`.
+
+    Ordering between two faults about one record comes from the entry's own
+    `tx`, which the read that already ran returns. No timestamp component is
+    needed for it and none was added (D38).
+    """
+    existing = faults.get(committed_key)
+    if existing is None:
+        faults[committed_key] = {**rendered, "count": count, "_tx": entry_tx}
+        return
+    existing["count"] += count
+    if entry_tx > existing["_tx"]:
+        existing.update(rendered)
+        existing["_tx"] = entry_tx
+
+
+def _faults_in_tx_window(client: httpx.Client, token: str,
+                         min_tx: int, max_tx: int) -> list[dict]:
+    """Every `ledger_fault:` entry whose qualified record committed in
+    [min_tx, max_tx], in one paginated range scan.
+
+    D38 + P3c3d-3. The fault key leads with the qualified record's own
+    transaction, zero-padded to 20, so the page's own transaction window is a
+    key range and the read is bounded by the page rather than by the ledger.
+    Filtering back to the page's rows is client-side membership; the range is
+    a superset and never a subset.
+
+    **Half-open, and it has to be.** A composite key is longer than its
+    transaction component, so an `endKey` of the bare padded `hi` with
+    `inclusiveEnd=True` sorts before that transaction's own faults and
+    silently drops them - which surfaces only when `hi` is a transaction that
+    has a fault, that is, on the last row of the page. Measured: the bare
+    inclusive form returned nothing for a single-transaction window that had a
+    fault; `hi + 1` exclusive returned it (keyprobe report section 5).
+
+    **D42: the read asserts on what came back.** An unrecognised or misspelled
+    parameter is dropped by the REST route without comment, so a bounded read
+    degrades to an unbounded one at HTTP 200 with nothing in the response
+    saying so. Every returned key is checked against the bound that was
+    actually requested for that page.
+
+    Paginated on `seekKey`, the key analogue of the reconciler's `minScore`
+    cursor, because `scan` caps a result at 2500 silently: omitting `limit`
+    and passing `limit=0` both return 2500 rows with a 200 and no truncation
+    flag (keyprobe report section 3).
+    """
+    seek = _fault_key_tx_bound(min_tx).encode()
+    end = _fault_key_tx_bound(max_tx + 1).encode()
+    inclusive_seek = True
+    entries: list[dict] = []
+
+    while True:
+        resp = client.post(
+            f"{IMMUDB_URL}/api/v2/db/scan",
+            json={
+                "seekKey": base64.b64encode(seek).decode(),
+                "inclusiveSeek": inclusive_seek,
+                "endKey": base64.b64encode(end).decode(),
+                "inclusiveEnd": False,
+                "limit": _MAX_SCAN_LIMIT,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("entries", [])
+
+        for row in rows:
+            key = base64.b64decode(row.get("key", ""))
+            in_window = (key >= seek if inclusive_seek else key > seek) and key < end
+            if not in_window:
+                raise BoundedReadFault(
+                    "a bounded read returned a key outside the range it asked "
+                    f"for: {key.decode('utf-8', 'replace')!r} is not in "
+                    f"[{seek.decode()!r}, {end.decode()!r}) with "
+                    f"inclusiveSeek={inclusive_seek}. The bound was not applied, "
+                    "which is what a dropped or misspelled parameter looks like "
+                    "on this route: an unbounded read at HTTP 200."
+                )
+
+        entries.extend(rows)
+        if len(rows) < _MAX_SCAN_LIMIT:
+            return entries
+        seek = base64.b64decode(rows[-1]["key"])
+        inclusive_seek = False
+
+
+def _fault_for_row(page_faults: dict, encoded_key: str) -> dict | None:
+    """The fault qualifying the record this row renders, or None.
+
+    The row's `ledger_key` is the base64 raw ImmuDB key; a fault names the
+    record it qualifies in `committed_key`, written by the verifier as
+    `record_key.decode("utf-8", "replace")`. Decoded the same way here so the
+    two are the same string for the same bytes.
+
+    `_tx` is the bookkeeping `_merge_fault` orders on and is not part of the
+    response contract, so it is dropped here rather than rendered.
+    """
+    try:
+        record_key = base64.b64decode(encoded_key).decode("utf-8", "replace")
+    except Exception:
+        return None
+    fault = page_faults.get(record_key)
+    if fault is None:
+        return None
+    return {k: v for k, v in fault.items() if k != "_tx"}
+
+
+def _page_faults(client: httpx.Client, token: str, page_txs: list[int],
+                 legacy: dict) -> dict:
+    """This page's faults, keyed by the record key each one qualifies.
+
+    `legacy` is what the exact `getall` already found under the old
+    `ledger_fault:{call_id}` shape (P3c3d-4). The range read is added beside
+    it, over the transaction window of the rows this response will render.
+
+    **An empty page has no window.** Zero rows means min and max are
+    undefined, and the range read is skipped rather than run with an invented
+    bound. A page with rows and no faults is a different case and runs the
+    read normally, returning nothing.
+
+    The window comes from the rows the response will render, after the
+    `limit + 1` truncation, and not from the fetched set. Both are safe - a
+    window taken from the wider set is a superset, and a superset cannot
+    exclude a page row - and the rendered set is chosen anyway, because
+    "bounded by the page" is the property, and a reader must not have to work
+    out which set was meant.
+    """
+    faults: dict = dict(legacy)
+    if not page_txs:
+        return faults
+
+    for raw in _faults_in_tx_window(client, token, min(page_txs), max(page_txs)):
+        placed = _rendered_fault(raw)
+        if placed is None:
+            continue
+        committed_key, rendered = placed
+        # Each new-shape key is written once, so one entry is one fault.
+        _merge_fault(faults, committed_key, rendered, int(raw.get("tx", 0)), 1)
+    return faults
+
+
 def _tombstones_and_faults(
     client: httpx.Client, token: str, call_ids: set[str]
 ) -> tuple[set[str], dict[str, dict]]:
     """
     Which of exactly these call_ids have a content_erasure tombstone, and
-    which have a ledger_fault qualifying their record's standing.
+    which of this page's records carry a legacy ledger_fault.
 
     P3c3a-3. This replaces a prefix scan over `content_erasure:` that ran
     under GET /audit's own `limit`. The two have nothing to do with each
@@ -1185,11 +1540,22 @@ def _tombstones_and_faults(
     There is no orphan-tombstone direction to lose: nothing reads this set
     for tombstones whose call_id is not on the page.
 
-    D35 (Phase 3c-3c): the same call also asks for this page's ledger
-    faults. `ledger_fault:{call_id}` is derivable from a page row exactly
-    the way a tombstone key is, so both key shapes go into the one request
-    and the classification still goes through `record_type`. That is why
-    naming a record's fault on the page costs no extra round trip.
+    **P3c3d-4 (Phase 3c-3d): the fault half of this request is now the legacy
+    half, and it keeps exactly today's keys.** D35 asked for
+    `ledger_fault:{call_id}` alongside the tombstone key because that shape
+    was derivable from a page row exactly the way a tombstone key is. Under
+    D38 the new shape carries a nonce and is not derivable from a page row at
+    all, so it cannot go into a `getall` and is read by
+    `_faults_in_tx_window` instead. Every `ledger_fault:{call_id}` already
+    committed keeps that shape permanently, so this request keeps asking for
+    exactly the same keys it asks for today - no keys added, still fused with
+    the tombstone join, still one round trip.
+
+    The faults it returns are keyed by the record key each one qualifies and
+    not by call_id, which is the same change the range read makes and for the
+    same reason: an intent record, a decision record and an erasure tombstone
+    for one call share a call_id and are three different records, so a fault
+    about one of them is not a fault about the others.
     """
     if not call_ids:
         return set(), {}
@@ -1217,27 +1583,24 @@ def _tombstones_and_faults(
         try:
             value = json.loads(base64.b64decode(raw["value"]).decode())
             record_type = value.get("record_type")
-            call_id = value.get("call_id")
-            if not call_id:
-                continue
             if record_type == "content_erasure":
-                tombstoned.add(call_id)
-            elif record_type == _FAULT_RECORD_TYPE:
-                # `revision` on the head entry is the number of times this
-                # key has been written, and getall already returns it - so
-                # the count of faults for a call_id is free here, and no
-                # earlier fault is lost to a later one (they are prior
-                # versions of the same key, readable five ways; see
-                # docs/reports/phase-3c3c-probe.md).
-                faults[call_id] = {
-                    "fault_class": value.get("fault_class"),
-                    "error_class": value.get("error_class"),
-                    "committed_tx_id": value.get("committed_tx_id"),
-                    "committed_position": value.get("committed_position"),
-                    "timestamp": value.get("timestamp"),
-                    "count": int(raw.get("revision", 1) or 1),
-                    "ledger_key": raw.get("key", ""),
-                }
+                if value.get("call_id"):
+                    tombstoned.add(value["call_id"])
+                continue
+            if record_type != _FAULT_RECORD_TYPE:
+                continue
+            placed = _rendered_fault(raw)
+            if placed is None:
+                continue
+            committed_key, rendered = placed
+            # `revision` on the head entry is the number of times this key
+            # has been written, and getall already returns it. Under the old
+            # shape a second fault about one record was a new version of this
+            # key, so revision is the count of faults it holds and the count
+            # is free here. Under D38 each fault is its own key written once,
+            # which is why the range read below counts entries instead.
+            _merge_fault(faults, committed_key, rendered, int(raw.get("tx", 0)),
+                         int(raw.get("revision", 1) or 1))
         except Exception as exc:
             logger.warning("Skipping malformed page-side entry: %s", exc)
             continue
@@ -1573,8 +1936,21 @@ def get_audit(
                 if log_entry.get("call_id")
             }
             page_call_ids |= set(intent_by_call_id)
-            tombstoned_call_ids, page_faults = _tombstones_and_faults(
+            tombstoned_call_ids, legacy_faults = _tombstones_and_faults(
                 client, token, page_call_ids)
+
+            # P3c3d-3 (Phase 3c-3d): the page read is bounded by the page.
+            #
+            # The window is over BOTH zscans, decision and intent, and not
+            # over the decision page alone: a synthesized orphaned-intent row
+            # carries its own transaction, and a window that excluded it would
+            # exclude that row's fault. It is taken after the `limit + 1`
+            # truncation above, so it describes the rows this response will
+            # render rather than the rows that were fetched.
+            page_txs = [int(row["entry"].get("tx", 0))
+                        for row in (*raw_entries, *raw_intents)
+                        if isinstance(row.get("entry"), dict)]
+            page_faults = _page_faults(client, token, page_txs, legacy_faults)
 
     except ReserveMismatch as exc:
         # D36: fail closed, and name the value rather than the symptom. This
@@ -1583,6 +1959,19 @@ def get_audit(
         logger.error("Audit refused: %s", exc)
         raise HTTPException(status_code=503, detail={
             "error": "audit_reserve_mismatch",
+            "message": str(exc),
+            "page_served": False,
+        })
+    except BoundedReadFault as exc:
+        # D42: a bounded read that came back with something outside its bound
+        # did not apply the bound, and this project does not serve a page
+        # whose join it cannot trust. Structured like the ordering fault
+        # below, and for the same reason: naming the condition beats an
+        # "ImmuDB unavailable" that would send an operator to the wrong
+        # place.
+        logger.error("Audit refused: %s", exc)
+        raise HTTPException(status_code=500, detail={
+            "error": "bounded_read_fault",
             "message": str(exc),
             "page_served": False,
         })
@@ -1682,7 +2071,13 @@ def get_audit(
                 # ordinary case and means no fault was ever recorded for
                 # this call_id - never "not checked", because the join that
                 # produces it is exact.
-                "ledger_fault":    page_faults.get(call_id) if call_id else None,
+                # P3c3d-3/P3c3d-8: joined on the record key this fault
+                # names, not on call_id. Exact for every row, including a
+                # record that carries no call_id at all - such a record does
+                # reach a page (measured, keyprobe report section 7) and its
+                # fault was never joined onto it under any key shape,
+                # including the old one.
+                "ledger_fault":    _fault_for_row(page_faults, encoded_key),
                 # R3 (Phase 1.3 completion pass, red-team V5): a record with
                 # no "profile" key at all must render as explicitly unknown,
                 # not as a definite, valid-looking value. The previous
@@ -1764,8 +2159,11 @@ def get_audit(
                 "payload_state":   payload_state,
                 "verification":    verification,
                 # D35: same field on a synthesized intent row. An intent
-                # write can fault exactly the way a decision write can.
-                "ledger_fault":    page_faults.get(call_id),
+                # write can fault exactly the way a decision write can - and
+                # since D38 an intent fault and a decision fault for one
+                # call_id are two records rather than one, so this row gets
+                # the intent's own fault and not the decision's.
+                "ledger_fault":    _fault_for_row(page_faults, encoded_key),
                 "profile":         intent.get("profile", "unknown"),
                 "exclusivity":     None,
                 "execution_state": "unknown",

@@ -59,11 +59,18 @@ on execution is unchanged, and only the description of the ledger changed.
 The durable half is the fault record. A page's `unverifiable` is computed
 fresh at read time, so repairing the anchor makes the same record read
 verified on the next page and nothing says its write-time proof failed.
-`ledger_fault:{call_id}` is a record, so it persists. It is written by the
-one path in this service that accepts a committed-unverified write, because
-that is exactly what it is describing, and the decision path cannot reach
-that path: _set_without_verification refuses any record that is not a
-ledger_fault, and POST /write refuses a ledger_fault outright.
+A `ledger_fault:` record persists. It is written by the one path in this
+service that accepts a committed-unverified write, because that is exactly
+what it is describing, and the decision path cannot reach that path:
+_set_without_verification refuses any bytes that are not a ledger_fault
+record, and both write routes refuse a ledger_fault arriving from a caller.
+
+D38/D39 (Phase 3c-3d): the fault key is
+`ledger_fault:{committed_tx_id:020d}:{identity}:{nonce}`, so two faults about
+one record are two records rather than two versions of one, and faults about
+an intent, a decision and a tombstone sharing a call_id no longer collide.
+`/write-ordered` refuses what it used to accept, and a record key is written
+once.
 
 D36 (Phase 3c-3c): the reserve is bound into the ledger at first allocation,
 under KeyMustNotExist in the same ExecAll. Raising AIL_RESERVED_POSITIONS
@@ -80,6 +87,7 @@ import os
 import pathlib
 import sys
 import threading
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -547,25 +555,24 @@ def health():
 # anywhere recording that its write-time proof failed. Demonstrated live in
 # docs/reports/phase-3c3c.md.
 #
-# So the durable qualification is a record. Key `ledger_fault:{call_id}`,
-# joined by the same exact `getall` the tombstone join uses (P3c3a-3), and
-# classified by `record_type` rather than by key shape - D11's discipline,
-# unchanged. call_id is the only thing on every page row from which an exact
-# key is derivable, which is what keeps this a join rather than a scan.
+# So the durable qualification is a record, classified by `record_type`
+# rather than by key shape - D11's discipline, unchanged.
 #
-# A second fault for the same call_id is a new version of the same key,
-# written by an unconditional set. Measured on this project's own REST route
-# (docs/reports/phase-3c3c-probe.md): a prior version stays readable five
-# ways, `getall` already returns `revision` on the head entry so a count of
-# faults costs no extra call, and `scan` over a prefix returns one row per
-# distinct key so versions do not inflate anything already walking it. An
-# unconditional set appends rather than replaces, so there is no read to race
-# and no earlier fault is lost.
+# D38 (Phase 3c-3d) replaced the key. It was `ledger_fault:{call_id}`, joined
+# by the same exact `getall` the tombstone join uses, and that shape lost
+# faults in two ways: a second fault about one record was a new version of
+# the same key, so a reader saw the last one and none of the others; and an
+# intent fault, a decision fault and a tombstone fault for one `call_id`
+# collided with each other. The key is now
+# `ledger_fault:{committed_tx_id:020d}:{identity}:{nonce}` - see the block
+# above _fault_key for what each component closes - and the page reads its
+# own transaction window in one bounded range scan, with the old exact
+# `getall` kept beside it for the keys already committed under the old shape.
 FAULT_RECORD_TYPE = "ledger_fault"
 FAULT_KEY_PREFIX  = "ledger_fault:"
 
 
-def _set_without_verification(client, key: bytes, value: bytes, record: dict) -> int:
+def _set_without_verification(client, key: bytes, value: bytes) -> int:
     """An unconditional `set`, with no proof check. Returns the transaction.
 
     The one write in this system whose success does not require write-time
@@ -574,18 +581,39 @@ def _set_without_verification(client, key: bytes, value: bytes, record: dict) ->
 
     **The decision path is structurally unable to reach it.** This function
     refuses any record that is not a fault record, so the only caller that
-    gets through is _write_fault_record below; POST /write refuses a
-    ledger_fault arriving from outside; and no parameter on either route
-    selects this path. tests/test_ledger_faults.py asserts both halves.
+    gets through is _write_fault_record below; both write routes refuse a
+    ledger_fault arriving from outside (D39); and no parameter on either
+    route selects this path. tests/test_ledger_faults.py asserts both halves.
 
     The condition that produces a fault is precisely the condition that
     breaks every proof, so requiring a verified write here would mean the
     qualification can never be recorded exactly when it is needed.
+
+    **P3c3d-12 (Phase 3c-3d): the guard reads the bytes it is about to
+    write.** It used to take a parallel `record` dict and inspect that, while
+    the bytes committed were `value` - two different objects with nothing
+    requiring them to agree. Driven live before the fix (red-team A3): a
+    `record` argument claiming `ledger_fault` with a decision record as
+    `value` wrote `tool_call:a3probe001` at tx 159 with
+    `record_type=decision, outcome=policy_allow`, through the one path in
+    this system that requires no proof, with no position and no index entry.
+    The parameter is gone; there is no longer an argument that can disagree
+    with the write.
     """
-    if record.get("record_type") != FAULT_RECORD_TYPE:
+    try:
+        parsed = json.loads(value.decode())
+    except Exception as exc:
+        raise RuntimeError(
+            "refusing an unverified write whose bytes are not a JSON record: "
+            f"{type(exc).__name__}: {exc}. This path exists only for "
+            f"{FAULT_RECORD_TYPE!r}, and what is not readable cannot be shown "
+            "to be one."
+        ) from exc
+    record_type = parsed.get("record_type") if isinstance(parsed, dict) else None
+    if record_type != FAULT_RECORD_TYPE:
         raise RuntimeError(
             "refusing an unverified write for a "
-            f"{record.get('record_type')!r} record: this path exists only for "
+            f"{record_type!r} record: this path exists only for "
             f"{FAULT_RECORD_TYPE!r}, which describes a failed proof and therefore "
             "cannot itself be proven"
         )
@@ -593,14 +621,75 @@ def _set_without_verification(client, key: bytes, value: bytes, record: dict) ->
     return int(resp.id)
 
 
-def _fault_key(record_value: bytes, record_key: bytes) -> str:
-    """`ledger_fault:{call_id}`, and a named fallback where no call_id exists.
+# D38 (Phase 3c-3d): the fault key carries a transaction and a nonce.
+#
+#     ledger_fault:{committed_tx_id:020d}:{call_id or "key:"+digest}:{nonce}
+#
+# **The transaction separates faults about different records; the nonce
+# separates faults about the same record. Neither substitutes for the
+# other.** Both halves of that sentence are load-bearing and each closes a
+# defect the other does not.
+#
+# What the nonce closes. Under `ledger_fault:{call_id}` a second fault about
+# one record was a new version of the same key, so `getall` returned the head
+# and a prefix scan returned one row: measured, three faults about one record
+# gave one row and two hidden (docs/reports/phase-3c3d-keyprobe.md section
+# 10). D38 as originally written - `ledger_fault:{call_id}:{tx_id}` - did not
+# close it, because the only transaction available when the key is built is
+# `committed_tx_id`, the qualified record's own transaction, which is fixed
+# per record. Measured: `revision=2`, one key. That was a rename.
+#
+# What the transaction closes, separately. `tool_call_intent:` and
+# `tool_call:` for one call carry the same `call_id` and both take the
+# ordered route; the erasure tombstone takes `POST /write` with that same
+# `call_id`. All three can fault. Under `ledger_fault:{call_id}` an intent
+# fault, a decision fault and a tombstone fault for one call collide and
+# silently replace each other, non-adversarially, with no second writer
+# involved. A scheme keyed on `{call_id}:{nonce}` would re-merge them, and
+# would also drop the bounded page read: a transaction-leading key is what
+# lets the page ask for exactly its own window in one range scan
+# (`_faults_in_tx_window` in control_plane/main.py) instead of one prefix
+# scan per row.
+#
+# Ordering between two faults about one record comes from the `scan` entry's
+# own `tx`, which the read that already ran returns. No timestamp component
+# is needed and none is added.
+#
+# What is given up, deliberately: the fault key is no longer derivable from a
+# page row. That derivability is exactly what the original form preserved by
+# closing nothing. Anything that needs to name a specific fault key gets it
+# from the write response's `fault_record`, which carries it.
 
-    Every row `/audit` renders carries a call_id, so the join is exact for
-    everything a reader can see. A record with no call_id never reaches a
-    page, so its fault is keyed by a digest of the record key instead of
-    being dropped - an unjoinable fault is still evidence, and losing one is
-    not the alternative to inventing a second join.
+# 20 because uint64 max is 18446744073709551615, twenty digits, so overflow
+# is unreachable and the ledger is append-only - a narrower pad is a bet that
+# cannot be un-made. Measured at a deliberately small pad, both failure modes
+# past it are silent and arrive at HTTP 200: over-width keys are pulled into
+# a window that should exclude them, and a window whose own bound is
+# over-width returns empty (keyprobe report section 4).
+FAULT_KEY_TX_PAD = 20
+
+
+def fault_key_tx_bound(tx_id: int) -> str:
+    """`ledger_fault:{tx_id:020d}` - the bound a page-side range read is built
+    from, and the leading component of every fault key.
+
+    A function rather than a pair of constants because the whole format has
+    to agree between the writer here and the reader in control_plane, not
+    just the prefix. tests/test_ledger_vocabulary.py compares what the two
+    modules produce for the same transaction.
+    """
+    return f"{FAULT_KEY_PREFIX}{tx_id:0{FAULT_KEY_TX_PAD}d}"
+
+
+def _fault_identity(record_value: bytes, record_key: bytes) -> str:
+    """What the fault names: the record's call_id, or a digest of its key.
+
+    A record with no `call_id` does reach a page - measured through
+    `/write-ordered` and `GET /audit` (keyprobe report section 7), which
+    corrects what this comment used to claim - and the row's `ledger_key` is
+    the base64 raw key, so `sha256(record_key)[:32]` is derivable from a page
+    row today with no format change. The fallback is not an unjoinable last
+    resort; it is a second identity that a reader can compute.
     """
     try:
         value = json.loads(record_value.decode())
@@ -608,9 +697,15 @@ def _fault_key(record_value: bytes, record_key: bytes) -> str:
     except Exception:
         call_id = None
     if call_id:
-        return f"{FAULT_KEY_PREFIX}{call_id}"
-    digest = hashlib.sha256(record_key).hexdigest()[:32]
-    return f"{FAULT_KEY_PREFIX}key:{digest}"
+        return str(call_id)
+    return "key:" + hashlib.sha256(record_key).hexdigest()[:32]
+
+
+def _fault_key(record_value: bytes, record_key: bytes, committed_tx_id: int,
+               nonce: str) -> str:
+    """The composite key, assembled from its three named parts."""
+    identity = _fault_identity(record_value, record_key)
+    return f"{fault_key_tx_bound(committed_tx_id)}:{identity}:{nonce}"
 
 
 def _write_fault_record(client, *, record_key: bytes, record_value: bytes,
@@ -626,11 +721,14 @@ def _write_fault_record(client, *, record_key: bytes, record_value: bytes,
     is leave a committed record unqualified with nothing recording why, which
     is the condition this record exists to remove.
     """
-    key = _fault_key(record_value, record_key)
+    # D38: the nonce is minted here, once per fault, and is what makes two
+    # faults about one record two records rather than two versions of one.
+    nonce = uuid.uuid4().hex[:16]
+    key = _fault_key(record_value, record_key, tx_id, nonce)
     fault = {
         "record_type": FAULT_RECORD_TYPE,
         "fault_class": "write_verification_failed",
-        "call_id": key[len(FAULT_KEY_PREFIX):],
+        "call_id": _fault_identity(record_value, record_key),
         # The committed record this fault qualifies, named as a key rather
         # than described, so a reader joins instead of searching.
         "committed_key": record_key.decode("utf-8", "replace"),
@@ -654,7 +752,7 @@ def _write_fault_record(client, *, record_key: bytes, record_value: bytes,
         signing_key, verifying_key = get_writer_keys()
         signed = sign_record(fault, signing_key, verifying_key)
         raw = json.dumps(signed, separators=(",", ":")).encode()
-        fault_tx = _set_without_verification(client, key.encode(), raw, signed)
+        fault_tx = _set_without_verification(client, key.encode(), raw)
     except Exception as exc:
         logger.error(
             "FAULT RECORD NOT WRITTEN for committed tx=%s key=%s: %s: %s. The record "
@@ -758,6 +856,19 @@ def _refuse_reason_for_plain_write(key: bytes, value: bytes) -> str | None:
     if not isinstance(parsed, dict):
         return None
     record_type = parsed.get("record_type")
+    # P3c3d-9 (Phase 3c-3d): `record_type in _REFUSED_ON_PLAIN_WRITE` against
+    # an unhashable value raised TypeError and answered 500 on a route whose
+    # whole job is to refuse deliberately. Nothing was written, so the effect
+    # was fail-closed, but an unhandled exception is not a refusal. A
+    # record_type that is not a string is not a classification at all, and it
+    # is refused as one rather than reaching the set membership test.
+    if record_type is not None and not isinstance(record_type, str):
+        return (
+            f"record_type must be a string; got {type(record_type).__name__}. A "
+            "record_type is how this ledger classifies a record (D11), and a "
+            "value that is not one cannot be checked against the classes this "
+            "route refuses"
+        )
     if record_type == FAULT_RECORD_TYPE:
         return (
             f"a {FAULT_RECORD_TYPE!r} record is written by this service about its own "
@@ -794,6 +905,12 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
     qualifying it - not tx_id null, which reads as "the write did not
     happen" and, on the tombstone path, puts the erasure bookkeeping and the
     ledger into exactly the disagreement D11's states describe.
+
+    D40 (Phase 3c-3d): `committed` is a fact about the ledger. The state read
+    that used to sit inside this route's `try` is a second RPC issued after
+    the write has already committed, proved and persisted its anchor, and its
+    failure described the whole write as never having happened. It is now
+    outside, and the generic handler asks the ledger rather than assuming.
     """
     from ecdsa.keys import BadSignatureError
     from immudb.exceptions import ErrCorruptedData
@@ -817,10 +934,7 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
         return WriteResponse(tx_id=None, verified=False, committed=False, detail=str(exc))
 
     try:
-        resp   = client.verifiedSet(key, value)
-        state  = client.currentState()
-        logger.info("Verified write: tx=%d state_id=%d", resp.id, state.txId)
-        return WriteResponse(tx_id=resp.id, verified=True, committed=True)
+        resp = client.verifiedSet(key, value)
     except (ErrCorruptedData, BadSignatureError) as exc:
         error_class = ("consistency_failure" if isinstance(exc, ErrCorruptedData)
                        else "signature_failure")
@@ -849,8 +963,74 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
                    f"transaction {tx_id}",
         )
     except Exception as exc:
+        # D40 (Phase 3c-3d): committed describes what is in the ledger, not
+        # whether the call that would have told us succeeded. This branch used
+        # to answer committed: false unconditionally, which is the exact shape
+        # ledger/immudb_ledger.py reads as "the write did not happen".
+        # Reproduced live: a proxy that relayed the write frame and then cut
+        # the connection produced `{tx_id: null, verified: false, committed:
+        # false}` while the record sat at tx 14 and the verifier's own
+        # persisted trust anchor had advanced to 14.
+        #
+        # So the ledger is asked. Asked with the value as well as the key,
+        # which is narrower than the proof-failure branch below on purpose:
+        # there, the commit is known to have happened and only its
+        # transaction is in question, whereas here nothing is known, and a
+        # previous record under the same key would otherwise be reported as
+        # this write. Byte equality answers exactly the question being asked.
+        #
+        # `verified` stays false and no fault record is written: the proof did
+        # not fail, it could not be attempted, and that is not tamper evidence
+        # - the same rule the ordered route's corresponding branch applies.
         logger.error("verifiedSet error: %s", exc)
-        return WriteResponse(tx_id=None, verified=False, committed=False, detail=str(exc))
+        tx_id = _committed_tx_for_value(client, key, value)
+        if tx_id is None:
+            return WriteResponse(tx_id=None, verified=False, committed=False,
+                                 detail=str(exc))
+        logger.error(
+            "verifiedSet: verification could not be attempted and the record is "
+            "in the ledger at tx=%s: %s", tx_id, exc,
+        )
+        return WriteResponse(
+            tx_id=tx_id, verified=False, committed=True,
+            detail=f"verification could not be attempted: {exc}; the record "
+                   f"committed at transaction {tx_id}",
+        )
+
+    # D40: the state read is outside the proof's own try, and its failure
+    # cannot describe the write. `currentState()` is a second RPC issued after
+    # `verifiedSet` has already committed, proved and persisted the new
+    # anchor; wrapping it in the same handler let a transport failure on that
+    # call report the whole write as never having occurred. It is logged here
+    # and changes nothing about the response.
+    try:
+        state = client.currentState()
+        logger.info("Verified write: tx=%d state_id=%d", resp.id, state.txId)
+    except Exception as exc:
+        logger.warning(
+            "Verified write: tx=%d; the state read after it failed (%s). The "
+            "write committed and its proof checked out; this call describes "
+            "neither.", resp.id, exc,
+        )
+    return WriteResponse(tx_id=resp.id, verified=True, committed=True)
+
+
+def _committed_tx_for_value(client, key: bytes, value: bytes) -> int | None:
+    """The transaction holding exactly these bytes under `key`, or None.
+
+    D40. Stricter than _committed_tx_for below, and deliberately so: it is
+    called when nothing is known about whether the write landed, so a record
+    that was already under this key before the call must not be reported as
+    the call's own. Byte equality is the whole check, and it is exact.
+    """
+    try:
+        got = client.get(key)
+    except Exception as exc:
+        logger.error("Could not read back a key whose write raised: %s", exc)
+        return None
+    if got is None or got.value != value:
+        return None
+    return int(got.tx)
 
 
 def _committed_tx_for(client, key: bytes) -> int | None:
@@ -952,8 +1132,27 @@ SEQUENCE_KEY = b"ail_seq:commit"
 # position at or below zero, and `zscan` under `desc: true` silently omits a
 # negatively-scored member while a score of exactly zero arrives with no
 # score field at all. A zero or negative reserve was accepted silently.
+# P3c3d-9 (Phase 3c-3d): the first integer a float64 cannot follow.
+# zscan scores are float64, so no position at or above this is distinct
+# from its neighbour. Both the reserve and every allocation are bounded
+# by it: the reserve check catches a seam that is already past the
+# boundary, and the allocator refuses the write that would cross it.
+MAX_POSITION = 2 ** 53
+
+
 def validate_reserve(raw: str, source: str = "AIL_RESERVED_POSITIONS") -> int:
-    """A reserve is a positive integer. Anything else refuses at load."""
+    """A reserve is a positive integer below 2**53. Anything else refuses at load.
+
+    A reserve at or above 2**53 is refused too (P3c3d-9). Positions are
+    float64 scores in a zset, and 2**53 is the first integer whose successor
+    is not representable, so above it distinct positions collapse onto the
+    same score. Measured on a virgin ledger at
+    AIL_RESERVED_POSITIONS=9007199254740993: six writes produced four scores,
+    three records shared one, the response named a position the index does
+    not hold, and /audit was dead at every limit from the sixth write on. All
+    four readers agreed with each other about a number that cannot work,
+    which is what "bounds below only" bought.
+    """
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError):
@@ -968,6 +1167,14 @@ def validate_reserve(raw: str, source: str = "AIL_RESERVED_POSITIONS") -> int:
             "under desc omits negatively-scored members and reports a zero score "
             "as no score at all - the records would be indexed and still absent "
             "from every page."
+        )
+    if value >= MAX_POSITION:
+        raise RuntimeError(
+            f"{source} must be below 2**53 ({MAX_POSITION}); got {value}. A position is a "
+            "float64 score in a zset, and above 2**53 consecutive integers are "
+            "not distinct scores: allocated positions collapse onto each other, "
+            "the write response names a position the index does not hold, and "
+            "the order check reads the collapse as a disagreement at every limit."
         )
     return value
 
@@ -1164,6 +1371,21 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
                 keyNotModifiedAfterTX=schema.Precondition.KeyNotModifiedAfterTXPrecondition(
                     key=SEQUENCE_KEY, txID=last_tx
                 )
+            )
+
+        # P3c3d-9: the allocator refuses to issue a position that is not a
+        # distinct float64 score. The reserve check catches a seam that is
+        # already past the boundary; this catches the write that would cross
+        # it, which is the other half of the same property. A ledger that
+        # reaches it is out of positions and the honest answer is a failed
+        # write, which the middleware turns into a denied call.
+        if next_seq >= MAX_POSITION:
+            raise RuntimeError(
+                f"the next commit position would be {next_seq}, at or above 2**53 "
+                f"({MAX_POSITION}). A position is a float64 score in a zset, so "
+                "beyond that consecutive integers are not distinct scores and the "
+                "index stops describing the order the ledger committed in. The "
+                "write did not happen."
             )
 
         # D39: the record key is written once. This is the enforcement, not

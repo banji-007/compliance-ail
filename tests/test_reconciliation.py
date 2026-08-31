@@ -389,3 +389,69 @@ def test_reconciliation_reports_a_disagreement_no_page_can_reach():
         "no page can reach this record and reconciliation does not report it "
         f"either, so nothing does: {result['foreign'][:5]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P3c3d-9 (Phase 3c-3d): a key at more than one position.
+# ---------------------------------------------------------------------------
+
+@requires_stack
+def test_a_second_position_below_the_reserve_for_an_indexed_record_is_a_finding():
+    """
+    A5's fourth condition, which reconciled clean.
+
+    Every score below the reserve was assumed to be history and was never
+    checked against anything. Reproduced on a virgin ledger: three normal
+    writes plus one injection giving an already-indexed record a second
+    position at score 42.
+
+        {"state": "clean", "allocated": 3, "indexed": 3, "backfilled": 1,
+         "missing": [], "unallocated": [], "foreign": [], "shared": [],
+         "malformed": [], "views": {"ail_view:decision:v1": 4, ...}}
+
+        HTTP 200  rows 4  total 3
+        call_ids appearing more than once on ONE page: ['a5c1-e0bc06']
+
+    `clean`, every finding category empty, while the page showed the row
+    twice. That is C2's duplication defect wearing history's clothes, and the
+    ordering fault's own remediation points an operator at this check.
+
+    A key at two positions is always wrong, in either range: history is
+    scored at each record's own transaction, one position per record; the CAS
+    allocates one position per commit; and since D39 a record key is written
+    once. Two records SHARING a score is a different thing and is what
+    `shared` reports.
+    """
+    call_id = uuid.uuid4().hex
+    key = f"tool_call:p3c3d-dup-{uuid.uuid4().hex[:8]}:{uuid.uuid4().hex}:query_database"
+    written = _write_ordered(key, _decision_value(call_id, "p3c3d-dup"))
+
+    # Below the reserve, which is the range that was assumed to be history.
+    _zadd(VIEW_DECISION, 42.0, key)
+
+    result = _load_reconciler().reconcile_once()
+    assert result["state"] == "findings", (
+        f"a record holding two positions reconciled clean: {result}"
+    )
+    offenders = [f for f in result["duplicated"] if f["key"] == key]
+    assert offenders, (
+        "the record holding two positions is not named among the findings: "
+        f"{result['duplicated'][:5]}"
+    )
+    assert sorted(offenders[0]["positions"]) == sorted([42.0, float(written["seq"])]), (
+        f"the finding does not name both positions: {offenders[0]}"
+    )
+
+    # And the thing the finding is about: the page shows the row twice.
+    page = _CLIENT.get(f"{CONTROL_PLANE_URL}/audit", params={"limit": 2500},
+                       headers={"X-API-Key": READ_API_KEY})
+    assert page.status_code == 200, page.text[:300]
+    seen = [e["call_id"] for e in page.json()["entries"]]
+    assert seen.count(call_id) == 2, (
+        "this test is not exercising the condition it describes: the record "
+        f"appears {seen.count(call_id)} time(s) on the page"
+    )
+
+    # The running service says the same thing.
+    verdict = _next_service_verdict()
+    assert verdict["duplicated_count"] >= 1, verdict

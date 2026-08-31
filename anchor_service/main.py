@@ -337,12 +337,24 @@ SEQUENCE_KEY = "ail_seq:commit"
 RESERVE_KEY = "ail_seq:reserve"
 
 
+# P3c3d-9 (Phase 3c-3d): the first integer a float64 cannot follow.
+# zscan scores are float64, so no position at or above this is distinct
+# from its neighbour. Same constant and same rule as
+# verifier/main.py::MAX_POSITION.
+MAX_POSITION = 2 ** 53
+
+
 def validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
-    """A reserve is a positive integer. Anything else refuses at load.
+    """A reserve is a positive integer below 2**53. Anything else refuses at load.
 
     Same rule and same words as verifier/main.py::validate_reserve. Three
     copies because three images do not import each other; the ledger's bound
     value is what actually keeps them honest.
+
+    P3c3d-9 (Phase 3c-3d) added the upper bound: a reserve at or above 2**53
+    makes allocated positions unrepresentable as distinct float64 scores.
+    Measured, six writes produced four scores and /audit was dead at every
+    limit from the sixth write on a virgin ledger.
     """
     try:
         value = int(str(raw).strip())
@@ -356,6 +368,14 @@ def validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
             "every allocated position would be at or below zero too, and zscan "
             "under desc omits negatively-scored members and reports a zero score "
             "as no score at all."
+        )
+    if value >= MAX_POSITION:
+        raise RuntimeError(
+            f"{source} must be below 2**53 ({MAX_POSITION}); got {value}. A position is a "
+            "float64 score in a zset, and above 2**53 consecutive integers are "
+            "not distinct scores: allocated positions collapse onto each other, "
+            "the write response names a position the index does not hold, and "
+            "the order check reads the collapse as a disagreement at every limit."
         )
     return value
 
@@ -447,6 +467,27 @@ def collect_positions(client, headers) -> dict:
                     malformed.append({"reason": "unparseable_score",
                                       "view": view_set, "score": repr(raw_score)})
                     continue
+                # D42 (Phase 3c-3d): a bounded read asserts on what came
+                # back, in the form its bound takes. This read is bounded by
+                # `minScore` and not by keys, so the key-range assertion the
+                # page's fault read makes does not apply to it and is not
+                # bolted on; the equivalent here is that every returned row's
+                # score is inside the score bound that was asked for. Read
+                # from the row's own `score` field with `.get`, because
+                # protobuf omits a zero-valued score entirely.
+                #
+                # An unrecognised or misspelled parameter is dropped by this
+                # REST route without comment, so a bounded read whose bound
+                # did not survive becomes an unbounded one at HTTP 200 with
+                # nothing in the response saying so. Reported as a finding
+                # rather than raised, which is this function's rule for every
+                # bad row: a pass that dies on one row reports nothing about
+                # any of the others.
+                if min_score is not None and score < min_score:
+                    malformed.append({"reason": "score_outside_requested_bound",
+                                      "view": view_set, "score": score,
+                                      "requested_min_score": min_score,
+                                      "key": row.get("entry", {}).get("key", "")})
                 if "score" not in row:
                     # protobuf's JSON mapping omits a zero-valued field, so a
                     # row with no `score` key is a row scored at exactly zero.
@@ -570,7 +611,8 @@ def reconcile_once() -> dict:
                       "missing": [], "missing_count": 0, "unallocated": [],
                       "unallocated_count": 0, "foreign": [], "foreign_count": 0,
                       "shared": [], "shared_count": 0, "malformed": [],
-                      "malformed_count": 0}
+                      "malformed_count": 0, "duplicated": [],
+                      "duplicated_count": 0}
             _write_report(result)
             return result
 
@@ -588,7 +630,8 @@ def reconcile_once() -> dict:
                       "missing": [], "missing_count": 0, "unallocated": [],
                       "unallocated_count": 0, "foreign": [], "foreign_count": 0,
                       "shared": [], "shared_count": 0, "malformed": [],
-                      "malformed_count": 0}
+                      "malformed_count": 0, "duplicated": [],
+                      "duplicated_count": 0}
             _write_report(result)
             return result
         allocated = int(base64.b64decode(entries[0]["value"]).decode())
@@ -613,6 +656,35 @@ def reconcile_once() -> dict:
             for n in (live_by_view.get(a, set()) & live_by_view.get(b, set()))
         })
 
+        # P3c3d-9 (Phase 3c-3d): a key at more than one position, in any
+        # range.
+        #
+        # The fourth condition the red team found reading clean. Every score
+        # below the reserve was assumed to be history and was never checked
+        # against anything: an already-indexed record given a second position
+        # at score 42 reconciled `clean` with every finding category empty,
+        # while the page showed the row twice. That is C2's duplication
+        # wearing history's clothes, and the ordering fault's own remediation
+        # points an operator at this reconciliation.
+        #
+        # A key at two positions is always wrong, in either range, and needs
+        # no assumption about which range it is in. History is scored at each
+        # record's own transaction, one position per record; the CAS
+        # allocates one position per commit; and since D39 a record key is
+        # written once, so there is no legitimate second zAdd for a key.
+        # Two records SHARING a score is a different thing and is
+        # `shared`/`backfilled` above - this is one key holding two scores.
+        duplicated = []
+        for view, data in per_view.items():
+            by_key: dict[str, list[float]] = {}
+            for score, keys in data["positions"].items():
+                for key in keys:
+                    by_key.setdefault(key, []).append(score)
+            for key in sorted(by_key):
+                if len(by_key[key]) > 1:
+                    duplicated.append({"view": view, "key": key,
+                                       "positions": sorted(by_key[key])})
+
         live = set().union(*live_by_view.values()) if live_by_view else set()
         all_positions = {n for data in per_view.values() for n in data["positions"]}
         # Above the reserve and not an integer is not a position the
@@ -635,7 +707,8 @@ def reconcile_once() -> dict:
         missing = sorted(handed_out - live)
         unallocated = sorted((live - handed_out) | fractional_above_reserve)
 
-        findings = bool(missing or unallocated or foreign or shared or malformed)
+        findings = bool(missing or unallocated or foreign or shared or malformed
+                        or duplicated)
         result = {
             "state": "findings" if findings else "clean",
             "allocated": max(0, allocated - RESERVED_POSITIONS),
@@ -651,17 +724,20 @@ def reconcile_once() -> dict:
             "shared_count": len(shared),
             "malformed": malformed[:100],
             "malformed_count": len(malformed),
+            "duplicated": duplicated[:100],
+            "duplicated_count": len(duplicated),
             "views": {view: len(data["positions"]) for view, data in per_view.items()},
         }
         if findings:
             logger.error(
                 "Sequence reconciliation found %d hole(s), %d unallocated position(s), "
-                "%d record(s) in the wrong view, %d position(s) in two views and %d "
-                "unreadable row(s). The counter allocated %d and the views hold %d. A "
-                "position is consumed only by a commit that happened, so each hole is a "
-                "committed record missing from its view index. First few holes: %s",
-                len(missing), len(unallocated), len(foreign), len(shared), len(malformed),
-                allocated, len(live), missing[:20],
+                "%d record(s) in the wrong view, %d position(s) in two views, %d key(s) "
+                "at more than one position and %d unreadable row(s). The counter "
+                "allocated %d and the views hold %d. A position is consumed only by a "
+                "commit that happened, so each hole is a committed record missing from "
+                "its view index. First few holes: %s",
+                len(missing), len(unallocated), len(foreign), len(shared),
+                len(duplicated), len(malformed), allocated, len(live), missing[:20],
             )
         else:
             logger.info(

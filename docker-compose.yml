@@ -43,6 +43,13 @@ services:
       # tombstone, and a bundle's writer_key_fingerprint names which of the
       # two wrote the record it carries.
       - AIL_WRITER_SIGNING_KEY=/keys/writer-control-plane.key
+      # D41 (Phase 3c-3d): the public half of the key the verifier signs
+      # fault records with. A ledger fault is presented on /audit as
+      # authoritative metadata about ANOTHER record's standing, so it is
+      # checked before it is rendered; a decision record's own state is
+      # reported as `asserted` and is never self-certified (D2), which is
+      # why that check is not extended to every row.
+      - AIL_FAULT_WRITER_PUBLIC_KEY=/keys/writer-verifier.pub
       # D36 (Phase 3c-3c): the seam between backfilled history and live
       # traffic. Bound into the ledger at first allocation; this service
       # refuses to serve a page if its own value disagrees with the bound

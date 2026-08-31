@@ -376,3 +376,87 @@ def test_each_module_validates_the_reserve_it_actually_uses():
         assert 'int(os.getenv("AIL_RESERVED_POSITIONS"' not in source, (
             f"{path} still reads the reserve with a bare int()"
         )
+
+
+# ---------------------------------------------------------------------------
+# P3c3d-9 (Phase 3c-3d): the upper bound.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["9007199254740992", "9007199254740993",
+                                 "9223372036854775807"])
+def test_a_reserve_at_or_above_2_to_the_53_is_refused_everywhere(bad):
+    """
+    A6, refuted. `validate_reserve` bounded the reserve below and not above:
+    "a positive integer" was the whole rule. Positions are float64 scores in
+    a zset, so a reserve at or above 2**53 makes allocated positions
+    unrepresentable as distinct scores, and all four readers agreed with each
+    other about a number that cannot work.
+
+    Reproduced on a virgin ledger at AIL_RESERVED_POSITIONS=9007199254740993:
+
+        write 0: tx=6  seq=9007199254740994 verified=True
+        ...
+        write 5: tx=11 seq=9007199254740999 verified=True
+        scores holding MORE THAN ONE record: {"9007199254740996": [3 records]}
+        HTTP 500 audit_ordering_fault ... at every limit
+
+    Note also that write 5 was told seq=...999 and stored at ...1000: the
+    response named a position the index does not hold.
+    """
+    import ail_backfill_index as bf
+
+    cp = _load("cp_ceiling_p3c3d", "control_plane/main.py")
+    anchor = _load("recon_ceiling_p3c3d", "anchor_service/main.py")
+    verifier = _load("verifier_ceiling_p3c3d", "verifier/main.py")
+
+    for name, fn, error in (("verifier", verifier.validate_reserve, RuntimeError),
+                            ("control_plane", cp._validate_reserve, RuntimeError),
+                            ("anchor_service", anchor.validate_reserve, RuntimeError),
+                            ("ail_backfill_index", bf.validate_reserve, SystemExit)):
+        with pytest.raises(error):
+            fn(bad)
+
+
+def test_the_allocator_refuses_a_position_that_is_not_a_distinct_score():
+    """
+    The other half of the same property, and the one the reserve check cannot
+    give on its own: the reserve check catches a seam that is already past the
+    boundary, and this catches the write that would cross it.
+
+    Asserted on the source rather than driven, because reaching it needs a
+    counter at 2**53, which is 9 quadrillion commits away on any ledger a test
+    can build. What is asserted is that the allocator compares the position it
+    is about to hand out against the ceiling, and refuses.
+    """
+    source = (REPO_ROOT / "verifier" / "main.py").read_text(encoding="utf-8")
+    body = source[source.index("def _ordered_commit"):]
+    body = body[:body.index(chr(10) + "@app.post")]
+    assert "next_seq >= MAX_POSITION" in body, (
+        "the allocator does not check the position it is about to hand out "
+        "against the float64 ceiling; the reserve check alone bounds where "
+        "allocation starts, not where it ends"
+    )
+    assert "raise RuntimeError" in body, (
+        "the allocator does not refuse; a write it cannot position must fail"
+    )
+
+
+def test_the_float64_ceiling_agrees_everywhere():
+    """One number in four modules, compared, for the same reason
+    tests/test_ledger_vocabulary.py compares the others."""
+    import ail_backfill_index as bf
+
+    cp = _load("cp_maxpos_p3c3d", "control_plane/main.py")
+    anchor = _load("recon_maxpos_p3c3d", "anchor_service/main.py")
+    verifier = _load("verifier_maxpos_p3c3d", "verifier/main.py")
+
+    values = {
+        "verifier": verifier.MAX_POSITION,
+        "control_plane": cp.MAX_POSITION,
+        "anchor_service": anchor.MAX_POSITION,
+        "ail_backfill_index": bf.MAX_POSITION,
+    }
+    assert len(set(values.values())) == 1 and verifier.MAX_POSITION == 2 ** 53, (
+        f"the float64 position ceiling does not mean the same thing in every "
+        f"module that reads it: {values}"
+    )

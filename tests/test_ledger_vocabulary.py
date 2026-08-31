@@ -23,10 +23,30 @@ every constant would couple the images this project deliberately keeps
 apart - but a disagreement now fails a test instead of producing a record
 nothing can find.
 
-What it does not cover: a module that renames its constant, or a sixth
-module that hardcodes a string and defines no constant at all. Those are
-invisible to a comparison of named constants, and the honest scope is
-stated rather than implied.
+What it does not cover: a module that renames its constant, or a module that
+hardcodes a string and defines no constant at all. Those are invisible to a
+comparison of named constants, and the honest scope is stated rather than
+implied.
+
+**P3c3d-9 (Phase 3c-3d): the scope used to be stated as narrower than it
+was, and a fifth module was outside it.** The scope read "a rename, or a
+sixth module hardcoding a string" - but a fifth module defining a named
+constant was also invisible, because `_modules()` loaded four while the
+completion report's own table counted five copies.
+`tools/ail_ordering_cost_probe.py:52` defines `VIEW_DECISION` as a named
+constant in the same `tools/` directory as `ail_backfill_index.py`, which is
+compared, and it was not. Reproduced: pointing that fifth constant at
+`ail_view:decision:v2` left this file green at 6 passed. It is loaded and
+compared now.
+
+**And under D38 what has to agree is the whole key format, not the prefix
+constant.** The verifier writes
+`ledger_fault:{committed_tx_id:020d}:{identity}:{nonce}` and the control
+plane builds the page's window bounds from the same rule, so a pad width that
+disagreed would produce a window that silently excludes the faults it asked
+for while both modules still held the same prefix string. The comparison is
+therefore on what the two functions produce for the same transaction, not on
+a constant either of them happens to name.
 """
 
 import importlib.util
@@ -62,12 +82,17 @@ def _text(value) -> str:
 
 def _modules():
     import ail_backfill_index
+    import ail_ordering_cost_probe
 
     return {
         "verifier": _load("vocab_verifier", "verifier/main.py"),
         "control_plane": _load("vocab_control_plane", "control_plane/main.py"),
         "anchor_service": _load("vocab_anchor", "anchor_service/main.py"),
         "backfill": ail_backfill_index,
+        # The fifth copy. In tools/ like the backfill, defining a named
+        # constant like the backfill, and outside this comparison until
+        # P3c3d-9.
+        "cost_probe": ail_ordering_cost_probe,
     }
 
 
@@ -112,6 +137,7 @@ def test_the_view_index_names_agree_everywhere():
         "anchor_service": [k for k, v in m["anchor_service"].VIEW_PREFIXES.items()
                            if v == "tool_call:"][0],
         "backfill": m["backfill"].VIEWS["decision"][1],
+        "cost_probe": m["cost_probe"].VIEW_DECISION,
     })
     _assert_all_agree("the intent view's set name", {
         "verifier": _text(m["verifier"]._VIEW_SETS["intent"]),
@@ -134,6 +160,28 @@ def test_the_fault_record_vocabulary_agrees():
     _assert_all_agree("the ledger-fault record_type", {
         "verifier": m["verifier"].FAULT_RECORD_TYPE,
         "control_plane": m["control_plane"]._FAULT_RECORD_TYPE,
+    })
+
+
+def test_the_fault_key_format_agrees_and_not_only_its_prefix():
+    """D38 (Phase 3c-3d). The verifier builds a fault key and the control
+    plane builds the bounds of the range read that finds it, from the same
+    rule: `ledger_fault:{tx:020d}`. Comparing the prefix alone would pass with
+    two different pad widths, and a pad that disagreed produces a window that
+    silently excludes the faults it asked for - measured, both failure modes
+    past a short pad arrive at HTTP 200 (keyprobe report section 4).
+
+    Compared on what the two functions produce rather than on a constant, so
+    a module that keeps the constant and changes the format still fails."""
+    m = _modules()
+    for tx_id in (0, 1, 999999, 2 ** 53, 2 ** 64 - 1):
+        _assert_all_agree(f"the fault key's transaction bound at tx={tx_id}", {
+            "verifier": m["verifier"].fault_key_tx_bound(tx_id),
+            "control_plane": m["control_plane"]._fault_key_tx_bound(tx_id),
+        })
+    _assert_all_agree("the fault key's transaction pad width", {
+        "verifier": m["verifier"].FAULT_KEY_TX_PAD,
+        "control_plane": m["control_plane"]._FAULT_KEY_TX_PAD,
     })
 
 
