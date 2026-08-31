@@ -768,3 +768,35 @@ Every mutation in section 7 was applied one at a time, with the owning service r
 ### CI
 
 **Not run.** Pushing the branch was refused by this session's tool policy, so the commits are on the scratch clone only and no CI run exists for them. `77b431c`, `a7829f4` and `91e74cb` sit on `p3c3b-order` ahead of `e3d8284`. The push and the CI run id are the one deliverable of this phase that is outstanding, and it is recorded here rather than left to be discovered.
+
+---
+
+## 13. Environment cleanup
+
+Removed:
+
+- Compose project `p3c3dfix`: all containers, the three volumes
+  (`test-immudb-data`, `test-verifier-state`, `test-control-plane-data`), and
+  the network. Verified empty by `docker ps -a`, `docker volume ls`,
+  `docker network ls` and `docker images`, each filtered on the project name.
+- The six images built from this run (`p3c3dfix-verifier`,
+  `-ail-control-plane`, `-decision-service`, `-anchor-service`, `-dashboard`)
+  and the throwaway `p3c3dfix-a10repro` that carried three live P-256 keys for
+  the A10 control.
+- The relay container and the temporary verifier container the first
+  reproduction ran through, both from before the relay became a test fixture.
+- Every probe script, written to the session scratchpad rather than into the
+  tree, so none of them could be committed by accident.
+
+**Not removed, and this is the one thing left open.** The scratch clone at
+`C:\Users\banji\OneDrive\Documents\p3c3d-fix` still exists, because it holds the four commits of this
+phase and pushing them was refused by this session's tool policy. Removing it
+would destroy the work. It goes as soon as `77b431c`, `a7829f4`, `91e74cb` and
+`3785b2c` are on `p3c3b-order` at the GitHub remote.
+
+Images from earlier sessions (`p3c3d-keyprobe-*`, `p3c3brepro-*`,
+`p3bverify-*`) were present at the start and are untouched: they belong to
+other runs.
+
+The primary working directory was never used for a stack and is untouched:
+`p3c3b-order` at `e3d8284`, `git status` clean.
