@@ -454,7 +454,7 @@ Two coupling instances this pass, both resolved by rewording the new text rather
 
 ### CI
 
-**Run `33408816212`, green: 395 passed, 9 skipped, 89.60s.** Commit `39a0755` on `p3c3b-order`, PR #14.
+**Run `33409450352`, green: 395 passed, 9 skipped, 97.31s.** Commit `6ec28a9` on `p3c3b-order`, PR #14, which is the whole of this phase including this report. The run covering the code and tests alone, `33408816212` at `39a0755`, was green with the same 395 passed, 9 skipped.
 
 **The run before it, `33407673213`, failed, and the cause is worth recording rather than only fixing.** `tests/compose_helpers.py` was written this phase by copying the Compose project-name rule out of `tests/test_content_states.py`, and the copy dropped a character class: `"".join(c for c in name if c.isalnum())` where the original has `re.sub(r"[^a-z0-9_-]", "", name)`. This repository's directory is `compliance-ail`, so the copy resolved to `complianceail`, and every `docker compose` call against it addressed a project that does not exist:
 
