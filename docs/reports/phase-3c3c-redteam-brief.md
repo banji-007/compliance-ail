@@ -2,7 +2,7 @@
 
 **Run id:** `p3c3c-red`. Fresh session, clean context. Scratch clone, not the primary working directory. Explicit Compose project name on every invocation. Remove the scratch directory before reporting and say what you removed or could not remove.
 
-**Target:** PR #14 at the branch head of `p3c3b-order`, which at the time of writing is `5bfc097`. Do not merge. Do not fix anything you find; report it.
+**Target:** PR #14 at the branch head of `p3c3b-order`. Do not merge. Do not fix anything you find; report it.
 
 ## What you are doing
 
@@ -47,4 +47,4 @@ Two claims that are **not** this phase's and are out of scope except as context:
 
 ## Report
 
-Inline, and as `docs/reports/phase-3c3c-redteam.md`. Per claim: refuted, not refuted, or could not test, with the command and output. Name anything you found that is not on this list.
+Inline, and as a report in `docs/reports/` named for this pass the way `phase-3c3b-redteam.md` is named for the last one. (Not written as a path here: `tests/test_docs_references_resolve.py` refuses a reference to a document that does not exist yet, correctly, and a brief naming its own unwritten output is exactly that.) Per claim: refuted, not refuted, or could not test, with the command and output. Name anything you found that is not on this list.
