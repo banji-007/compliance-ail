@@ -233,3 +233,20 @@ Offered because this pass exists to make that pass more useful, not to pre-empt 
 2. **`_fault_key`'s fallback.** A record with no `call_id` is keyed by a digest of the record key. Nothing on a page can ever join that, and the claim that such records never reach a page is an argument, not a test.
 3. **The whitelist in section 4 is a list too.** It is complete against additions, which the blacklist was not, but it says nothing about a service that reads a setting it does not declare.
 4. **The reserve binding on a pre-D36 ledger** was reasoned about and never run against a ledger written by the previous build.
+
+---
+
+## 11. The brief, and two corrections that landed with it
+
+`docs/reports/phase-3c3c-redteam-brief.md`, commit `aaa0edd`. **CI `33421995261` green: 406 passed, 9 skipped.**
+
+Ten claims, each stated as a behaviour that could be false. It names the two weakest points this session knows of rather than making the red team find them first (C3's parse-based bounds, C2's digest-keyed fallback), and it scopes out the two items already deferred in `TODO.md` so a restatement of a known limit is not mistaken for a finding.
+
+**Correction A: writer-signature attribution was overstated, and at its source.** `docs/adr/0012-writer-signing-and-external-anchoring.md` said `decision-service` and `ail-control-plane` "hold separate pairs, so a bundle's `writer_key_fingerprint` names which service wrote the record". They do not hold separate pairs. `./keys:/keys:ro` is mounted by `ail-control-plane`, `verifier`, `decision-service`, `anchor-service` and `immudb`, so each holds every writer's private key and is separated from the others only by which path its own `AIL_WRITER_SIGNING_KEY` names, which is a configuration convention rather than a boundary. The fingerprint names a key; the key does not name a component. That matters exactly when it would be relied on, after one of those services is compromised: a compromised control plane can forge a record attributed to the decision service and nothing here distinguishes it. Per-key revocation is unaffected, because the deny-list operates on keys.
+
+Corrected in the ADR and in both `readME.md` §5 bullets that rest on it. Segregating the mounts is a D22 item in `TODO.md`, not done here: it changes deployment topology and needs a decision about what `immudb` requires from that directory.
+
+**Correction B: a third corpus-coupling direction, in `TODO.md`.** Correction A is the shape section 2 of this report describes, met again: a citing document and the cited source were both wrong, and class (b) is satisfied when a false claim and a section repeating the same false thing agree. Both instances found this phase passed the checker while both documents were wrong. Nothing mechanical catches it, so it is written down as a direction rather than as a check.
+
+**One thing the phase's own test caught in the brief.** The first push named `docs/reports/phase-3c3c-redteam.md` as the report to write, and `tests/test_docs_references_resolve.py` refused it: a `docs/` reference that does not resolve in the commit. CI run `33421709886` failed on it. That is correct behaviour and the 3c-3b brief avoided it by saying "inline"; the naming convention is stated without the path.
+
