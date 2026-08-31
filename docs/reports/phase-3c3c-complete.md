@@ -217,7 +217,13 @@ Scope stated rather than implied: this compares **named constants**. A module th
 
 ## 9. Suite and CI
 
-*(recorded below)*
+**CI run `33418328641`, green: 406 passed, 9 skipped, 96.53s.** Commit `8027750` on `p3c3b-order`, PR #14. The phase itself was `33409450352` at 395 passed; the eleven new passes are this pass's three test modules.
+
+Locally, 53 failed against 336 passed, down from the phase's 67 against 309. **No test file this phase touched or added is among the local failures** (confirmed by name). The 53 are the known host set recorded in the phase report's could-not-verify item 5: `sigstore` cannot be installed into the host Python, and the tests that drive `decision_service/main.py` in-process cannot resolve compose service names or hold the verifier's write key. CI is the authority.
+
+Mapping check: **0 new, 12 known, 0 stale**, 31 heading pins, 0 unpinned. This pass's own 11 rows are clean.
+
+**The mapping-table coupling fired a third time**, and was resolved the same way as the first two: two rows in this report's table used the word "number", which made the stem generic and retired `phase-1-3.md` row 16's baselined class (b) failure without that row changing. Both rows were reworded to "identical". Three instances in one phase is itself the finding - a new report's vocabulary silently weakens historical checks, and the only thing that catches it is running the checker and reading the stale line.
 
 ## 10. What a red-team pass should go at first
 
