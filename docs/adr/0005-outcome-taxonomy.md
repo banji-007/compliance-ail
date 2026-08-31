@@ -251,7 +251,7 @@ So this class now covers two materially different outcomes:
 | What happened | Ledger entry | Response |
 | :--- | :--- | :--- |
 | The verifier could not be reached, or the write did not commit | none | `committed: false` |
-| The write committed and its proof did not check out | **exists**, and a `ledger_fault:{call_id}` record qualifies it | `committed: true` with the real transaction and position |
+| The write committed and its proof did not check out | **exists**, and a `ledger_fault:{committed_tx_id:020d}:{identity}:{nonce}` record qualifies it (D38, Phase 3c-3d; it was `ledger_fault:{call_id}`, which lost every fault after the first about one record and collided across the three record kinds that share a `call_id`) | `committed: true` with the real transaction and position |
 
 The structural limit the paragraph above describes is real and unchanged for
 the first row: nothing can write a durable record of "the durable-record

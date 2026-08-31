@@ -14,9 +14,21 @@ What that phase added to the deferred list rather than closing is recorded in RE
 
 **Closed in Phase 3c-3c (`docs/reports/phase-3c3c.md`, ADR-0014 D35/D36/D37).** The red-team pass against 3c-3b refuted eight of ten claims; that set is closed. What it added to the deferred list rather than closing is the entry immediately below, plus three Residual Limits entries in the README.
 
+**Closed in Phase 3c-3d (`docs/reports/phase-3c3d.md`, ADR-0014 D38-D42).** The red-team pass against 3c-3c refuted nine of ten claims, and a key-shape probe then established that the decision taken in response, D38 as originally written, was a rename that closed nothing. That set is closed. What it added to the deferred list rather than closing is the entry below on `/write-ordered` and a key of any shape, plus two Residual Limits entries in the README.
+
 ---
 
 ## Deferred (v1.1.0)
+
+### `/write-ordered` accepts a key of any shape into a view
+
+Raised in Phase 3c-3d and deliberately not taken there.
+
+D39 made both write routes refuse a `ledger_fault` record, which is what the measured injection used: a caller holding only `VERIFIER_WRITE_KEY` wrote the ledger's own account of another record's standing, and because the ordered route allocates a position, that write became a page row with `outcome_type: null` so `entries` exceeded `total`. What is not closed is the general form. The ordered route does not require the key prefix to match the requested view, so a key of some other shape written into the decision view still becomes a page row.
+
+Why it was not closed here: requiring the match would also refuse the writes `tests/test_reconciliation.py` uses to prove the reconciler finds a record indexed into the wrong view (D37, closing red-team C6a). Those writes are deliberately mismatched, and the enforcing test for a Phase 3c-3c fix would have to be rewritten to inject into the index directly. That is a design change, and this phase's rule is to escalate rather than substitute.
+
+The shape of the fix, when it is taken: a view contract in `verifier/main.py` pairing each view with the key prefix and `record_type` it indexes, refused at the route the way D39's refusal is, with the reconciliation tests re-expressed as direct `zAdd` injections.
 
 ### `fault_class: verifier_unreachable` covers two materially different outcomes
 

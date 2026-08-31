@@ -218,24 +218,25 @@ Fail-closed on execution is unchanged and the caller's rule is still keyed on
 time, so repairing the trust anchor makes the same record read `verified` on
 the next page with nothing recording that its write-time proof failed -
 measured, including a clean `ail-evidence-bundle/2` exported for it
-afterwards. The durable qualification is therefore a **record**:
-`ledger_fault:{call_id}`, classified by `record_type`, carrying the committed
-key, transaction and position, joined to a page row by the same exact
-`getall` the tombstone join already issues. A second fault for one `call_id`
-is a new version of the same key written by an unconditional set, so nothing
-is lost and `getall`'s `revision` gives the count for free
-(`docs/reports/phase-3c3c-probe.md`).
+afterwards. The durable qualification is therefore a **record**, classified by
+`record_type`, carrying the committed key, transaction and position. It was
+keyed `ledger_fault:{call_id}` and joined by the same exact `getall` the
+tombstone join issues; **D38 (Phase 3c-3d) replaced that key and that join**,
+because a second fault for one `call_id` was a new version of the same key
+and three records sharing a `call_id` collided into it. See D38 below.
 
 **The fault record's own write is the one write in this system whose success
 does not require write-time proof.** The condition that produces a fault is
 the condition that breaks every proof, so requiring one would mean the
 qualification can never be recorded exactly when it is needed. Three
-constraints hold it in place: `_set_without_verification` refuses any record
-that is not a `ledger_fault`, so the decision path is structurally unable to
-reach it; `POST /write` refuses a `ledger_fault` arriving from a caller; and
-a failure to write the fault fails loudly, logged and reported as
-`fault_record_error`, because a silent absence would leave a committed record
-unqualified with nothing saying why.
+constraints hold it in place: `_set_without_verification` refuses any bytes
+that are not a `ledger_fault` record - it reads the bytes it is about to
+write, since P3c3d-12 found that inspecting a parallel `record` argument
+bounded nothing; **both** write routes refuse a `ledger_fault` arriving from a
+caller (D39; until Phase 3c-3d only the plain route did); and a failure to
+write the fault fails loudly, logged and reported as `fault_record_error`,
+because a silent absence would leave a committed record unqualified with
+nothing saying why.
 
 **The verifier is a writer now, so it has a writer key.** D22's rule is one
 dedicated long-lived key per writer; `keys/writer-verifier.key` is the third.
@@ -381,6 +382,161 @@ requested view, which would also refuse the writes
 indexed into the wrong view - the D37 check would lose its enforcing test.
 That is a decision this phase raises rather than takes.
 
+## D38. The fault key carries a transaction and a nonce
+
+Added in Phase 3c-3d, closing the loss D35's key shape carried from the day
+it was written, and the shape half of red-team A2 and A4.
+
+```
+ledger_fault:{committed_tx_id:020d}:{call_id or "key:" + sha256(record_key)[:32]}:{nonce}
+```
+
+`nonce` is `uuid4().hex[:16]`, minted in `_write_fault_record`.
+
+**The transaction separates faults about different records; the nonce
+separates faults about the same record. Neither substitutes for the other.**
+
+*What the nonce closes.* Under `ledger_fault:{call_id}` a second fault about
+one record was a new version of the same key, so `getall` returned the head
+and a prefix scan returned one row: three faults about one record were one
+row and two hidden. D38 as first written, `ledger_fault:{call_id}:{tx_id}`,
+did not close it. The only transaction available when the key is built is
+`committed_tx_id`, the qualified record's own, which is fixed per record.
+Measured: the same key twice, `revision=2`, and a range read over the
+record's transaction returning one key. That was a rename.
+
+*What the transaction closes, separately.* `tool_call_intent:` and
+`tool_call:` for one call carry the same `call_id` and both take the ordered
+route; the erasure tombstone takes `POST /write` with that same `call_id`.
+All three can fault. Under `ledger_fault:{call_id}` an intent fault, a
+decision fault and a tombstone fault for one call collide and silently
+replace each other, non-adversarially, with no second writer involved. A
+scheme keyed on `{call_id}:{nonce}` would re-merge them, and would also drop
+the bounded page read.
+
+*Why twenty digits.* uint64 max is twenty digits, so overflow is unreachable,
+and the ledger is append-only, which makes a narrower pad a bet that cannot
+be un-made. Both failure modes past a short pad are silent and arrive at HTTP
+200: over-width keys are pulled into a window that should exclude them, and a
+window whose own bound is over-width returns empty.
+
+*Ordering between two faults about one record* comes from the `scan` entry's
+own `tx`, which the read that already ran returns. It costs nothing, and no
+timestamp component is needed or present.
+
+*What is given up.* The fault key is no longer derivable from a page row.
+That derivability is exactly what the original form preserved by closing
+nothing. Anything that needs to name a specific fault key gets it from the
+write response's `fault_record`.
+
+*The page read.* The fault key leads with the qualified record's transaction,
+so a page's faults are a key range: one paginated half-open scan from
+`ledger_fault:{min_tx:020d}` inclusive to `ledger_fault:{max_tx+1:020d}`
+exclusive, with the window taken from the rows the response will render,
+across both zscans rather than the decision page alone. Half-open is
+required, not stylistic: a bare padded `hi` with `inclusiveEnd=True` sorts
+before that transaction's own composite keys and silently drops the last row
+of the page. An empty page has no window and issues no read. Filtering back
+to the page is client-side membership on the record key each fault names, so
+the range is a superset and never a subset - which is also what joins a fault
+onto a row whose record carries no `call_id`, something no key shape did
+before, including the old one.
+
+Every `ledger_fault:{call_id}` already committed keeps that shape
+permanently, so the exact `getall` stays, with exactly today's keys and no
+keys added - a nonce-carrying key cannot go into a `getall` at all. The cost
+is two round trips per page against one.
+
+*And the count.* `ledger_fault.count` was `revision` on the head entry, which
+was the number of faults only because the single key was rewritten in place.
+Under D38 each fault is its own key written once, so `revision` is
+permanently 1 and the field would report one fault where three exist - the
+failure D38 exists to fix, surviving inside the field that describes it. The
+count is the number of hits for that record. **Contract change:**
+`ledger_fault` stays one object, the most recent fault by the ledger's own
+transaction for the fault record, with a true `count`. A list of faults was
+the alternative and is equally defensible; one object keeps the field
+answering "what is this record's standing", avoids an unbounded structure on
+every row of a 2500-row page for a field that is null on almost all of them,
+and changes no consumer. `ledger_fault` appears nowhere in `dashboard/` and
+no test asserted `count`, both checked rather than taken on trust.
+
+## D40. `committed` is a fact about the ledger
+
+Added in Phase 3c-3d, closing red-team A1 and, through it, A8.
+
+`POST /write` issued `currentState()` in the same `try` as `verifiedSet`,
+under a broad `except Exception` that answered `committed: false`. Measured
+with a relay that passed the write through and cut the connection afterwards:
+the record committed at tx 14, the SDK's persisted trust anchor advanced to
+14, and the response said `{"tx_id": null, "verified": false, "committed":
+false}` - the exact shape `ledger/immudb_ledger.py` reads as "the write did
+not happen".
+
+The state read is now outside the proof's handler and cannot describe the
+write. And the generic handler no longer guesses: a transport error raised by
+`verifiedSet` itself is genuinely ambiguous, so the ledger is asked, with the
+value as well as the key. Byte equality answers exactly the question being
+asked, and keeps a record that was already under this key from being reported
+as this write. `verified` stays false there and no fault record is written -
+the proof did not fail, it could not be attempted, which is not tamper
+evidence.
+
+## D41. A fault is verified before it is rendered as a record's standing
+
+Added in Phase 3c-3d.
+
+Nothing on the read path checked `writer_signature` or
+`writer_key_fingerprint` before `/audit` rendered a fault. D39 closes the
+write path; D41 means a fault that arrived some other way is not presented as
+the ledger's account of anything. The check is `provenance.verify_record`
+against the verifier's own writer public key, and it refuses four ways: no
+signature, a format string this rule does not cover, a fingerprint that is
+not this key, and a signature that does not verify.
+
+**The asymmetry is deliberate and is stated rather than left to be
+inferred.** `/audit` renders a decision record without checking its writer
+signature, and at the default `verify=false` without checking its inclusion
+proof either. That is defensible: a record's own state is explicitly reported
+as `asserted` and is never self-certified (D2, ADR-0006), whereas a fault is
+presented as authoritative metadata about *another* record. Extending the
+check to every row on the default page would be the per-record round trip D29
+removed. **It is not extended.**
+
+The ceiling: every service mounts `./keys:/keys:ro`, so a fingerprint names a
+key and not a component (ADR-0012, corrected in Phase 3c-3c). D41 establishes
+that a fault was signed by the writer key the verifier signs faults with, and
+the D22 mount split is what would make that a statement about which process
+wrote it.
+
+## D42. A bounded read asserts on what came back
+
+Added in Phase 3c-3d.
+
+ImmuDB's REST route drops an unrecognised or misspelled field without
+comment, so a bounded read whose bound did not survive becomes an unbounded
+read at HTTP 200 with nothing in the response saying so. Measured: `endkey`
+for `endKey` returned all ten keys where `endKey` returned seven. That is the
+whole distance between a correct read and a wrong one, and it is why the
+assertion is on what came back rather than on what was sent.
+
+Two forms, because a bound has two shapes here and one assertion does not fit
+both.
+
+- **Key-range scans** assert that every returned key falls within the range
+  actually requested for that page, seek to end, with the seek bound
+  inclusive only on the first page. A violation raises, and `/audit` answers
+  `bounded_read_fault` rather than serving a page whose fault join may have
+  silently widened.
+- **Score-bounded reads are a separate case with their own form.** The
+  view-index reads are `zscan` bounded by `minScore`, not by keys, so the
+  key-range assertion does not apply to them and is not bolted on. Their
+  equivalent is that every returned row's score falls within the requested
+  bound, read from the row's own `score` field with `.get("score", 0.0)`
+  because protobuf omits a zero score entirely. Reported as a reconciliation
+  finding rather than raised, which is that function's standing rule for
+  every bad row: a pass that dies on one row reports nothing about the rest.
+
 ## D34. The serialisation ceiling is accepted, documented, and measured
 
 The CAS globally serialises the ledger write path: every write contends on
@@ -429,8 +585,6 @@ writers gave up at 8 concurrent in either this phase's measurements or
 - `has_more` now means more *recent* records exist behind the page, which is
   a stronger claim than the one Phase 3c-3a shipped. README's Residual Limits
   states the new meaning rather than leaving both alive.
-- A position is a float64 score, so positions stay exact to 2^53. With the
-  reserve at 1e9 and one write per second, that is about 285 million years.
 - `POST /write` is still live: `control_plane/main.py::_write_tombstone` uses
   it. A tombstone is not a decision and is never a row on the ordered page -
   it is joined by keyed lookup - so it takes no position. If it took one, that
@@ -439,18 +593,49 @@ writers gave up at 8 concurrent in either this phase's measurements or
   intent or a fault record itself** (P3c3c-2): the split used to rest on
   convention plus a static parse of two files, and the parse was defeated by
   holding the route in a variable. The parse survives as a second line, over
-  every production module rather than two.
+  every production module rather than two. A `record_type` that is not a
+  string is refused with a 400 rather than raising `TypeError` and answering
+  500, which is what a route whose job is to refuse deliberately owes a
+  caller (P3c3d-9).
 - An erasure completes against a committed-unverified tombstone (P3c3c-12),
   after the tombstone is confirmed present by an exact read. Refusing it
   instead left the ledger saying erased while the content it names was still
   in the store, which is `_payload_state`'s `erasure_conflict` - P13-4's own
   finding, manufactured by the refusal. What has not changed is the invariant:
   no row is ever deleted without a tombstone behind it.
+- **A position is a float64 score, and both ends of that are bounded now.**
+  `validate_reserve` used to bound the reserve below only, so a reserve at or
+  above 2^53 made allocated positions unrepresentable as distinct scores:
+  measured, six writes produced four scores, the response named a position the
+  index does not hold, and `/audit` was dead at every limit from the sixth
+  write on a virgin ledger, with all four readers agreeing about a number that
+  cannot work. The reserve is refused at or above 2^53, and the allocator
+  refuses to hand out a position at or above it. With the reserve at 1e9 and
+  one write per second that ceiling is about 285 million years away.
+- **A key at more than one position is a finding, in either range.**
+  Reconciliation assumed every score below the reserve was history and never
+  checked it against anything, so an already-indexed record given a second
+  position at score 42 reconciled `clean` with every category empty while the
+  page showed the row twice. History is scored one position per record, the
+  CAS allocates one per commit, and since D39 a record key is written once, so
+  there is no legitimate second `zAdd` for a key. Two records sharing a score
+  is a different thing and stays `shared`.
 - A bundle does not name a record's ledger fault. `GET /audit/bundle` takes a
   key and passes no revision, and the bundle has no section for one; adding
   one is a format change (`ail-evidence-bundle/3`), which is a D18-D20
   decision this phase deliberately did not make. README's Residual Limits
-  states it.
+  states it. **D38 widens the gap slightly and it is stated rather than left
+  to be found**: a record can now carry more than one fault, so a bundle that
+  named only one would be incomplete as well as absent.
+- **`/write-ordered` still accepts a key of any shape into a view.** D39
+  refuses a `ledger_fault` on both routes, and the injected row the keyprobe
+  found was one; a caller holding the write key can still write some other key
+  shape into the decision view and it becomes a page row with `outcome_type:
+  null`. Refusing that means requiring the key prefix to match the requested
+  view, which would also refuse the writes
+  `tests/test_reconciliation.py` uses to prove the reconciler finds a record
+  indexed into the wrong view - the D37 check would lose its enforcing test.
+  Raised rather than taken.
 
 ## References
 
@@ -460,6 +645,11 @@ writers gave up at 8 concurrent in either this phase's measurements or
 - `docs/reports/phase-3c3c.md` - D35, D36 and D37, and the reproduction of
   every refutation they close
 - `docs/reports/phase-3c3c-probe.md` - the ImmuDB read-API facts these rest on
+- `docs/reports/phase-3c3c-redteam.md` - the ten claims, nine refuted
+- `docs/reports/phase-3c3d-keyprobe.md` - what a composite fault key does and
+  does not close, and every measurement D38 and D42 rest on
+- `docs/reports/phase-3c3d.md` - D38 through D42, and the reproduction of
+  every refutation they close
 - `docs/reports/phase-3c2.md` - where the defect was first observed
 - `tools/ail_backfill_index.py`, `tools/ail_ordering_cost_probe.py`
 - `tests/test_audit_ordering.py`
