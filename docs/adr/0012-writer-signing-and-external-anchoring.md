@@ -114,9 +114,11 @@ compromise of one of them.
 
 Segregating the mounts so each service mounts only its own key is a D22 item
 and is recorded in `TODO.md`; it is not done here, because it is a change to
-the deployment topology rather than to this phase's subject, and doing it
-without also deciding what `immudb` needs from that directory would be
-guesswork.
+the deployment topology rather than to this phase's subject. One constraint
+on that split is already decided and recorded with it: `immudb` gets its own
+directory holding only the signing key. It mounts this one for
+`--signingKey` and has no writer key of its own, so a per-service split that
+left it reading `keys/` would move this defect rather than close it.
 
 #### Where the key is generated and stored, and how it reaches the service
 

@@ -80,7 +80,9 @@ Raised in review of the Phase 3c-3c completion pass. `./keys:/keys:ro` is mounte
 
 **What is unaffected.** Per-key revocation, because `tools/ail_verify_bundle.py`'s deny-list operates on key fingerprints rather than on services. And the refusal of an unsigned record.
 
-**Scope.** Give each service a mount of only the key it is configured to use (`./keys/writer-decision.key:/keys/writer-decision.key:ro` and so on), which needs a decision about what `immudb` requires from that directory - it mounts it for `--signingKey=/keys/signing.key` and has no writer key of its own. The claim in `docs/adr/0012-writer-signing-and-external-anchoring.md` and `readME.md` §5 is corrected to what the mechanism actually supports in the meantime, rather than left standing until this is done.
+**Scope.** Give each service a mount of only the key it is configured to use (`./keys/writer-decision.key:/keys/writer-decision.key:ro` and so on).
+
+**`immudb` gets its own directory holding only the signing key** (decided in review of the completion pass, and the awkward part of the split). It mounts `keys/` for `--signingKey=/keys/signing.key` and has no writer key of its own, so a naive per-service split still leaves the ledger server able to read every writer key it has no use for - which is the same defect this item exists to close, moved rather than removed. A separate directory is the answer rather than a per-file mount, because `--signingKey` names a path inside a directory the server also walks, and because it makes "what may ImmuDB see" a question with a directory listing for an answer instead of a mount list to audit. The claim in `docs/adr/0012-writer-signing-and-external-anchoring.md` and `readME.md` §5 is corrected to what the mechanism actually supports in the meantime, rather than left standing until this is done.
 
 ### Corpus coupling in the mapping check
 
