@@ -444,9 +444,23 @@ def _write_tombstone(call_id: str) -> None:
     write-scoped API key (ADR-0007), not a per-caller credential, so no
     finer-grained identity exists at this layer to record.
 
-    Raises on any failure (non-2xx, transport error, or verified: false) -
-    the caller (erase_content) treats this as fail-closed: the erasure is
-    refused and the row survives.
+    Raises when the tombstone did not reach the ledger (non-2xx, transport
+    error, or a `verified: false` that is also `committed: false`) - the
+    caller treats that as fail-closed: the erasure is refused and the row
+    survives.
+
+    P3c3c-12 (Phase 3c-3c): a `verified: false` that is `committed: true` is
+    a different thing and returns rather than raising. `verifiedSet` commits
+    at service.VerifiableSet and every proof failure is raised after that
+    line, so such a tombstone is in the ledger; refusing the erasure on the
+    strength of a proof failure about a write we can see happened leaves the
+    ledger saying erased and the content store saying present, which is the
+    `erasure_conflict` face of _payload_state - P13-4's own finding,
+    manufactured by the refusal. Reproduced live on b9f6a1d in
+    docs/reports/phase-3c3c.md: DELETE answered 503 while the tombstone was
+    committed at tx 6.
+
+    The return value is that distinction, and the caller acts on it.
     """
     tombstone = {
         "record_type": "content_erasure",
@@ -474,8 +488,74 @@ def _write_tombstone(call_id: str) -> None:
         resp.raise_for_status()
 
     result = resp.json()
-    if not result.get("verified"):
+    if result.get("verified"):
+        return {"committed": True, "verified": True, "tx_id": result.get("tx_id"),
+                "fault_record": None}
+
+    if not result.get("committed"):
         raise RuntimeError(f"Tombstone write not verified: {result.get('detail', 'no detail')}")
+
+    # Committed, unverified. Confirm it from the ledger rather than from the
+    # response that just told us a proof failed - one exact read, on a path
+    # that has already failed once, and it separates a stale trust anchor
+    # (the record is there) from a record that genuinely is not in the tree.
+    # A compromised server defeats both, which is why this is stated as
+    # confirming presence rather than as re-verifying anything.
+    if not _tombstone_present_in_ledger(call_id):
+        raise RuntimeError(
+            "Tombstone write reported committed but no record is present under "
+            f"content_erasure:{call_id}; refusing the erasure"
+        )
+    logger.error(
+        "Tombstone for call_id=%s committed at tx=%s and failed verification "
+        "(%s); the erasure completes and the fault record at %s qualifies it",
+        call_id, result.get("tx_id"), result.get("error_class"),
+        result.get("fault_record"),
+    )
+    return {"committed": True, "verified": False, "tx_id": result.get("tx_id"),
+            "fault_record": result.get("fault_record"),
+            "error_class": result.get("error_class")}
+
+
+def _tombstone_present_in_ledger(call_id: str) -> bool:
+    """Is there a content_erasure record under this call_id's exact key.
+
+    An exact `getall` against ImmuDB's own REST route, not a verified read:
+    this is called precisely when a proof has failed, so a verified read
+    would fail the same way and answer a different question than the one
+    being asked. What it establishes is narrow and is used narrowly - a
+    record exists under this key.
+    """
+    try:
+        with httpx.Client(timeout=15) as client:
+            login = client.post(f"{IMMUDB_URL}/api/v2/login", json={
+                "user": base64.b64encode(IMMUDB_USER.encode()).decode(),
+                "password": base64.b64encode(IMMUDB_PASSWORD.encode()).decode(),
+                "database": base64.b64encode(b"defaultdb").decode(),
+            })
+            login.raise_for_status()
+            token = login.json()["token"]
+            resp = client.post(
+                f"{IMMUDB_URL}/api/v2/db/getall",
+                json={"keys": [base64.b64encode(
+                    f"content_erasure:{call_id}".encode()).decode()]},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+    except Exception as exc:
+        # Fail closed: an erasure must never complete because the check that
+        # would have caught a missing tombstone could not run. Same rule
+        # _has_tombstone applies in the other direction.
+        logger.error("Could not confirm the tombstone for call_id=%s: %s", call_id, exc)
+        return False
+    for raw in resp.json().get("entries", []):
+        try:
+            value = json.loads(base64.b64decode(raw["value"]).decode())
+        except Exception:
+            continue
+        if value.get("record_type") == "content_erasure" and value.get("call_id") == call_id:
+            return True
+    return False
 
 
 @app.delete("/content/{call_id}", status_code=204)
@@ -498,13 +578,22 @@ def erase_content(
     deletes a row without a durable record of having done so. A call_id
     with no row (already erased, or never had one) is a no-op: nothing to
     erase, so no tombstone is written for it.
+
+    P3c3c-12 (Phase 3c-3c): "if it fails" now means the tombstone did not
+    reach the ledger, which is the question D11 was always asking. A
+    tombstone that committed and whose proof did not check out is confirmed
+    by an exact read and the erasure completes - the durable record of
+    having erased exists, a ledger_fault qualifies its standing, and
+    refusing instead would leave the ledger saying erased while the content
+    it names is still in the store. The one thing that must never happen
+    here is a row deleted with no tombstone behind it, and that is unchanged.
     """
     existing = db.query(CallContent).filter_by(call_id=call_id).first()
     if existing is None:
         return
 
     try:
-        _write_tombstone(call_id)
+        outcome = _write_tombstone(call_id)
     except Exception as exc:
         logger.error("Tombstone write failed for call_id=%s: %s", call_id, exc)
         raise HTTPException(
@@ -514,6 +603,12 @@ def erase_content(
 
     db.delete(existing)
     db.commit()
+    if not outcome.get("verified"):
+        logger.warning(
+            "Erasure for call_id=%s completed against a committed-unverified "
+            "tombstone (tx=%s, fault=%s)",
+            call_id, outcome.get("tx_id"), outcome.get("fault_record"),
+        )
 
 
 _TAMPER_ERROR_CLASSES = frozenset({"consistency_failure", "signature_failure"})
@@ -798,10 +893,21 @@ class OrderingFault(Exception):
 
 # The condition is deliberately a 500 and deliberately not a 503. It is a
 # server-side integrity failure rather than a bad request, so it is not 4xx;
-# and it will not heal on its own, because the ledger is append-only and a
-# score that has been written cannot be withdrawn, so it is not the "try
-# again shortly" that 503 promises. `transient: false` says that in the body
-# rather than leaving a caller to infer it from a retry that never succeeds.
+# and it is not the "try again shortly" that 503 promises either, because the
+# ledger is append-only and a score that has been written cannot be
+# withdrawn.
+#
+# P3c3c-7 (Phase 3c-3c): what it must not say is `transient: false`. The
+# corruption is not transient; this fault is. The check's window is the
+# top-of-index page, so newer traffic pushes a disagreement below the window
+# and every limit returns 200 again with the corruption still indexed -
+# measured, in docs/reports/phase-3c3b-redteam.md C5 and C10 and reproduced
+# in docs/reports/phase-3c3c.md. A field asserting durability the code does
+# not have is worse than no field: it tells an operator the fault will be
+# there tomorrow, so its absence tomorrow reads as repair.
+#
+# What replaces it is the scope this check actually has, and a pointer to
+# the check that does have the durable answer (D37, the reconciliation).
 ORDERING_FAULT_ERROR = "audit_ordering_fault"
 
 
@@ -821,15 +927,35 @@ def _ordering_fault_body(exc: "OrderingFault") -> dict:
             "higher_position": {"position": exc.higher[0], "transaction": exc.higher[1]},
             "lower_position": {"position": exc.lower[0], "transaction": exc.lower[1]},
         },
-        # Both stated rather than implied. No page was served, so a caller
-        # must not treat this as an empty ledger; and retrying will return
-        # the same fault, so a caller must not treat it as a blip.
+        # Stated rather than implied: no page was served, so a caller must
+        # not read this as an empty ledger.
         "page_served": False,
-        "transient": False,
+        # P3c3c-7: the scope of the check that raised, said plainly, because
+        # it is narrower than a reader would assume from a 500 about the
+        # ledger's integrity.
+        "scope": (
+            "this page only: the adjacent rows at the top of the view index at "
+            "this limit, and only positions the compare-and-set allocated"
+        ),
+        # And what that scope implies about repeating the request, without
+        # claiming a persistence this check cannot observe. Both directions
+        # are named because both mislead on their own.
+        "on_retry": (
+            "an identical request returns this same fault while the disagreement "
+            "is inside the window; a later request can succeed without anything "
+            "having been repaired, because newer commits push the disagreement "
+            "below the window while it stays in the index. A page that succeeds "
+            "is therefore not evidence the index was corrected"
+        ),
+        "authoritative_check": (
+            "the sequence reconciliation in anchor_service walks every position "
+            "in every view, so it has no window and its findings persist"
+        ),
         "remediation": (
             "The view index does not describe the order the ledger committed in. "
             "Do not reorder or ignore it. Run the sequence reconciliation in "
-            "anchor_service to find what else is affected, and see "
+            "anchor_service to find what else is affected - including "
+            "disagreements this page can no longer reach - and see "
             "docs/adr/0014-ordered-audit-view-index.md."
         ),
     }
@@ -838,9 +964,81 @@ def _ordering_fault_body(exc: "OrderingFault") -> dict:
 # The seam. Positions 1 through _RESERVED_POSITIONS belong to backfilled
 # history, scored at each record's own transaction id
 # (tools/ail_backfill_index.py); the CAS allocates from _RESERVED_POSITIONS + 1
-# upward. Must match verifier/main.py::RESERVED_POSITIONS.
-_RESERVED_POSITIONS = int(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+# upward.
+#
+# D36 (Phase 3c-3c): no longer "must match verifier/main.py" by convention.
+# The reserve is bound into the ledger under KeyMustNotExist at first
+# allocation, and this reader refuses to serve a page if its own value
+# disagrees with the bound one - paging against a different seam than the
+# writer allocated against would put live positions inside the reserve,
+# where D33 does not check them and reconciliation does not count them.
+def _validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
+    """A reserve is a positive integer. Anything else refuses at load.
+
+    Same rule and same words as verifier/main.py::validate_reserve. Three
+    copies because three images do not import each other; the value bound
+    into the ledger is what actually keeps them honest.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{source} must be an integer; got {raw!r}.")
+    if value < 1:
+        raise RuntimeError(
+            f"{source} must be a positive integer; got {value}. At or below zero "
+            "every allocated position would be at or below zero too, and zscan "
+            "under desc omits negatively-scored members and reports a zero score "
+            "as no score at all."
+        )
+    return value
+
+
+_RESERVED_POSITIONS = _validate_reserve(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
 _FIRST_ALLOCATED_POSITION = float(_RESERVED_POSITIONS + 1)
+_RESERVE_KEY = b"ail_seq:reserve"
+
+# Cached so the check costs no round trip per page. Re-read at cold start and
+# after a refusal, the same two moments the verifier refreshes its own copy.
+_bound_reserve_cache: int | None = None
+
+
+class ReserveMismatch(Exception):
+    """The ledger's bound reserve is not this service's configured reserve."""
+
+
+def _assert_reserve_agrees(client: httpx.Client, token: str) -> None:
+    """Refuse to serve a page against a seam this deployment does not share.
+
+    A ledger with no bound reserve is one that has never allocated, or one
+    written before D36. Neither is a disagreement, so neither refuses: there
+    is no bound value to disagree with, and inventing a refusal for the
+    absence would make every pre-D36 ledger unreadable.
+    """
+    global _bound_reserve_cache
+    if _bound_reserve_cache is None:
+        resp = client.post(
+            f"{IMMUDB_URL}/api/v2/db/getall",
+            json={"keys": [base64.b64encode(_RESERVE_KEY).decode()]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        entries = resp.json().get("entries", [])
+        if not entries:
+            return
+        _bound_reserve_cache = _validate_reserve(
+            base64.b64decode(entries[0]["value"]).decode(), source="the bound reserve")
+    if _bound_reserve_cache != _RESERVED_POSITIONS:
+        bound = _bound_reserve_cache
+        _bound_reserve_cache = None      # re-read on the next attempt
+        raise ReserveMismatch(
+            f"this service is configured with AIL_RESERVED_POSITIONS="
+            f"{_RESERVED_POSITIONS} and the ledger has {bound} bound into it. Every "
+            "position in this ledger was allocated against the bound value, so "
+            "paging against a different one would put live positions inside the "
+            f"reserve, where they are not order-checked. Set this service to {bound}. "
+            "A reserve that is genuinely too small is a re-index into a new view, "
+            "not a moved boundary."
+        )
 
 
 def _assert_score_order_matches_commit_order(
@@ -889,11 +1087,14 @@ def _zscan_view(client, token: str, view_set: bytes, limit: int) -> list[dict]:
     and D33's comparison is free.
 
     One measured constraint on what may be used as a position: `desc: True`
-    silently omits negatively-scored members. A backfill that placed history
-    below zero would produce records that exist, are indexed, and are still
-    absent from every page - which is the defect this index exists to remove,
-    reintroduced by the migration meant to fix it. History is therefore
-    scored in (0, 1), never at or below zero.
+    silently omits negatively-scored members, and a score of exactly zero
+    arrives with no `score` field at all because protobuf's JSON mapping
+    omits a zero-valued field. A backfill that placed history at or below
+    zero would produce records that exist, are indexed, and are still absent
+    from every page - the defect this index exists to remove, reintroduced
+    by the migration meant to fix it. History is scored at each record's own
+    transaction id (tools/ail_backfill_index.py), and transaction ids start
+    at 1, so both are avoided by construction.
     """
     resp = client.post(
         f"{IMMUDB_URL}/api/v2/db/zscan",
@@ -945,9 +1146,12 @@ def _ledger_decision_count(client: httpx.Client, token: str) -> int:
     return int(resp.json().get("count", 0))
 
 
-def _tombstoned_call_ids(client: httpx.Client, token: str, call_ids: set[str]) -> set[str]:
+def _tombstones_and_faults(
+    client: httpx.Client, token: str, call_ids: set[str]
+) -> tuple[set[str], dict[str, dict]]:
     """
-    Which of exactly these call_ids have a content_erasure tombstone.
+    Which of exactly these call_ids have a content_erasure tombstone, and
+    which have a ledger_fault qualifying their record's standing.
 
     P3c3a-3. This replaces a prefix scan over `content_erasure:` that ran
     under GET /audit's own `limit`. The two have nothing to do with each
@@ -973,18 +1177,26 @@ def _tombstoned_call_ids(client: httpx.Client, token: str, call_ids: set[str]) -
 
     There is no orphan-tombstone direction to lose: nothing reads this set
     for tombstones whose call_id is not on the page.
+
+    D35 (Phase 3c-3c): the same call also asks for this page's ledger
+    faults. `ledger_fault:{call_id}` is derivable from a page row exactly
+    the way a tombstone key is, so both key shapes go into the one request
+    and the classification still goes through `record_type`. That is why
+    naming a record's fault on the page costs no extra round trip.
     """
     if not call_ids:
-        return set()
+        return set(), {}
 
+    ordered = sorted(call_ids)
     resp = client.post(
         f"{IMMUDB_URL}/api/v2/db/getall",
         json={
             "keys": [
-                base64.b64encode(f"content_erasure:{call_id}".encode()).decode()
+                base64.b64encode(key.encode()).decode()
                 # sorted() only so the request is reproducible between
                 # identical calls; getall imposes no ordering requirement.
-                for call_id in sorted(call_ids)
+                for call_id in ordered
+                for key in (f"content_erasure:{call_id}", f"ledger_fault:{call_id}")
             ]
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -992,15 +1204,36 @@ def _tombstoned_call_ids(client: httpx.Client, token: str, call_ids: set[str]) -
     resp.raise_for_status()
 
     tombstoned: set[str] = set()
+    faults: dict[str, dict] = {}
     for raw in resp.json().get("entries", []):
         try:
             value = json.loads(base64.b64decode(raw["value"]).decode())
-            if value.get("record_type") == "content_erasure" and value.get("call_id"):
-                tombstoned.add(value["call_id"])
+            record_type = value.get("record_type")
+            call_id = value.get("call_id")
+            if not call_id:
+                continue
+            if record_type == "content_erasure":
+                tombstoned.add(call_id)
+            elif record_type == "ledger_fault":
+                # `revision` on the head entry is the number of times this
+                # key has been written, and getall already returns it - so
+                # the count of faults for a call_id is free here, and no
+                # earlier fault is lost to a later one (they are prior
+                # versions of the same key, readable five ways; see
+                # docs/reports/phase-3c3c-probe.md).
+                faults[call_id] = {
+                    "fault_class": value.get("fault_class"),
+                    "error_class": value.get("error_class"),
+                    "committed_tx_id": value.get("committed_tx_id"),
+                    "committed_position": value.get("committed_position"),
+                    "timestamp": value.get("timestamp"),
+                    "count": int(raw.get("revision", 1) or 1),
+                    "ledger_key": raw.get("key", ""),
+                }
         except Exception as exc:
-            logger.warning("Skipping malformed tombstone entry: %s", exc)
+            logger.warning("Skipping malformed page-side entry: %s", exc)
             continue
-    return tombstoned
+    return tombstoned, faults
 
 
 @app.get("/audit")
@@ -1181,6 +1414,12 @@ def get_audit(
             if not token:
                 raise ValueError("No auth token in ImmuDB login response")
 
+            # D36: before anything is selected. A page drawn against a
+            # different seam than the writer allocated against is not a
+            # degraded page, it is a page whose ordering guarantees do not
+            # apply, so it is refused rather than served with a caveat.
+            _assert_reserve_agrees(client, token)
+
             # P3c3b-3 (Phase 3c-3b): the page is selected through the view
             # index, not by walking keys.
             #
@@ -1229,9 +1468,10 @@ def get_audit(
             # `.get("score", 0.0)`, and float rather than int, both for
             # reasons measured on the wire: protobuf's JSON mapping omits a
             # zero-valued field entirely, so a score of exactly 0 arrives
-            # with no "score" key at all, and backfilled positions are
-            # fractional, so int() would collapse every one of them to 0 and
-            # manufacture a disagreement out of nothing.
+            # with no "score" key at all, and a position is a float on the
+            # wire, so int() would truncate rather than compare - a
+            # difference that matters for any score the backfill or an
+            # operator placed between two integers.
             _assert_score_order_matches_commit_order(
                 [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_entries],
                 view="decision",
@@ -1325,8 +1565,19 @@ def get_audit(
                 if log_entry.get("call_id")
             }
             page_call_ids |= set(intent_by_call_id)
-            tombstoned_call_ids = _tombstoned_call_ids(client, token, page_call_ids)
+            tombstoned_call_ids, page_faults = _tombstones_and_faults(
+                client, token, page_call_ids)
 
+    except ReserveMismatch as exc:
+        # D36: fail closed, and name the value rather than the symptom. This
+        # is a configuration disagreement with the ledger, not an outage, so
+        # a caller must not retry into it.
+        logger.error("Audit refused: %s", exc)
+        raise HTTPException(status_code=503, detail={
+            "error": "audit_reserve_mismatch",
+            "message": str(exc),
+            "page_served": False,
+        })
     except OrderingFault as exc:
         # D33: surfaced, never smoothed over. Reordering to match the
         # transaction ids would hide the one condition this check exists to
@@ -1412,6 +1663,16 @@ def get_audit(
                 "payload":         payload,
                 "payload_state":   payload_state,
                 "verification":    verification,
+                # D35 (Phase 3c-3c): the record's durable standing, as
+                # opposed to `verification`, which is recomputed on every
+                # read and goes back to "verified" the moment a corrupt
+                # trust anchor is repaired. A non-null value here says this
+                # record's write-time proof did not check out, whatever the
+                # verification state beside it now says. Null is the
+                # ordinary case and means no fault was ever recorded for
+                # this call_id - never "not checked", because the join that
+                # produces it is exact.
+                "ledger_fault":    page_faults.get(call_id) if call_id else None,
                 # R3 (Phase 1.3 completion pass, red-team V5): a record with
                 # no "profile" key at all must render as explicitly unknown,
                 # not as a definite, valid-looking value. The previous
@@ -1492,6 +1753,9 @@ def get_audit(
                 "payload":         payload,
                 "payload_state":   payload_state,
                 "verification":    verification,
+                # D35: same field on a synthesized intent row. An intent
+                # write can fault exactly the way a decision write can.
+                "ledger_fault":    page_faults.get(call_id),
                 "profile":         intent.get("profile", "unknown"),
                 "exclusivity":     None,
                 "execution_state": "unknown",

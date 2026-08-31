@@ -104,11 +104,10 @@ precondition every allocation uses - so every live position is strictly
 greater than every historical one and the page is monotone across the
 boundary by construction.
 
-Why `entry.tx` and not a rank within the backfill pass. Ranking was the first
-implementation: history sorted by tx, then mapped onto evenly spaced values in
-(0, 1). It is monotone within one pass and not across two, because a second
-pass computes a different rank against a different denominator and interleaves
-with the first. A position that *is* the transaction id is stable however many
+Why `entry.tx` and not a rank within the backfill pass. A rank is monotone
+within one pass and not across two, because a second pass computes a different
+rank against a different denominator and interleaves with the first. A
+position that *is* the transaction id is stable however many
 passes run and in whatever order, so re-running after finding more history
 extends the ordering rather than disturbing it, and no cursor is needed to say
 where history ends.
@@ -160,18 +159,31 @@ reader a page that looks fine.
                 "disagreement": {"higher_position": {"position", "transaction"},
                                  "lower_position":  {"position", "transaction"}},
                 "page_served": false,
-                "transient": false,
+                "scope": "<what this check can see>",
+                "on_retry": "<what a later request means, and does not mean>",
+                "authoritative_check": "<where the durable answer lives>",
                 "remediation": "<what to do>"}}
 
 `500` and not `4xx`, because nothing about the request is wrong; `500` and not
-`503`, because the condition will not heal on its own - the ledger is
-append-only and a position once written cannot be withdrawn, so the "try again
-shortly" that `503` promises would be false. `page_served` and `transient` are
-stated in the body rather than left for a caller to infer from a status code,
-so no reader mistakes the fault for an empty ledger or for a blip worth
-retrying. The handler is deliberately the first in `get_audit`: anything
-broader above it would swallow the fault into a `503 ImmuDB unavailable` and
-tell a reader something false.
+`503`, because the ledger is append-only and a position once written cannot be
+withdrawn, so the "try again shortly" that `503` promises would be false.
+`page_served` is stated in the body rather than left for a caller to infer
+from a status code, so no reader mistakes the fault for an empty ledger. The
+handler sits above every handler broad enough to catch it: an `except
+Exception` above it would swallow the fault into a `503 ImmuDB unavailable`
+and tell a reader something false.
+
+**What the body must not say, corrected in Phase 3c-3c (P3c3c-7).** It said
+`transient: false`. The corruption is not transient; this fault is. The
+check's window is the top of the index at the requested limit, so newer
+commits push a disagreement below the window and every limit answers `200`
+again with the corruption still indexed - measured in
+`docs/reports/phase-3c3b-redteam.md` C5 and C10 and reproduced in
+`docs/reports/phase-3c3c.md`. A field asserting a durability the code does
+not have is worse than no field: its absence tomorrow reads as repair. What
+replaces it is the scope the check actually has, what a later success does
+and does not mean, and a pointer to D37's reconciliation, which has no
+window.
 
 **What the check covers, stated precisely.** Only positions the CAS
 allocated, which are the integers from 1 up. Backfilled history was ordered
@@ -180,6 +192,140 @@ was never subject to the CAS, so a pre-index record can legitimately carry a
 higher transaction id than a record indexed after it. Comparing those two
 would report a fault about a rule that never applied to either. The check is
 scoped to the rows the CAS produced and is not weakened for them.
+
+## D35. A committed write is reported as committed, and its standing is durable
+
+Added in Phase 3c-3c, closing red-team C7 and C1.
+
+Both write routes commit before their proof runs. The ordered route's
+`ExecAll` commits the record, the counter advance and the index entry, and
+then runs `verifiedGet`; `verifiedSet` commits at
+`service.VerifiableSet(rawRequest)` and every `ErrCorruptedData` raise is
+after that line. So a proof failure can no longer prevent the write, and
+answering `{"tx_id": null, "seq": null, "verified": false}` told the caller
+the opposite of what happened - it is the exact shape
+`ledger/immudb_ledger.py` reads as "the write did not happen". Reproduced:
+the response said null while the record sat at tx 7, position 1000000005,
+indexed, with the counter advanced.
+
+The response now carries the real transaction, the real position and
+`committed: true` beside `verified: false`. **The call still denies.**
+Fail-closed on execution is unchanged and the caller's rule is still keyed on
+`verified`; what changed is the description of the ledger.
+
+**The page's `unverifiable` is not the record's standing.**
+`control_plane/main.py::_verify_one_key` computes verification fresh at read
+time, so repairing the trust anchor makes the same record read `verified` on
+the next page with nothing recording that its write-time proof failed -
+measured, including a clean `ail-evidence-bundle/2` exported for it
+afterwards. The durable qualification is therefore a **record**:
+`ledger_fault:{call_id}`, classified by `record_type`, carrying the committed
+key, transaction and position, joined to a page row by the same exact
+`getall` the tombstone join already issues. A second fault for one `call_id`
+is a new version of the same key written by an unconditional set, so nothing
+is lost and `getall`'s `revision` gives the count for free
+(`docs/reports/phase-3c3c-probe.md`).
+
+**The fault record's own write is the one write in this system whose success
+does not require write-time proof.** The condition that produces a fault is
+the condition that breaks every proof, so requiring one would mean the
+qualification can never be recorded exactly when it is needed. Three
+constraints hold it in place: `_set_without_verification` refuses any record
+that is not a `ledger_fault`, so the decision path is structurally unable to
+reach it; `POST /write` refuses a `ledger_fault` arriving from a caller; and
+a failure to write the fault fails loudly, logged and reported as
+`fault_record_error`, because a silent absence would leave a committed record
+unqualified with nothing saying why.
+
+**The verifier is a writer now, so it has a writer key.** D22's rule is one
+dedicated long-lived key per writer; `keys/writer-verifier.key` is the third.
+An unsigned fault record would be a record `tools/ail_verify_bundle.py`
+refuses outright, which is a poor thing for a record whose whole job is to
+qualify another record's standing.
+
+## D36. The reserve is bound into the ledger at first allocation
+
+Added in Phase 3c-3c, closing red-team C3 and the named half of C4.
+
+Raising `AIL_RESERVED_POSITIONS` after allocation put committed CAS positions
+inside the new reserve, where they are neither reconciled (`anchor_service`
+counts only positions above it) nor order-checked (D33 is scoped to the same
+range), permanently, with the verdict still reading `clean`. Nothing
+distinguished "raised after allocation" from "always was this value", and the
+backfill's own refusal message instructed exactly that raise.
+
+The reserve is written into the ledger at `ail_seq:reserve`, in the same
+`ExecAll` as the first allocation, under a `KeyMustNotExist` precondition.
+That gives immutability and the runtime agreement check from one mechanism
+rather than pairwise probes between three services: every reader compares its
+own configured value against the bound one and refuses on disagreement - the
+writer refuses to allocate, the control plane refuses to serve a page, the
+reconciler refuses to report, and the backfill refuses to run.
+
+The key lives outside every counted prefix, the same rule the counter follows
+and for the same reason. Reading it costs no round trip per write: it is
+cached, re-read at cold start and after a rejection. The value is validated as
+a positive integer wherever it is read, in all four copies - C4 was not
+refuted, but an unvalidated reserve is the one input that puts every position
+at or below zero, where `zscan desc` silently omits it.
+
+**A reserve that turns out too small is a re-index into a new view, not a
+moved boundary.** A second zset scored from the same counter takes the
+history that does not fit. The refusal message says so, in place of the
+instruction that was the attack.
+
+**One limit, stated rather than assumed away.** A ledger that was already
+allocating before this phase has no first allocation left to catch, so the
+binding attaches to its next one. A deployment that had already raised its
+reserve before upgrading therefore binds the raised value, and nothing can
+retroactively distinguish that.
+
+## D37. Reconciliation is the authoritative order check
+
+Added in Phase 3c-3c, closing red-team C6 and, with D35, C10.
+
+D33's comparison stays as a cheap assertion that enforcement is in place, but
+its window is the top-of-index page, so a disagreement below it is
+unreachable at any limit and newer traffic clears the fault while the
+corruption stays. The authoritative check is the reconciliation, which
+already walks every position.
+
+**Per view, and per view means precisely three things:**
+
+1. every member of a view matches that view's prefix;
+2. the union across views equals the allocated range exactly, **in both
+   directions** - positions the counter handed out that no view holds, and
+   positions no counter ever handed out that a view does;
+3. no position appears in two views.
+
+Clause 1 is what a union across views could not see: a decision record
+indexed into the intent view balanced the arithmetic while being on no page
+at all, and reconciled `clean`. Clause 2's second direction is new: 2510
+positions nobody allocated sat in a view and the verdict was `clean`, which
+matters because D33's own remediation sends an operator here.
+
+**Clause 3 is a property of the current view set, not a law.** It is retired
+the first time a view legitimately overlaps the existing ones, which is the
+incident-first view D32 anticipated. Stated here so that is a known
+consequence rather than a surprise to whoever adds it.
+
+**Reconciliation must not die on a malformed row.** `min_score =
+float(rows[-1]["score"])` sat two lines after a correct `.get("score", 0.0)`,
+so a page ending on a zero-scored row - protobuf omits a zero-valued field
+entirely - raised `KeyError` out of the whole pass, which `run_forever`
+swallowed into one log line per interval, permanently dark. A row that cannot
+be read is now a finding in the same shape as every other finding, and a
+zero-scored row is itself a finding: no write path this project has produces
+one.
+
+**It runs in the test stack, and anchoring still does not.**
+`AIL_ANCHOR_MODE=reconcile-only` runs the reconciliation half with no
+anchoring key, no `/state` read and no submission anywhere on the path, so
+`docker-compose.test.yml` gets a genuinely running reconciler while P3b-5's
+demonstration - the whole suite running with anchoring entirely broken -
+survives. Each pass writes its verdict to `AIL_RECONCILE_REPORT_PATH`, which
+is how a test observes the running service rather than its own in-process
+call.
 
 ## D34. The serialisation ceiling is accepted, documented, and measured
 
@@ -231,17 +377,35 @@ writers gave up at 8 concurrent in either this phase's measurements or
   states the new meaning rather than leaving both alive.
 - A position is a float64 score, so positions stay exact to 2^53. With the
   reserve at 1e9 and one write per second, that is about 285 million years.
-- `POST /write` is unchanged and still live: `control_plane/main.py::
-  _write_tombstone` uses it. A tombstone is not a decision and is never a row
-  on the ordered page - it is joined by keyed lookup - so it takes no
-  position. If it took one, that position would sit in no view index and
-  reconciliation would report it as a hole on every pass. The split between
-  the two routes is asserted by tests rather than left to convention.
+- `POST /write` is still live: `control_plane/main.py::_write_tombstone` uses
+  it. A tombstone is not a decision and is never a row on the ordered page -
+  it is joined by keyed lookup - so it takes no position. If it took one, that
+  position would sit in no view index and reconciliation would report it as a
+  hole on every pass. **Since Phase 3c-3c the route refuses a decision, an
+  intent or a fault record itself** (P3c3c-2): the split used to rest on
+  convention plus a static parse of two files, and the parse was defeated by
+  holding the route in a variable. The parse survives as a second line, over
+  every production module rather than two.
+- An erasure completes against a committed-unverified tombstone (P3c3c-12),
+  after the tombstone is confirmed present by an exact read. Refusing it
+  instead left the ledger saying erased while the content it names was still
+  in the store, which is `_payload_state`'s `erasure_conflict` - P13-4's own
+  finding, manufactured by the refusal. What has not changed is the invariant:
+  no row is ever deleted without a tombstone behind it.
+- A bundle does not name a record's ledger fault. `GET /audit/bundle` takes a
+  key and passes no revision, and the bundle has no section for one; adding
+  one is a format change (`ail-evidence-bundle/3`), which is a D18-D20
+  decision this phase deliberately did not make. README's Residual Limits
+  states it.
 
 ## References
 
 - `docs/reports/phase-3c3b.md` - the measurements, the mutation transcripts,
   and the before/after demonstration
+- `docs/reports/phase-3c3b-redteam.md` - the ten claims, eight refuted
+- `docs/reports/phase-3c3c.md` - D35, D36 and D37, and the reproduction of
+  every refutation they close
+- `docs/reports/phase-3c3c-probe.md` - the ImmuDB read-API facts these rest on
 - `docs/reports/phase-3c2.md` - where the defect was first observed
 - `tools/ail_backfill_index.py`, `tools/ail_ordering_cost_probe.py`
 - `tests/test_audit_ordering.py`

@@ -88,13 +88,25 @@ def _network_available():
 # Helpers that drive the real services
 # ---------------------------------------------------------------------------
 
-def _write(key: bytes, value: bytes) -> dict:
+def _write(key: bytes, value: bytes, view: str | None = "decision") -> dict:
+    # D32 (Phase 3c-3b): a decision or intent record takes /write-ordered,
+    # because it needs a commit position in the same transaction that
+    # commits it and a record with no position is absent from every ordered
+    # page. P3c3c-2 (Phase 3c-3c) made that a rule the route enforces rather
+    # than a convention, so the plain route now refuses such a record
+    # outright. `view=None` keeps the plain route for the record kinds that
+    # take no position, which is what a tombstone is.
+    body = {
+        "key": base64.b64encode(key).decode(),
+        "value": base64.b64encode(value).decode(),
+    }
+    route = "/write"
+    if view is not None:
+        route = "/write-ordered"
+        body["view"] = view
     resp = httpx.post(
-        f"{VERIFIER_URL}/write",
-        json={
-            "key": base64.b64encode(key).decode(),
-            "value": base64.b64encode(value).decode(),
-        },
+        f"{VERIFIER_URL}{route}",
+        json=body,
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=30,
     )
@@ -564,12 +576,23 @@ def test_writes_continue_and_records_are_produced_with_anchoring_broken():
     """
     P3b-5, the enforcing test for the write path.
 
-    anchor-service is absent from docker-compose.test.yml, so external
-    anchoring against this stack is not merely failing, it does not exist.
-    That absence is asserted here from the compose file itself rather than
+    External anchoring against this stack is not merely failing, it does not
+    exist. That is asserted here from the compose file itself rather than
     assumed, the same way tests/test_host_port_bindings.py asserts port
-    bindings from the YAML - otherwise a future edit that quietly added the
-    service would turn this into a test of nothing.
+    bindings from the YAML - otherwise a future edit could turn this into a
+    test of nothing.
+
+    **What is asserted changed shape in Phase 3c-3c, and did not weaken.**
+    It used to be "anchor-service is absent from this file". P3c3c-4 puts
+    the service in the file in `AIL_ANCHOR_MODE=reconcile-only`, because the
+    sequence reconciliation lives in it and was covered by no test at all
+    while it was absent. Absence by name was never the property that
+    mattered; not anchoring is. So the assertion is now the mechanism: if
+    the service is here it must be in reconcile-only mode, which never calls
+    anchor_once, never reads the verifier's /state and never submits
+    anything, and it must hold no anchoring key, so it could not sign a
+    submission even if it tried. A future edit that put the anchoring loop
+    back fails this exactly as an unconditional absence check would have.
 
     Writes succeed anyway, records are produced, and bundles export. That is
     D23's fail-open half, running on every CI job rather than staged once.
@@ -579,12 +602,32 @@ def test_writes_continue_and_records_are_produced_with_anchoring_broken():
     compose = yaml.safe_load(
         (REPO_ROOT / "docker-compose.test.yml").read_text(encoding="utf-8")
     )
-    assert "anchor-service" not in compose["services"], (
-        "anchor-service is now in docker-compose.test.yml; this suite would "
-        "then depend on a shared public transparency log and on CI having "
-        "egress, and the fail-open demonstration would no longer be running "
-        "against genuinely broken anchoring"
-    )
+    anchor = compose["services"].get("anchor-service")
+    if anchor is not None:
+        environment = anchor.get("environment") or []
+        settings = dict(
+            item.split("=", 1) for item in environment if "=" in item
+        ) if isinstance(environment, list) else dict(environment)
+        assert settings.get("AIL_ANCHOR_MODE") == "reconcile-only", (
+            "anchor-service is in docker-compose.test.yml and is not in "
+            "reconcile-only mode; this suite would then depend on a shared "
+            "public transparency log and on CI having egress, and the "
+            "fail-open demonstration would no longer be running against "
+            f"genuinely broken anchoring. environment: {settings}"
+        )
+        assert "AIL_ANCHOR_SIGNING_KEY" not in settings, (
+            "the reconcile-only anchor-service holds an anchoring key; it must "
+            "not be able to sign a submission at all"
+        )
+        assert "VERIFIER_READ_KEY" not in settings, (
+            "the reconcile-only anchor-service holds the credential it would "
+            "need to read the verifier's /state, which is the first step of an "
+            "anchoring cycle"
+        )
+        assert "CONTROL_PLANE_WRITE_KEY" not in settings, (
+            "the reconcile-only anchor-service holds the credential it would "
+            "need to record an anchor in the store"
+        )
 
     key, tx = _write_signed_record()
     assert tx > 0

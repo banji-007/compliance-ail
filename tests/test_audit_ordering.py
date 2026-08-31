@@ -136,6 +136,24 @@ def _write_unordered(key: str, value: str) -> dict:
     return body
 
 
+def _write_historical(key: str, value: str) -> dict:
+    """A record as it looked before the view index existed: in the ledger,
+    with no position and no index entry.
+
+    Written straight to ImmuDB's own REST route rather than through the
+    verifier. P3c3c-2 closed POST /write to decision and intent records, so
+    the route that used to stand in for "an older build wrote this" now
+    refuses - correctly, because an older build is exactly what wrote these
+    records and it is not reachable from here. What the backfill has to pick
+    up is a key in the ledger that no view holds, and this produces one.
+    """
+    resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/set",
+                        json={"KVs": [{"key": _b64(key), "value": _b64(value)}]},
+                        headers=_immudb_headers())
+    resp.raise_for_status()
+    return resp.json()
+
+
 def _new_decision(agent_id: str | None = None, call_id: str | None = None) -> tuple[str, dict]:
     agent = agent_id or f"p3c3b-{uuid.uuid4().hex[:8]}"
     cid = call_id or uuid.uuid4().hex
@@ -472,10 +490,11 @@ def test_page_order_equals_commit_order():
     re-sorting between the index and the response.
 
     Asserted over records this test wrote, in their relative order on the
-    page, rather than over every row. Backfilled history is scored in (0, 1)
-    by an offline pass and sits at the back of the page by position, but its
-    transaction ids can be higher than live traffic's - a record written
-    through the old path today gets a high tx and a low position. Comparing
+    page, rather than over every row. Backfilled history is scored at each
+    record's own transaction id by an offline pass, inside the reserve, so
+    it sits at the back of the page by position while its transaction ids
+    can be higher than live traffic's - a record written straight to the
+    ledger today gets a high tx and a position below every allocated one. Comparing
     those two groups would be comparing positions the CAS allocated against
     positions it never touched, which is the same scoping D33's own check
     applies (see _assert_score_order_matches_commit_order).
@@ -636,8 +655,16 @@ def test_the_ordering_fault_has_a_structured_face():
 
     The body names the error, the view, and the two positions that disagreed
     with the transactions they resolve to, and it says out loud that no page
-    was served and that the condition will not heal. A caller must not be
-    left inferring either from a bare status code.
+    was served and what the scope of the check that raised actually is. A
+    caller must not be left inferring either from a bare status code.
+
+    P3c3c-7 (Phase 3c-3c): and it must not say `transient: false`. The
+    corruption is not transient; this fault is - the check's window is the
+    top of the index, so newer commits push a disagreement below the window
+    and every limit answers 200 again with the corruption still there
+    (docs/reports/phase-3c3b-redteam.md C5 and C10). A field asserting a
+    durability the code does not have is worse than no field, because its
+    absence tomorrow then reads as repair.
 
     Tested through the body builder rather than by fabricating a live
     disagreement: ImmuDB zsets are append-only, so a bad score written into a
@@ -657,9 +684,20 @@ def test_the_ordering_fault_has_a_structured_face():
     assert body["page_served"] is False, (
         "a caller must not be able to read this as an empty ledger"
     )
-    assert body["transient"] is False, (
-        "the ledger is append-only and a written score cannot be withdrawn, "
-        "so a caller must not be invited to retry"
+    assert "transient" not in body, (
+        "the page check cannot observe whether this fault persists: newer "
+        "commits push a disagreement below its window and every limit answers "
+        "200 again with the corruption still indexed. A field claiming "
+        "otherwise makes its own absence read as repair."
+    )
+    assert body["scope"], "the check's scope must be stated, not inferred"
+    assert "this page" in body["scope"], body["scope"]
+    assert "not evidence" in body["on_retry"], (
+        "a caller must be told that a later page succeeding is not evidence "
+        "the index was corrected"
+    )
+    assert "reconciliation" in body["authoritative_check"], (
+        "the body must point at the check that does have the durable answer"
     )
     assert body["disagreement"]["higher_position"] == {
         "position": R + 9.0, "transaction": 100}, body
@@ -690,9 +728,20 @@ def test_the_ordering_fault_is_answered_and_never_escapes():
     handlers = [line.strip() for line in body.splitlines()
                 if line.startswith("    except ")]
     assert handlers, "get_audit has no exception handlers at all"
-    assert handlers[0].startswith("except OrderingFault"), (
-        "the ordering fault must be the first handler; anything broader above "
-        f"it would swallow the fault. handlers, in order: {handlers}"
+    ordering_at = [i for i, h in enumerate(handlers)
+                   if h.startswith("except OrderingFault")]
+    assert ordering_at, f"get_audit does not handle OrderingFault at all: {handlers}"
+    # Not "must be first": D36 added a sibling handler for ReserveMismatch,
+    # which is a distinct class and swallows nothing. What must hold is that
+    # no handler broad enough to catch an OrderingFault sits above it -
+    # Python takes the first matching except, so an `except Exception` there
+    # would turn the fault into a 503 "ImmuDB unavailable" and tell a reader
+    # something false.
+    broad = ("except Exception", "except BaseException", "except httpx.HTTPError")
+    above = handlers[:ordering_at[0]]
+    assert not [h for h in above if h.startswith(broad)], (
+        "a handler broad enough to catch OrderingFault sits above it and would "
+        f"swallow the fault. handlers, in order: {handlers}"
     )
     assert "raise HTTPException(status_code=500, detail=_ordering_fault_body(exc))" in body, (
         "the fault must be answered with the structured body"
@@ -763,6 +812,20 @@ def test_each_record_kind_is_written_through_the_route_that_matches_it():
     Static parse of the production callers, so a record kind cannot quietly
     change routes.
 
+    **This is the second line, not the control.** P3c3c-2 moved the control
+    into the verifier route itself (see
+    tests/test_ledger_faults.py::test_a_decision_record_is_refused_at_the_
+    plain_write_route), because the red team defeated this parse: it counted
+    substrings in two files, so a caller holding the route in a variable
+    (`ledger.verifier_url + _PLAIN_ROUTE`) passed it, and a third module was
+    invisible to it entirely.
+
+    Both weaknesses are closed here rather than the parse being deleted. It
+    walks every production module that could write a ledger record, not two;
+    and it asserts on what each module names rather than on a count that a
+    variable can dodge - a module that mentions the plain route at all,
+    outside the one function allowed to, fails.
+
     A decision and an intent must take the ordered route, because a record
     with no position is absent from every ordered page. A tombstone must take
     the plain one, because allocating for it would consume a position no view
@@ -777,9 +840,6 @@ def test_each_record_kind_is_written_through_the_route_that_matches_it():
     )
     assert '"view": "decision"' in ledger, "the decision write must name its view"
     assert '"view": "intent"' in ledger, "the intent write must name its view"
-    assert '{self.verifier_url}/write"' not in ledger, (
-        "no ledger record kind may take the plain route from here"
-    )
 
     tombstone = control[control.index("def _write_tombstone"):]
     tombstone = tombstone[:tombstone.index(chr(10) + "def ")]
@@ -788,6 +848,68 @@ def test_each_record_kind_is_written_through_the_route_that_matches_it():
         "a tombstone must not allocate a commit position: it is never a row on "
         "the ordered page, and the position would be one reconciliation then "
         "reports as a hole forever"
+    )
+
+    # Weakness one: the sweep walks every production module that could write
+    # a ledger record, not two.
+    #
+    # Weakness two: it locates each occurrence rather than counting them, and
+    # requires every one to fall inside the single span allowed to reach the
+    # plain route. `ledger.verifier_url + _PLAIN_ROUTE` in a module that has
+    # no allowed span is an occurrence in the wrong place, whatever it is
+    # spelled as, so holding the route in a variable no longer dodges this.
+    directories = ("ledger", "control_plane", "decision_service", "interceptor",
+                   "anchor_service", "agent", "framework_integration", "tools")
+    sources = sorted(
+        path
+        for directory in directories
+        if (REPO_ROOT / directory).is_dir()
+        for path in (REPO_ROOT / directory).rglob("*.py")
+    )
+    assert sources, "the sweep found no production modules to walk"
+
+    def _plain_route_positions(text: str) -> list[int]:
+        """Every offset where the plain route is named as a URL.
+
+        `/write-ordered` is excluded, and so is prose: the occurrence has to
+        end a string literal, which is what `f"{url}/write"` and
+        `route = "/write"` do and what a sentence mentioning the route does
+        not. Prose is not a caller.
+        """
+        found, at = [], 0
+        while True:
+            at = text.find("/write", at)
+            if at == -1:
+                return found
+            after = text[at + len("/write"):at + len("/write") + 8]
+            if not after.startswith("-ordered") and after[:1] in ('"', "'"):
+                found.append(at)
+            at += 1
+
+    tombstone_at = control.index("def _write_tombstone")
+    tombstone_end = tombstone_at + len(tombstone)
+    allowed_spans = {"control_plane/main.py": [(tombstone_at, tombstone_end)]}
+    # The measurement probes drive both routes on purpose - comparing them is
+    # what they exist for (docs/reports/phase-3c3b.md section 7). Named
+    # individually rather than by excluding tools/, so a new module there
+    # that writes records is still caught.
+    allowed_files = {"tools/ail_ordering_cost_probe.py",
+                     "tools/audit_roundtrip_measure.py"}
+
+    offenders = []
+    for path in sources:
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel in allowed_files:
+            continue
+        spans = allowed_spans.get(rel, [])
+        for at in _plain_route_positions(text):
+            if any(lo <= at < hi for lo, hi in spans):
+                continue
+            offenders.append((rel, text[max(0, at - 40):at + 20].strip()))
+    assert not offenders, (
+        "a production module names the plain write route outside the one span "
+        f"allowed to write through it: {offenders}"
     )
 
 
@@ -810,7 +932,7 @@ def test_a_record_written_before_the_index_appears_in_the_ordered_page_after_bac
     call_id = uuid.uuid4().hex
     agent = f"0000-p3c3b-preindex-{uuid.uuid4().hex[:8]}"
     key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
-    _write_unordered(key, _decision_value(call_id, agent))
+    _write_historical(key, _decision_value(call_id, agent))
 
     encoded = _b64(key)
 
@@ -855,7 +977,7 @@ def test_the_seam_is_monotone_across_the_boundary():
     # A record from before the index, and one after it.
     agent = f"0000-p3c3b-seam-{uuid.uuid4().hex[:8]}"
     old_key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
-    _write_unordered(old_key, _decision_value(uuid.uuid4().hex, agent))
+    _write_historical(old_key, _decision_value(uuid.uuid4().hex, agent))
     ail_backfill_index.backfill()
     _new_decision()
 
@@ -947,7 +1069,7 @@ def _load_reconciler():
 def test_a_correctly_indexed_write_introduces_no_hole():
     """
     The baseline. A detector that cannot distinguish a good write from a bad
-    one says nothing when it says "holes".
+    one says nothing when it says "findings".
 
     Stated as a difference across one write rather than as "the ledger is
     clean", deliberately. The hole the next test creates is permanent - an
@@ -1009,7 +1131,7 @@ def test_a_consumed_position_with_no_index_entry_is_detected():
     assert resp.status_code == 200, f"could not create the hole: {resp.text[:300]}"
 
     result = reconciler.reconcile_once()
-    assert result["state"] == "holes", (
+    assert result["state"] == "findings", (
         f"a consumed position with no index entry was reported clean: {result}"
     )
     assert burned in result["missing"], (

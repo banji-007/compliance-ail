@@ -30,13 +30,12 @@ the boundary by construction. This pass seeds it if a counter is already
 running below the reserve, and verifier/main.py starts a fresh counter above
 it, so the seam lands in the same place whether or not a backfill ever runs.
 
-Why `tx` and not a rank within the pass. Ranking was the first
-implementation: history sorted by tx and mapped onto evenly spaced values in
-(0, 1). It is monotone within one pass and not across two, because a second
-pass computes a different rank against a different denominator and
-interleaves with the first. A score that *is* the transaction id is stable
-however many passes run and in whatever order, so re-running after finding
-more history extends the ordering instead of disturbing it.
+Why `tx` and not a rank within the pass. A rank is monotone within one pass
+and not across two: a second pass computes a different rank against a
+different denominator and interleaves with the first. A score that *is* the
+transaction id is stable however many passes run and in whatever order, so
+re-running after finding more history extends the ordering instead of
+disturbing it.
 
 Two constraints on what may be used as a position, both measured rather than
 assumed. ImmuDB's `zscan` under `desc: true` silently omits
@@ -77,9 +76,54 @@ IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD", "immudb")
 
 SEQUENCE_KEY = "ail_seq:commit"
 
-# Must match verifier/main.py::RESERVED_POSITIONS and control_plane's own
-# copy. Positions at or below this belong to backfilled history.
-RESERVED_POSITIONS = int(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+# Positions at or below this belong to backfilled history.
+#
+# D36 (Phase 3c-3c): no longer "must match verifier/main.py" by convention.
+# The reserve is bound into the ledger at first allocation and this pass
+# reads the bound value, never its own default - a backfill scoring history
+# against a different seam than the writer allocates against is how live
+# positions end up inside the reserve, which is exactly what raising the
+# setting used to do.
+RESERVE_KEY = "ail_seq:reserve"
+
+
+def validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
+    """A reserve is a positive integer. Anything else refuses.
+
+    Same rule and same words as verifier/main.py::validate_reserve.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise SystemExit(f"{source} must be an integer; got {raw!r}.")
+    if value < 1:
+        raise SystemExit(
+            f"{source} must be a positive integer; got {value}. At or below zero "
+            "every allocated position would be at or below zero too, and zscan "
+            "under desc omits negatively-scored members and reports a zero score "
+            "as no score at all."
+        )
+    return value
+
+
+RESERVED_POSITIONS = validate_reserve(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+
+
+def bound_reserve(client: httpx.Client, headers: dict) -> int | None:
+    """The reserve bound into this ledger, or None if none is bound yet."""
+    resp = client.post(f"{IMMUDB_URL}/api/v2/db/getall",
+                       json={"keys": [b64(RESERVE_KEY)]}, headers=headers)
+    if resp.status_code != 200:
+        raise SystemExit(
+            f"refusing to backfill: could not read the bound reserve (HTTP "
+            f"{resp.status_code}). Scoring history against an unknown seam is "
+            "how live positions end up inside the reserve."
+        )
+    entries = resp.json().get("entries", [])
+    if not entries:
+        return None
+    return validate_reserve(unb64(entries[0]["value"]).decode(),
+                            source="the bound reserve")
 
 # Must match verifier/main.py::_VIEW_SETS and control_plane/main.py's
 # _VIEW_DECISION / _VIEW_INTENT. Three copies of these names is two too
@@ -131,15 +175,57 @@ def scan_all(client: httpx.Client, headers: dict, prefix: str) -> list[dict]:
 
 
 def indexed_keys(client: httpx.Client, headers: dict, view_set: str) -> set[bytes]:
-    """Which keys the view already holds, so a re-run does not double-index."""
+    """Which keys the view already holds, so a re-run does not double-index.
+
+    P3c3c-5 (Phase 3c-3c): paged, like scan_all beside it. This used to
+    issue one un-paginated `zscan` at the 2500 ceiling, so once a view held
+    more than 2500 rows every row past the ceiling was invisible to the
+    snapshot and got indexed a second time - in a *single* pass, not by
+    re-running. Reproduced on b9f6a1d at 2535 rows: the snapshot reported
+    2499 already indexed and one pass left 25 records holding two positions
+    each. A production view reaches 2500 rows after 2500 decisions.
+
+    Paged by score rather than by key because zscan orders by score. Rows
+    sharing a score are all read on the page that reaches that score, and
+    the next page seeks strictly past it, so the loop terminates and the
+    only case it could miss is more than 2500 rows at one identical score -
+    which the backfill itself cannot produce (a score is a transaction id)
+    and which is stated rather than silently assumed.
+
+    A non-200 raises. It used to return an empty set, which does not mean
+    "nothing is indexed" but is indistinguishable from it, so one transient
+    zscan error made the pass believe the view was empty and re-index every
+    record in it.
+    """
     seen: set[bytes] = set()
-    resp = client.post(f"{IMMUDB_URL}/api/v2/db/zscan", json={
-        "set": b64(view_set), "desc": False, "limit": SCAN_PAGE,
-    }, headers=headers)
-    if resp.status_code != 200:
-        return seen
-    for row in resp.json().get("entries", []):
-        seen.add(unb64(row["key"]))
+    min_score = None
+    while True:
+        body = {"set": b64(view_set), "desc": False, "limit": SCAN_PAGE}
+        if min_score is not None:
+            body["minScore"] = {"score": min_score}
+        resp = client.post(f"{IMMUDB_URL}/api/v2/db/zscan", json=body, headers=headers)
+        if resp.status_code != 200:
+            raise SystemExit(
+                f"refusing to backfill: reading the existing index for {view_set!r} "
+                f"failed with HTTP {resp.status_code}: {resp.text[:200]}. An "
+                "incomplete snapshot of what is already indexed produces records "
+                "at two positions, so this stops rather than guessing."
+            )
+        rows = resp.json().get("entries", [])
+        if not rows:
+            break
+        before = len(seen)
+        for row in rows:
+            seen.add(unb64(row["key"]))
+        try:
+            min_score = float(rows[-1].get("score", 0.0))
+        except (TypeError, ValueError):
+            raise SystemExit(
+                f"refusing to backfill: a row in {view_set!r} has an unreadable "
+                "score, so the index cannot be paged completely."
+            )
+        if len(rows) < SCAN_PAGE or len(seen) == before:
+            break
     return seen
 
 
@@ -161,7 +247,8 @@ def current_sequence(client: httpx.Client, headers: dict) -> int:
         return 0
 
 
-def seed_counter_above_reserve(client: httpx.Client, headers: dict) -> dict:
+def seed_counter_above_reserve(client: httpx.Client, headers: dict,
+                               reserve: int | None = None) -> dict:
     """Move a counter that is running below the reserve up to it.
 
     Only ever raises the counter, never lowers it, and does it under the same
@@ -173,24 +260,25 @@ def seed_counter_above_reserve(client: httpx.Client, headers: dict) -> dict:
     existed, in which case its live positions and the range history is about
     to be scored into would overlap.
     """
+    reserve = RESERVED_POSITIONS if reserve is None else reserve
     observed = _counter_with_tx(client, headers)
     if observed is None:
         # No counter yet: verifier/main.py's first allocation starts above the
         # reserve on its own, so there is nothing to seed.
         return {"seeded": False, "reason": "no counter yet", "value": None}
     value, tx = observed
-    if value >= RESERVED_POSITIONS:
+    if value >= reserve:
         return {"seeded": False, "reason": "already above the reserve", "value": value}
 
     resp = client.post(f"{IMMUDB_URL}/api/v2/db/execall", json={
         "Operations": [{"kv": {"key": b64(SEQUENCE_KEY),
-                               "value": b64(str(RESERVED_POSITIONS))}}],
+                               "value": b64(str(reserve))}}],
         "preconditions": [{"keyNotModifiedAfterTX": {"key": b64(SEQUENCE_KEY),
                                                      "txID": str(tx)}}],
         "noWait": False,
     }, headers=headers)
     resp.raise_for_status()
-    return {"seeded": True, "from": value, "value": RESERVED_POSITIONS}
+    return {"seeded": True, "from": value, "value": reserve}
 
 
 def _counter_with_tx(client: httpx.Client, headers: dict):
@@ -212,6 +300,21 @@ def backfill(dry_run: bool = False) -> dict:
     with httpx.Client(timeout=120.0) as client:
         headers = login(client)
 
+        # D36: the ledger's own value wins over this process's environment.
+        # A disagreement is refused rather than resolved in either
+        # direction: whichever is wrong, running would score history into a
+        # range the writer is allocating from or vice versa.
+        bound = bound_reserve(client, headers)
+        if bound is not None and bound != RESERVED_POSITIONS:
+            raise SystemExit(
+                f"refusing to backfill: AIL_RESERVED_POSITIONS is "
+                f"{RESERVED_POSITIONS} and the ledger has {bound} bound into it. "
+                "The bound value is what every position in this ledger was "
+                f"allocated against. Set this to {bound} and re-run."
+            )
+        reserve = bound if bound is not None else RESERVED_POSITIONS
+        summary["bound_reserve"] = bound
+
         pending: list[tuple[str, bytes, int]] = []   # (view, key, tx)
         for view, (prefix, view_set) in VIEWS.items():
             already = indexed_keys(client, headers, view_set)
@@ -232,19 +335,34 @@ def backfill(dry_run: bool = False) -> dict:
         pending.sort(key=lambda item: item[2])
 
         summary["sequence_at_start"] = current_sequence(client, headers)
-        summary["reserved_positions"] = RESERVED_POSITIONS
+        summary["reserved_positions"] = reserve
 
         # Fail closed rather than guess. A historical transaction id at or
         # above the reserve would be scored on top of live positions, which
         # is worse than not running: the page would interleave history with
         # current traffic and D33 would fault on it.
-        over = [tx for _v, _k, tx in pending if tx >= RESERVED_POSITIONS]
+        #
+        # D36 (Phase 3c-3c): what this message used to instruct is the
+        # attack the red team ran. "Raise AIL_RESERVED_POSITIONS and re-run"
+        # moves the seam above positions the compare-and-set has already
+        # handed out, which puts committed live positions inside the new
+        # reserve - where reconciliation does not count them and D33 does
+        # not order-check them, permanently, with the verdict still reading
+        # clean. The reserve is bound into the ledger at first allocation
+        # and cannot be moved, so the remedy is a re-index into a new view:
+        # a second zset, scored from the same counter, that this history
+        # fits into. The boundary stays where it is.
+        over = [tx for _v, _k, tx in pending if tx >= reserve]
         if over:
             raise SystemExit(
                 f"refusing to backfill: {len(over)} record(s) have a transaction id at "
-                f"or above the reserve of {RESERVED_POSITIONS} (highest {max(over)}). "
-                "Raise AIL_RESERVED_POSITIONS above the ledger's highest transaction "
-                "id, on every service, and re-run."
+                f"or above the reserve of {reserve} (highest {max(over)}). The reserve "
+                "is bound into this ledger and cannot be raised: positions the "
+                "compare-and-set has already allocated would fall inside the new "
+                "reserve, where they are neither reconciled nor order-checked. This "
+                "history needs a re-index into a new view scored from the same "
+                "counter, not a moved boundary. See docs/adr/"
+                "0014-ordered-audit-view-index.md."
             )
 
         # The score IS the transaction id. See the module docstring for why
@@ -261,7 +379,7 @@ def backfill(dry_run: bool = False) -> dict:
         # it goes on to hand out would collide with the range being written
         # here. Raising it first means a writer racing this backfill cannot
         # take a position inside the reserve.
-        summary["seed"] = seed_counter_above_reserve(client, headers)
+        summary["seed"] = seed_counter_above_reserve(client, headers, reserve)
 
         for (view, key, _tx), score in zip(pending, scores):
             _prefix, view_set = VIEWS[view]

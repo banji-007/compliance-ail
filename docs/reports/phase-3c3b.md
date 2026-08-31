@@ -482,3 +482,43 @@ The entry is deleted. If the statistics shift back, the row reappears as a **new
 | `docs/adr/0014-ordered-audit-view-index.md` | New. D32, D33, D34. |
 | `TODO.md` | The Blocking entry closes. |
 | `readME.md` | Two Residual Limits, the `/audit` route description, the ledger-write description. |
+
+---
+
+## Erratum, 2026-08-31 (added by Phase 3c-3c, `p3c3c-fix`)
+
+Three claims in this report were refuted by `p3c3b-red`
+(`docs/reports/phase-3c3b-redteam.md`) and are corrected here rather than
+edited away. The fixes are in Phase 3c-3c; what follows is the correction to
+what this report says.
+
+**1. Section 10's mapping row on the ordering fault claims too much.** The row
+reads "An ordering fault answers with a named error, the disagreeing pair, and
+that no page was served **and the condition is not transient**". The last
+clause was false. The check's window is the top of the view index at the
+requested limit, so newer commits push a disagreement below the window and
+every limit answers 200 again with the corruption still indexed (red-team C5
+and C10, reproduced in `docs/reports/phase-3c3c.md` section 4.4). The fault is
+transient; the corruption is not. P3c3c-7 removed `transient: false` from the
+response body and replaced it with the scope the check actually has, and D37
+moved the authoritative, windowless check into the reconciliation. The row's
+claim now ends at "no page was served".
+
+**2. Section 2's verification claim is narrower than stated.** This report
+says the write-time guarantee "moved from inside the write call to just after
+it, and did not weaken". It did not weaken as a *check*, and that is what was
+measured. What was not stated is the consequence for the *response*: the
+`ExecAll` commits before the `verifiedGet` runs, so a proof failure can no
+longer prevent the write, and the response reported `tx_id: null` for a write
+that had committed, advanced the counter and been indexed. D35 corrects the
+response, not the check.
+
+**3. The claim that no path commits a record without its position was not
+true when written.** `POST /write` accepted a decision record, and one could
+reach it (red-team C8). It was prevented by convention plus a static parse of
+two files, and this report treated the parse as the control. It was not: the
+parse was defeated by holding the route in a variable. P3c3c-2 moved the
+control into the route itself and kept the parse as a second line.
+
+Nothing above is edited in the body of this report. Sections 4, 5b, 6, 7 and
+the CI record stand as written.
