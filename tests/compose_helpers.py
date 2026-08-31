@@ -19,6 +19,7 @@ service rather than as a mismatched project.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -32,9 +33,26 @@ COMPOSE_FILE = "docker-compose.test.yml"
 
 
 def default_compose_project_name() -> str:
-    """Compose's own default when COMPOSE_PROJECT_NAME is not set: the
-    basename of the project directory, lowercased with separators removed."""
-    return "".join(c for c in REPO_ROOT.name.lower() if c.isalnum())
+    """Compose's own default when COMPOSE_PROJECT_NAME is not set.
+
+    The lowercased basename of the project directory, with anything outside
+    `[a-z0-9_-]` stripped and leading separators removed. **A hyphen
+    survives.** Getting that wrong is not a cosmetic difference: this
+    repository's own directory is `compliance-ail`, so dropping the hyphen
+    produces `complianceail`, and every `docker compose` call against it
+    creates a second, empty project rather than addressing the running one.
+    It cost a CI run - `docker compose up --force-recreate verifier` created
+    a new network and then failed on `Bind for 127.0.0.1:8003 failed: port is
+    already allocated`, because the real verifier was up under the real
+    project name. Invisible locally, where COMPOSE_PROJECT_NAME is set
+    explicitly and this fallback never runs.
+
+    tests/test_content_states.py holds the other copy of this rule, and
+    test_the_two_copies_of_the_compose_project_rule_agree below is what stops
+    them drifting.
+    """
+    name = re.sub(r"[^a-z0-9_-]", "", REPO_ROOT.name.lower())
+    return name.lstrip("_-") or "default"
 
 
 def compose_project_name() -> str:
@@ -104,3 +122,4 @@ def wait_for_health(url: str, timeout_seconds: float = 120.0) -> bool:
             pass
         time.sleep(2)
     return False
+
