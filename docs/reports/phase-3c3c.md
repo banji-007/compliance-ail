@@ -325,7 +325,19 @@ The remaining disagreement is exactly one per orphaned intent, in the direction 
 - `docs/adr/0014-ordered-audit-view-index.md`: D35, D36 and D37 added; D33's response body corrected; Consequences extended.
 - `readME.md` section 5, Residual Limits: four new entries (the committed-unverified write and the one unproven write, the bundle not naming faults, the page check's scope against reconciliation's, and the bound reserve). The D32 entry's tail is superseded rather than left alive.
 - `docs/reports/phase-3c3c-probe.md`: the ImmuDB wire facts, re-derived live.
-- `docs/reports/phase-3c3b.md`: dated erratum, because that report's mapping table claims the ordering fault says "the condition is not transient", which P3c3c-7 removed as false.
+- `docs/reports/phase-3c3b.md`: dated erratum, because that report's mapping table claims the ordering fault says "the condition is not transient", which P3c3c-7 removed as false. The erratum also corrects two other claims that report makes and the red team refuted: that the write-time guarantee "did not weaken" (it did not, as a check; the response it produced was wrong), and that no path commits a record without its position (one did).
+
+### P3c3c-8: comments
+
+**Three defects**, all describing a ranking design that was not shipped, all corrected:
+
+| Site | Said | Ships |
+| :--- | :--- | :--- |
+| `control_plane/main.py:896` | "History is therefore scored in (0, 1), never at or below zero" | history is scored at each record's own transaction id, integers at or above 1 |
+| `control_plane/main.py:1233` | "backfilled positions are fractional, so int() would collapse every one of them to 0" | they are not fractional; the reason for `float` is that a position is a float on the wire and `int()` would truncate rather than compare |
+| `tests/test_audit_ordering.py:475` | "Backfilled history is scored in (0, 1) by an offline pass" | same defect, found by sweeping for the phrase rather than by reading the two sites the instruction named |
+
+**Three convention fixes, deliberately not counted as defects.** `docs/adr/0014-ordered-audit-view-index.md:107`, `tools/ail_backfill_index.py:33` and `verifier/main.py:518` each describe the shipped behaviour correctly and then narrate the abandoned implementation ("Ranking was the first implementation: history sorted by tx, then mapped onto evenly spaced values in (0, 1)"). The convention here is that comments explain why and carry no change-history narration, so restating an abandoned implementation is narration. Each was reworded to keep the reasoning and drop the history. Nothing was claimed about them in the verdict table's defect count.
 
 ---
 
@@ -385,6 +397,7 @@ All false at the end. Each was confirmed individually and derived from its own e
 | A reserve that is not a positive integer is refused in every module that reads one | `tests/test_reserve_binding.py::test_a_reserve_that_is_not_a_positive_integer_is_refused_everywhere` | test |
 | Every module puts the reserve it uses through its own validator | `tests/test_reserve_binding.py::test_each_module_validates_the_reserve_it_actually_uses` | test |
 | The ordering fault names its scope, says a later success is not repair, and claims no persistence | `tests/test_audit_ordering.py::test_the_ordering_fault_has_a_structured_face` | test |
+| The two copies of Compose's default project-name rule resolve to the same string | `tests/test_compose_helpers.py::test_the_two_copies_of_the_compose_project_rule_agree` | test |
 | The ordering fault is handled ahead of every handler broad enough to swallow it | `tests/test_audit_ordering.py::test_the_ordering_fault_is_answered_and_never_escapes` | test |
 | A zscan under desc omits negatively-scored members, and a zero score arrives with no score field | `python tools/immudb_ordering_probe.py`, transcribed in `docs/reports/phase-3c3c-probe.md` | **command, marked: no test covers this** |
 | A prior version of a key is readable five ways, one of them with an inclusion proof | `python tools/immudb_ordering_probe.py`, transcribed in `docs/reports/phase-3c3c-probe.md` | **command, marked: no test covers this** |
@@ -421,7 +434,7 @@ All false at the end. Each was confirmed individually and derived from its own e
 | `anchor_service/main.py` | D37's three clauses, malformed-row tolerance, the reserve check, reconcile-only mode, the per-pass report file |
 | `tools/ail_backfill_index.py` | P3c3c-5's paged snapshot and its refusal on a failed read; D36's bound-reserve read and the reworded refusals |
 | `tools/immudb_ordering_probe.py` | new: P3c3c-9's probe |
-| `tests/compose_helpers.py` | new: the Compose plumbing three test modules share |
+| `tests/compose_helpers.py`, `tests/test_compose_helpers.py` | new: the Compose plumbing three test modules share, and the check that its rule agrees with the other copy |
 | `tests/test_ledger_faults.py`, `tests/test_reconciliation.py`, `tests/test_reserve_binding.py`, `tests/test_backfill_index.py` | new |
 | `tests/test_audit_ordering.py`, `tests/test_anchored_export.py`, `tests/test_evidence_bundle.py` | adapted, see section 6.2 |
 | `Makefile` | the verifier's writer key in `keygen` |
@@ -441,7 +454,20 @@ Two coupling instances this pass, both resolved by rewording the new text rather
 
 ### CI
 
-*(run id recorded below)*
+**Run `33408816212`, green: 395 passed, 9 skipped, 89.60s.** Commit `39a0755` on `p3c3b-order`, PR #14.
+
+**The run before it, `33407673213`, failed, and the cause is worth recording rather than only fixing.** `tests/compose_helpers.py` was written this phase by copying the Compose project-name rule out of `tests/test_content_states.py`, and the copy dropped a character class: `"".join(c for c in name if c.isalnum())` where the original has `re.sub(r"[^a-z0-9_-]", "", name)`. This repository's directory is `compliance-ail`, so the copy resolved to `complianceail`, and every `docker compose` call against it addressed a project that does not exist:
+
+```
+ verifier  Built
+ Network complianceail_default  Creating
+ Network complianceail_default  Created
+ ... Bind for 127.0.0.1:8003 failed: port is already allocated
+```
+
+It created a second empty project, failed on a port the real stack already held, left the real verifier untouched, and took `tests/test_ledger_faults.py` down with `service "verifier" is not running`.
+
+Two things about it. **It was invisible locally**, because every local invocation set `COMPOSE_PROJECT_NAME` explicitly, so the fallback never ran - which is exactly the local-environment trap this project already records for `docker compose` in a worktree, wearing the other coat. The fix was verified by bringing the stack up under the directory-default project name and running the docker-driving tests with no override (30 passed) before pushing again. And **the typo is not the defect**: two copies of a rule that must agree, with nothing comparing them, is. `tests/test_compose_helpers.py::test_the_two_copies_of_the_compose_project_rule_agree` is the check.
 
 ### Local
 
