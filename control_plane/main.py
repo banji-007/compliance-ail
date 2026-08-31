@@ -859,6 +859,13 @@ _MAX_SCAN_LIMIT = 2500
 _VIEW_DECISION = b"ail_view:decision:v1"
 _VIEW_INTENT   = b"ail_view:intent:v1"
 
+# D35 (Phase 3c-3c). Named rather than spelled inline at the two places that
+# use it, so tests/test_ledger_vocabulary.py can compare this copy against
+# verifier/main.py's - these two modules never import each other and both
+# have to mean the same key.
+_FAULT_KEY_PREFIX  = "ledger_fault:"
+_FAULT_RECORD_TYPE = "ledger_fault"
+
 
 class OrderingFault(Exception):
     """D33 (Phase 3c-3b): the index and the ledger disagree about order.
@@ -1196,7 +1203,8 @@ def _tombstones_and_faults(
                 # sorted() only so the request is reproducible between
                 # identical calls; getall imposes no ordering requirement.
                 for call_id in ordered
-                for key in (f"content_erasure:{call_id}", f"ledger_fault:{call_id}")
+                for key in (f"content_erasure:{call_id}",
+                            f"{_FAULT_KEY_PREFIX}{call_id}")
             ]
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -1214,7 +1222,7 @@ def _tombstones_and_faults(
                 continue
             if record_type == "content_erasure":
                 tombstoned.add(call_id)
-            elif record_type == "ledger_fault":
+            elif record_type == _FAULT_RECORD_TYPE:
                 # `revision` on the head entry is the number of times this
                 # key has been written, and getall already returns it - so
                 # the count of faults for a call_id is free here, and no
@@ -1585,8 +1593,10 @@ def get_audit(
         #
         # A chosen response, not an escaping exception: a structured body
         # naming the error, the view, the two positions that disagreed and
-        # the transactions they resolve to, and saying plainly that no page
-        # was served and that the condition is not transient.
+        # the transactions they resolve to, saying plainly that no page was
+        # served, and stating the scope of the check that raised. P3c3c-7:
+        # it does not claim the condition persists, because this check
+        # cannot observe that - see _ordering_fault_body.
         logger.error(
             "Audit ordering fault in view %s: position %s -> tx %s, position %s -> tx %s",
             exc.view, exc.higher[0], exc.higher[1], exc.lower[0], exc.lower[1],

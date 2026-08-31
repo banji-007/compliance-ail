@@ -12,9 +12,24 @@ Nothing is blocking. The current build is stable and production-hardened; everyt
 
 What that phase added to the deferred list rather than closing is recorded in README's Residual Limits: the CAS globally serialises the ledger write path, so concurrency stops buying throughput, and the retry budget is an availability parameter that can deny traffic if it is set too low.
 
+**Closed in Phase 3c-3c (`docs/reports/phase-3c3c.md`, ADR-0014 D35/D36/D37).** The red-team pass against 3c-3b refuted eight of ten claims; that set is closed. What it added to the deferred list rather than closing is the entry immediately below, plus three Residual Limits entries in the README.
+
 ---
 
 ## Deferred (v1.1.0)
+
+### `fault_class: verifier_unreachable` covers two materially different outcomes
+
+Raised in review of Phase 3c-3c and deliberately **not** taken as a decision in that phase. Since D35 this one closed-set class covers both:
+
+- the verifier could not be reached, or the write did not commit, so **no ledger entry exists** (the original meaning, and the structural limit ADR-0005's Documented Boundary describes: nothing can write a durable record of "the durable-record writer is down");
+- the write **committed** and its proof did not check out, so the record is in the ledger at a real transaction and position, indexed, with the counter advanced, and a `ledger_fault:` record qualifies it.
+
+Both return `outcome_type: fault, fault_class: verifier_unreachable` and the call denies either way. **This is the same collapse D1 exists to prevent, one level down**: D1's point was that a fault is distinguishable from a denial, and here two faults with opposite consequences for the audit record are not distinguishable from each other by the field a consumer switches on.
+
+Why it is deferred rather than fixed in 3c-3c. The distinction is cheap to *compute* - the write response already carries `committed`, and `ledger/immudb_ledger.py` would need to raise a typed exception rather than a bare `RuntimeError` for `decision_service/main.py` to map it - but the change is not a rename. It alters ADR-0005's closed set, which is D1's own artifact; it changes the Prometheus label collection that `tests/test_outcome_types.py::test_metric_label_set_matches_closed_collection` asserts, so any alert or dashboard keyed on the class changes meaning; and the right shape is genuinely open, because a call whose record committed unproven may not belong under the same `outcome_type` at all rather than merely under a second `fault_class`. That is an ADR-0005 conversation, and running it inside a remediation phase already closing eight refutations would make the least-examined part of that phase the taxonomy.
+
+What exists in the meantime: the distinction is available to a caller in the write response's `committed` field and on the `/audit` row's `ledger_fault`, and it is stated in ADR-0005's Documented Boundary amendment and README's Residual Limits. What is collapsed is the class name.
 
 ### ImmuDB TLS
 ImmuDB's REST API communicates over plain HTTP on the internal Docker network (`http://immudb:8080`). Internal Docker traffic is isolated from the host, but TLS should be enforced for defence-in-depth and to satisfy stricter SOC2 transport encryption requirements.
