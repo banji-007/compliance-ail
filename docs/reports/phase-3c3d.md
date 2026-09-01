@@ -767,7 +767,9 @@ Every mutation in section 7 was applied one at a time, with the owning service r
 
 ### CI
 
-**Run `33475430028` failed: 2 failed, 440 passed, 9 skipped, 134.40s**, on `ff6e8fa`. Both failures were **this phase's own tests, and both were over-assertions rather than defects in the code they cover.** Neither was closed by weakening an assertion; each was replaced by one that states exactly what the item delivers, and both replacements were then re-run against a ledger in the same state that broke them.
+**Run `33477596287`, green: 442 passed, 9 skipped, 138.16s.** Commit `9f44360` on `p3c3b-order`, PR #14, which is the whole of this phase including this report.
+
+**The run before it, `33475430028`, failed, and it is recorded rather than only fixed.** 2 failed, 440 passed, 9 skipped, 134.40s, on `ff6e8fa`. Both failures were **this phase's own tests, and both were over-assertions rather than defects in the code they cover.** Neither was closed by weakening an assertion; each was replaced by one that states exactly what the item delivers, and both replacements were then re-run against a ledger in the same state that broke them.
 
 **Failure 1: `test_an_injected_row_is_refused_and_entries_does_not_exceed_total` asserted a property this phase did not deliver.**
 
@@ -815,11 +817,9 @@ Removed:
 - Every probe script, written to the session scratchpad rather than into the
   tree, so none of them could be committed by accident.
 
-**Not removed yet.** The scratch clone at
-`C:\Users\banji\OneDrive\Documents\p3c3d-fix` still exists, because it holds this
-phase's commits. The first five are pushed and `33475430028` ran against
-them; the two test corrections in section 12 are a sixth. It goes once that
-one is pushed and green.
+**Removed last, after the report was final.** The scratch clone held this
+phase's commits, so it could only go once they were on the remote and green:
+`33477596287` on `9f44360`. Nothing of this run survives on this machine.
 
 Images from earlier sessions (`p3c3d-keyprobe-*`, `p3c3brepro-*`,
 `p3bverify-*`) were present at the start and are untouched: they belong to
