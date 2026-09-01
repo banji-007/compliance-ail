@@ -1,4 +1,4 @@
-# Order-dependence sweep: how much of green is collection order
+# Order dependence and isolation: how much of green is collection order
 
 **Run id:** `p3c3d-sweep`. **Head:** `c7b29d0` on `p3c3b-order`, the same commit
 the red-team pass `p3c3d-red` reported against. **Compose project:**
@@ -112,6 +112,54 @@ records two of my tests failing in CI for shared-ledger reasons; this is a
 third instance of the same misjudgement in the same phase, found only because
 the order was permuted.
 
+## Isolation: the other failure class, measured
+
+The permutation sweep cannot see a test that passes in every order because
+some earlier module seeded state it silently depends on. Such a test passes
+every permutation and fails run alone. The two want different fixes:
+interference wants the assertion scoped or the polluter cleaned up, hidden
+dependence wants the test to build its own preconditions.
+
+Eleven modules run alone, each against a ledger destroyed and rebuilt first:
+the nine this phase changed, plus `test_audit_ordering.py`,
+`test_audit_read_correctness.py` and `test_backfill_index.py`, which are the
+victims and polluters the permutation sweep named.
+
+**The comparison is exact rather than filtered.** All fourteen failures in the
+alphabetical baseline are in `test_external_anchor`, `test_offline_verify` and
+`test_writer_signing`, none of which is in this scope, so the baseline
+restricted to these eleven modules is empty. Any failure here is hidden
+dependence by construction, with no host noise to subtract.
+
+```
+test_committed_is_a_fact          4 passed   60.47s
+test_fault_key_and_page_read     12 passed   68.34s
+test_image_contents               5 passed   94.73s
+test_ledger_faults               20 passed   78.72s
+test_ledger_vocabulary            7 passed   11.60s
+test_ordered_route_refusals       6 passed   45.28s
+test_reconciliation               7 passed   40.32s
+test_reserve_binding             20 passed   59.35s
+test_audit_ordering              24 passed   61.74s
+test_audit_read_correctness      10 passed   26.74s
+test_backfill_index               3 passed   19.96s
+```
+
+**118 tests, zero failures. No hidden dependence in scope.**
+
+That is the result that bounds the remediation. This suite's failure mode is
+**interference only**: every one of the four order-dependent tests has an
+identified polluter, and no test in the phase's blast radius needs state some
+other module happened to leave. The fix is one decision about assertion scope,
+not a suite-wide rewrite of preconditions.
+
+Two residuals, stated rather than implied. The thirty-five modules outside
+this scope were not isolated; nothing in the data points at them, but nothing
+excludes them either. And isolation here is per **module**, not per test, so a
+dependence that one test in a module satisfies for a later test in the same
+module is invisible to it. Per-test isolation is 442 runs and is not
+indicated by anything measured here.
+
 ## Reproducing
 
 `sweep.sh` at this commit's scratch clone, removed with it. It is forty lines:
@@ -119,9 +167,5 @@ for each order, `down -v`, `up -d --wait`, sleep 15, `pytest <files> -q
 --tb=no -rf`, then `comm` the failing sets. The five orders are alphabetical,
 reverse, and `random.Random(seed).shuffle(sorted(modules))` for seeds 1, 2, 3.
 
-**What this does not measure.** A test that passes in every order because some
-earlier module seeded state it silently depends on would pass here and fail
-run alone. The clean measure is per-module isolation from a virgin ledger,
-46 runs, not done. The two classes want different fixes: interference wants
-the polluter to clean up or the victim to scope its assertion; hidden
-dependence wants the test to build its own preconditions.
+`isolation.sh` beside it, same shape: for each module, `down -v`, `up -d
+--wait`, `pytest <module>`, then `comm` against the alphabetical baseline.
