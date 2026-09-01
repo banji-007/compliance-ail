@@ -36,7 +36,15 @@ Routes are the first instance, not the rule. The rule is that any property the s
 
 The project built this control once and scoped it to constants (`test_ledger_vocabulary.py`). This generalises it to guarantees.
 
-Properties in scope as of now, each against every write route: the refusals, `KeyMustNotExist`, `committed` as a fact about the ledger, and the no-proof path guard. The route list is enumerated from the verifier's registered POST routes, not hand-listed.
+**The route list is derived, and the discriminator is named.** `app.routes` carries POST `/write`, `/write-ordered` and `/verify`, and the last is a read. The write routes are those whose dependency is `_require_write_key`; `/verify` takes `_require_read_key`. Hand-listing which are writes would sweep `/verify` in or out by judgement, which is this decision failing on its own terms at the first step.
+
+**Three states per cell, not two: holds, does not apply, or missing.** A property that does not apply to a route is recorded as such **with its reason, in the test**, so a new route forces a decision rather than defaulting silently to either state.
+
+That distinction is load-bearing rather than tidy. `KeyMustNotExist` does not belong on `POST /write`: D39's reason for it is that a second write gives the key a second entry in the view index at a second position, and the plain route allocates no position. Applying it there would refuse a second erasure attempt after a partial failure, on the GDPR path, which is the harm P3c3e-3 exists to close. An earlier draft of this decision said "each against every write route" without checking that each property's justification survives on both routes, which is the shape of the rule substituted for the rule.
+
+**Properties in scope as of now**, per route: the refusals, `KeyMustNotExist`, and `committed` as a fact about the ledger.
+
+**The no-proof path guard is not one of them.** `_set_without_verification` is module-level and no route reaches it, so "route by no-proof guard" has no meaning as a cell. The assertable property is that **no route reaches the unverified path**, which is one assertion rather than a matrix column. P3c3e-9 carries what does and does not enforce the rest of it.
 
 ### D44. A test's assertions are scoped to the records that test wrote
 
@@ -50,11 +58,11 @@ Four tests, two polluters, measured in `docs/reports/phase-3c3d-order-sweep.md`.
 
 ### P3c3e-1. The route parity test
 
-**Lands first, separately, before A4 is touched.**
+Implement D43. Enumerate the verifier's registered POST routes from the application object, select the write routes by their `_require_write_key` dependency, and assert each property against each route in the three states D43 names.
 
-Implement D43. Enumerate the verifier's registered POST write routes from the application object. Assert each property against each route.
+**Authoring order, not commit order.** The test is written before A4 is touched and its failing output is recorded in the report; it then lands in the same commit as the fix it produces. Nothing is gained by pushing a knowingly-red commit to a branch the red team also works on. P3c3d-1 landed separately for a different reason: it was an independent fix closing live paths, not a test and the fix it forces.
 
-**Demonstrate:** the test failing on unmodified head, naming `/write-ordered` for the `committed` property. Record that output in the report; it is the evidence that the enumeration works.
+**Demonstrate:** the test failing on unmodified head, naming `/write-ordered` for the `committed` property. Record that output in the report; it is the evidence that the enumeration produces the fix rather than ratifying it.
 
 **Enforce:** the parity test itself.
 
@@ -130,17 +138,25 @@ Derive the key's transaction from the committed record, or cross-check the two a
 
 P3c3d-4 exists so pre-D38 `ledger_fault:{call_id}` records still render, and it is the source of A7's `count: 2` for one fault, because its key derives from a caller-authored `call_id`.
 
-**Check the condition first:** whether any ledger outside CI holds pre-D38 fault records, given every CI ledger dies on `down -v`. If none does, the path protects nothing and costs a caller-influenced code path.
+**The condition is answered and does not need re-deciding: there is no deployment outside CI.** Every ledger that has ever held a fault record is a CI or scratch stack destroyed by `down -v`. The path protects nothing and costs a caller-influenced code path.
 
-If the condition holds, delete it, state the migration, and remove its tests. If it does not hold, say so and fix A7 in place instead.
+What the session verifies is the half it can: that no volume in either compose file survives `down -v`, so no ledger persists between runs. It does not verify deployments, and it should not try; that fact is recorded here rather than derived.
 
-**Demonstrate:** the check, then whichever branch follows.
+Delete the path, state the migration, and remove its tests.
+
+**Demonstrate:** the volume check, then the deletion, with A7's `count: 2` case no longer constructible.
+
+**Mutation:** restore the legacy read. A7's case must become constructible again.
 
 ### P3c3e-9. Retire the source parse
 
 Defeated three times: a plainly-named second caller, an alias binding, and `globals()[...]` / `getattr(sys.modules[__name__], ...)`.
 
-A source parse is not a control against anything that can write Python, and keeping it invites the belief that it is a second line. The runtime guard held; that is the control. Remove the parse and its tests, and state in the report and in Residual Limits that the runtime guard is the only control on that path.
+A source parse is not a control against anything that can write Python, and keeping it invites the belief that it is a second line. The runtime guard held; that is the control. Remove the parse and its tests.
+
+**State what replaces the half the parse was carrying, or state that nothing does.** The guard covers what gets *written*: it reads the bytes it is about to commit and refuses anything that is not a fault record. It does not bound *how many callers exist*, which is what the parse counted. The two are not the same property and the deletion must not quietly merge them.
+
+The expected answer is that nothing replaces it. The AST reference walk written in 3c-3d is itself a source parse, and `globals()[...]` carries the name only as a string literal, so no reference walk sees it; catching that means flagging dynamic lookup, which is defeatable in turn. If that is the answer, it is a Residual Limits entry rather than something lost in the deletion.
 
 ### P3c3e-10. Scope the four order-dependent tests
 
@@ -158,14 +174,15 @@ Implement D44. The four tests, two polluters and one shared victim are named in 
 
 - 35 modules were not isolated. Nothing in the sweep data points at them; nothing excludes them.
 - Isolation was per module, not per test. A dependence one test satisfies for a later test in the same module is invisible to it. Per-test isolation is 442 runs and nothing measured indicates it.
+- The unverified-write path's caller count is no longer enforced once the source parse is retired. The runtime guard bounds what that path writes; nothing bounds how many callers reach it. See P3c3e-9.
 - `/write-ordered` accepts a key of any shape into a view. Closing it would refuse the deliberately-mismatched writes `tests/test_reconciliation.py` uses to prove D37 finds a record in the wrong view. Carried, not taken.
 
 ## Pre-registered negatives
 
 All false at the end, each confirmed individually and derived per row.
 
-- Any property enumerated by the parity test that holds on one write route and not another.
-- Any enumeration hand-listed where it could have been derived from the code.
+- Any property that holds on one write route and is, on another, neither held nor recorded as inapplicable with its reason.
+- Any enumeration hand-listed where it could have been derived from the code. **This one is a stated judgement, not a confirmed negative**: it cannot be checked mechanically. The report names which enumerations were derived, which were hand-listed, and why each hand-listed one could not be derived.
 - Any bounded read that does not assert its bound.
 - Any response reporting `committed: false` for a write that committed, on either route.
 - Any legitimate retry permanently denied.
