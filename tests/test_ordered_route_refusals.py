@@ -183,11 +183,22 @@ def test_an_injected_row_is_refused_and_entries_does_not_exceed_total():
     fix: `entries` 4, `total` 3, and a row with `outcome_type: null` whose key
     was `ledger_fault:...`.
 
-    `total` counts `tool_call:` keys ledger-wide, so it is a bound the page
-    must not exceed by injection. It can legitimately be exceeded by a
-    synthesized orphaned-intent row (D16), which carries `outcome_type:
-    "policy_allow"` and never null - so the assertion here is on rows with no
-    outcome type at all, and on a fault key reaching the page as a row.
+    **What this asserts, and what it deliberately does not.** D39 refuses a
+    `ledger_fault` on both routes, so the measured injection is refused and no
+    fault key is a page row. It does **not** make "no page row has a null
+    outcome type" true, and this test must not claim otherwise. The ordered
+    route still accepts a key of any shape into a view, which is the open item
+    in `TODO.md` and README section 5 - and `tests/test_evidence_bundle.py`
+    exercises exactly that on purpose, writing `p3b_material_test:` records
+    with no `record_type` and no `call_id` through this route to produce real
+    proof material. On a shared ledger those are page rows with
+    `outcome_type: null`.
+
+    A first draft of this test asserted their absence and failed in CI against
+    them (run `33475430028`, 2 failed of 442). The assertion was wrong, not the
+    ledger: it claimed a property this phase did not deliver. It is narrowed to
+    what D39 does deliver, and the narrowing is stated here rather than left
+    for a reader to infer from a weaker assertion.
     """
     call_id = uuid.uuid4().hex
     seeded = _write_ordered(_tool_key("p3c3d-inject"),
@@ -203,16 +214,27 @@ def test_an_injected_row_is_refused_and_entries_does_not_exceed_total():
     page = _audit(2500)
     assert page.status_code == 200, page.text[:300]
     entries = page.json()["entries"]
-    nulls = [e for e in entries if e["outcome_type"] is None]
-    assert not nulls, (
-        "rows with no outcome type reached the audit page; every row must be a "
-        f"decision or a synthesized intent: {[e['ledger_key'] for e in nulls][:5]}"
-    )
+
+    # No fault key is a page row. This is the direct consequence of the
+    # refusal, ledger-wide rather than for this call_id alone, because the
+    # refusal is ledger-wide.
     fault_rows = [e for e in entries
                   if base64.b64decode(e["ledger_key"]).startswith(b"ledger_fault:")]
     assert not fault_rows, (
         f"a ledger_fault key is a page row: {fault_rows[:3]}"
     )
+
+    # And this call_id contributed exactly the one record it wrote. That is
+    # the "entries no longer exceeds total" claim, stated for the injection
+    # that was measured rather than as a property of the whole page: before
+    # the refusal, this call_id put two rows on the page for one decision
+    # record, and the second carried no outcome type.
+    mine = [e for e in entries if e["call_id"] == call_id]
+    assert len(mine) == 1, (
+        f"one decision record produced {len(mine)} page rows for its call_id: "
+        f"{[base64.b64decode(e['ledger_key']).decode('utf-8', 'replace') for e in mine]}"
+    )
+    assert mine[0]["outcome_type"] == "policy_allow", mine[0]
 
 
 # ---------------------------------------------------------------------------

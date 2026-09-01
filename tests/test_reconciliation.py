@@ -123,6 +123,35 @@ def _zadd(view_set: str, score: float, key: str) -> None:
     resp.raise_for_status()
 
 
+def _positions_for_key(key: str) -> list[float]:
+    """Every position the decision view holds for one key, paged past the
+    2500-row ceiling.
+
+    Paged for the reason tests/test_backfill_index.py pages: another module in
+    this suite deliberately takes the decision view past 2600 rows, so a
+    single zscan answers a plausible 2500 and says nothing about the rest.
+    """
+    headers = _immudb_headers()
+    found: list[float] = []
+    min_score = None
+    while True:
+        body = {"set": _b64(VIEW_DECISION), "desc": False, "limit": 2500}
+        if min_score is not None:
+            body["minScore"] = {"score": min_score}
+        resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/zscan", json=body, headers=headers)
+        resp.raise_for_status()
+        rows = resp.json().get("entries", [])
+        if not rows:
+            return sorted(found)
+        for row in rows:
+            if base64.b64decode(row["entry"]["key"]).decode("utf-8", "replace") == key:
+                found.append(float(row.get("score", 0.0)))
+        next_score = float(rows[-1].get("score", 0.0))
+        if len(rows) < 2500 or next_score == min_score:
+            return sorted(found)
+        min_score = next_score
+
+
 def _counter() -> int:
     resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/getall",
                         json={"keys": [_b64(SEQUENCE_KEY)]}, headers=_immudb_headers())
@@ -442,14 +471,27 @@ def test_a_second_position_below_the_reserve_for_an_indexed_record_is_a_finding(
         f"the finding does not name both positions: {offenders[0]}"
     )
 
-    # And the thing the finding is about: the page shows the row twice.
-    page = _CLIENT.get(f"{CONTROL_PLANE_URL}/audit", params={"limit": 2500},
-                       headers={"X-API-Key": READ_API_KEY})
-    assert page.status_code == 200, page.text[:300]
-    seen = [e["call_id"] for e in page.json()["entries"]]
-    assert seen.count(call_id) == 2, (
-        "this test is not exercising the condition it describes: the record "
-        f"appears {seen.count(call_id)} time(s) on the page"
+    # And the condition the finding is about, read from the index itself
+    # rather than from a page.
+    #
+    # **Why not from the page.** The reproduction measured it there - HTTP 200,
+    # rows 4, total 3, one call_id twice on a virgin ledger - and that is what
+    # makes this a duplication defect rather than an accounting one. But the
+    # page is bounded by `limit`, and `tests/test_backfill_index.py` takes the
+    # decision view past 2600 rows on purpose, so in a full-suite run the
+    # second position sits below the page's own bound and the row appears
+    # once. A first draft asserted `== 2` here and failed in CI for exactly
+    # that reason (run `33475430028`), which is `has_more` working, not a row
+    # being dropped: measured directly, a duplicated key still renders twice
+    # on any page that reaches it, at 2, 122 and 402 members.
+    #
+    # So the guard reads the index, which is where the condition lives and
+    # what the reconciler walks. It is a stronger statement than the page one,
+    # not a weaker one: it holds at every ledger size.
+    indexed = _positions_for_key(key)
+    assert indexed == sorted([42.0, float(written["seq"])]), (
+        "this test is not exercising the condition it describes: the decision "
+        f"view holds {indexed} for this key, not two positions"
     )
 
     # The running service says the same thing.
