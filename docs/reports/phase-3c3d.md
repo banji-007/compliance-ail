@@ -666,7 +666,7 @@ All false at the end, each confirmed individually.
 | A window larger than one page terminates and returns no key twice | `tests/test_fault_key_and_page_read.py::test_a_window_needing_more_than_one_page_terminates_and_is_gap_free` | test |
 | A page with no rows issues no range read | `tests/test_fault_key_and_page_read.py::test_an_empty_page_issues_no_range_read` | test |
 | A key-range read refuses a result outside the range it asked for | `tests/test_fault_key_and_page_read.py::test_a_bounded_read_asserts_on_what_came_back` | test |
-| A page carrying a pre-D38 fault and a post-D38 fault renders both | `tests/test_fault_key_and_page_read.py::test_a_page_carrying_an_old_shape_and_a_new_shape_fault_renders_both` | test |
+| A page carrying a pre-D38 fault and a post-D38 fault renders both | superseded by P3c3e-8 (Phase 3c-3e); see the erratum below | **marked: the legacy read is deleted and no test asserts it** |
 | A fault carrying no writer signature is not rendered as a record's standing | `tests/test_fault_key_and_page_read.py::test_a_fault_with_no_writer_signature_is_not_rendered_as_a_standing` | test |
 | A fault edited after signing is not rendered as a record's standing | `tests/test_fault_key_and_page_read.py::test_a_fault_whose_signature_does_not_check_out_is_not_rendered` | test |
 | A fault for a record carrying no call identifier reaches that record's page row | `tests/test_fault_key_and_page_read.py::test_a_fault_for_a_record_with_no_call_id_is_joined_onto_its_page_row` | test |
@@ -677,7 +677,7 @@ All false at the end, each confirmed individually.
 | An erasure completes when its tombstone commits and the state call fails | `tests/test_committed_is_a_fact.py::test_an_erasure_completes_when_its_tombstone_commits_and_the_state_call_fails` | test |
 | An erasure is refused unless the tombstone this call wrote is confirmed at its own transaction | `tests/test_ledger_faults.py::test_an_erasure_is_refused_when_the_tombstone_is_not_in_the_ledger` | test |
 | The unverified write path refuses bytes that are not a fault record | `tests/test_ledger_faults.py::test_the_unverified_write_path_checks_the_bytes_it_writes` | test |
-| The unverified write path is named in exactly one place, aliases included | `tests/test_ledger_faults.py::test_the_unverified_write_path_has_exactly_one_caller_including_aliases` | test |
+| The unverified write path is named in exactly one place, aliases included | superseded by P3c3e-9 (Phase 3c-3e); see the erratum below | **marked: the parse is retired and nothing replaces it** |
 | A record classification that is not a string is refused rather than crashing the route | `tests/test_ledger_faults.py::test_a_non_string_record_type_is_refused_rather_than_crashing` | test |
 | Every uvicorn service states its keep-alive timeout | `tests/test_ledger_faults.py::test_every_uvicorn_service_states_its_keep_alive_timeout` | test |
 | A reserve at or above two to the fifty-third is refused in every module that reads one | `tests/test_reserve_binding.py::test_a_reserve_at_or_above_2_to_the_53_is_refused_everywhere` | test |
@@ -827,3 +827,63 @@ other runs.
 
 The primary working directory was never used for a stack and is untouched:
 `p3c3b-order` at `e3d8284`, `git status` clean.
+
+
+---
+
+## Erratum, 2026-09-02 (Phase 3c-3e)
+
+Two rows of section 10's table are superseded, and one pre-registered negative
+in section 8 no longer has the enforcement it names. Neither claim was
+over-stated when it was written; one of them was refuted, and the other was
+deleted deliberately.
+
+**Row 14, "A page carrying a pre-D38 fault and a post-D38 fault renders both",
+is superseded.** P3c3d-4 kept the legacy `ledger_fault:{call_id}` `getall`
+beside the range read so faults committed under the pre-D38 key shape would
+still render. That read is deleted in Phase 3c-3e, so the claim is no longer
+true and its test is gone with it. Two reasons, and the second is the one that
+forced it:
+
+- It protected nothing. Every ledger that has ever held a fault record in this
+  project is a CI stack or a scratch stack destroyed by
+  `docker compose down -v`, and no volume in either compose file survives that
+  - `tests/test_ledger_state_does_not_survive_teardown.py` asserts the volume
+  half of that, and the deployment half is recorded rather than derived.
+- It was red-team A7. The legacy key is built from `call_id`, a caller-authored
+  string, so a record whose `call_id` is spelled `{tx:020d}:{identity}:{nonce}`
+  made this request fetch a fault the range read also returns, and
+  `_merge_fault` counted it twice. One fault in the ledger, `count: 2` on a
+  page row belonging to a different record, from the write credential alone.
+
+The row is marked rather than repointed: the test that now stands in that
+place, `::test_a_crafted_call_id_no_longer_makes_one_fault_count_twice`,
+asserts the opposite behaviour and does not back the old claim.
+
+**Row 25, "The unverified write path is named in exactly one place, aliases
+included", is superseded.** The AST reference count was refuted in the same
+pass that this report's own section 7 describes replacing a line count with
+it: `globals()["_set_" + "without_verification"](...)` and
+`getattr(sys.modules[__name__], _UNVERIFIED)(...)` carry the name only as a
+string literal, and both were proved with a stub client to reach the function
+while the parse reported one caller. It is retired rather than repaired,
+because a source parse is not a control against anything that can write
+Python, and catching a dynamic lookup means flagging dynamic lookup, which is
+defeatable in turn.
+
+**Nothing replaces it, and the two properties are not merged.** The runtime
+guard - which row 24 backs, and which the red team did not defeat - reads the
+bytes it is about to commit and refuses anything that is not a fault record.
+`tests/test_route_parity.py` asserts over every write route that a failed
+proof makes exactly one unverified write whose bytes are a fault record about
+the record just committed. Neither of those bounds how many callers exist,
+which is what the parse counted. That is a Residual Limit in README section 5
+now, stated rather than absorbed.
+
+**Section 8's pre-registered negative "Any caller of the unverified-write path
+invisible to the check that counts them" is therefore answered differently
+than it reads.** It was answered "false, by AST reference count"; the honest
+answer as of Phase 3c-3e is that there is no such check, and the negative
+cannot be confirmed. It is not re-asserted anywhere.
+
+See `docs/reports/phase-3c3e.md`.

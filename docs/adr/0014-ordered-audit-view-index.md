@@ -537,6 +537,164 @@ both.
   finding rather than raised, which is that function's standing rule for
   every bad row: a pass that dies on one row reports nothing about the rest.
 
+## D43. A guarantee holds at every site, and the sites are enumerated from the code
+
+Added in Phase 3c-3e.
+
+**The defect this closes is not any one of the six the red team refuted; it
+is what all six had in common.** A rule that has to hold at N sites, with
+nothing enumerating the sites. Two write routes covered at one. Four bounded
+reads covered at two. N key encodings covered at one. N inspection surfaces
+covered at one. Earlier passes: five modules compared at four, four copies of
+a validator, two copies of a Compose rule.
+
+D40 is the worked example. It made `committed` a fact about the ledger and
+every one of the four tests enforcing it drove `POST /write`. `POST
+/write-ordered` - the route every decision and every intent record takes -
+still answered `committed: false` from a generic handler that asked the
+ledger nothing, and survived a full phase and a red-team brief that named the
+route by name. The fix was correct; what was missing was anything that fails
+when a site is missed.
+
+This project built the control once and scoped it to constants
+(`tests/test_ledger_vocabulary.py`, ADR-0013). D43 generalises it: **any
+property this system claims is asserted against a site list the test derives
+from the code, so a new site fails the suite until a decision is recorded
+about it.**
+
+**The site list is derived, and the discriminator is named.**
+`tests/test_route_parity.py` reads `app.routes`, which carries POST `/write`,
+`/write-ordered` and `/verify`, and selects the write routes by their
+dependency: a write route is one gated by `_require_write_key`, and `/verify`
+takes `_require_read_key`. Hand-listing which POST routes are writes would
+sweep `/verify` in or out by judgement, which is this decision failing on its
+own terms at the first step. `tests/test_bounded_reads.py` derives its sites
+the same way: every call to `/api/v2/db/scan` or `/db/zscan` whose request
+body carries a selective bound (`prefix`, `seekKey`, `endKey`, `minScore`,
+`maxScore`), attributed to its innermost enclosing function.
+
+**Three states per cell, not two: holds, does not apply, or missing.** A
+property that does not apply to a site is recorded as such *with its reason,
+in the test*, so a new site forces a decision rather than defaulting silently
+to either state. That distinction is load-bearing rather than tidy.
+`KeyMustNotExist` does not belong on `POST /write`: D39's reason for it is
+that a second write gives the key a second entry in the view index at a
+second position, and the plain route allocates no position. Applying it there
+would refuse a second erasure attempt after a partial failure, on the GDPR
+path, which is the harm D45 exists to close.
+
+**Where an enumeration cannot be derived, it is hand-listed and the test says
+so.** Two are: the encodings a private key can be written in, and the
+surfaces a Docker image can be read on. Both are facts about the world rather
+than about this repository, so nothing in the tree can produce them. What is
+checked instead is that the detector honours the list it is given - real key
+material is generated in-process in each enumerated encoding and each one has
+to be found - and that the module docstring still says the lists are hand
+listed.
+
+**What this does not reach.** An enumeration is only as good as its
+discriminator. `tests/test_bounded_reads.py` reads call sites, so a bounded
+read issued through a helper that takes its bound as an argument is invisible
+to it; one probe script has that shape and it is stated in the module. And no
+enumeration here can see a property nobody stated.
+
+## D44. A test's assertions are scoped to the records that test wrote
+
+Added in Phase 3c-3e.
+
+A test proving the reconciler finds a fractional position has to create one.
+A test proving the seam is monotone has to assert none exists. Both are
+correct; the defect is the second stating its precondition as a ledger-wide
+fact when it is not one.
+
+Measured before it was fixed (`docs/reports/phase-3c3d-order-sweep.md`): five
+full-suite runs in five collection orders found **four order-dependent tests
+out of 442**, all of them in one cluster - two polluters, three polluting
+actions, and every one about the view index and a global assertion over it.
+The suite's green was fragile rather than false: in all four non-alphabetical
+orders, the set of tests passing there and failing alphabetically was empty.
+The same sweep established what this decision does *not* need to cover:
+hidden dependence came back zero across 11 modules and 118 tests run alone, so
+tests already build their own preconditions. Scoping assertions is the whole
+of it.
+
+**Scoping alone would lose something, so it is not done alone.** Three of the
+four assertions were true statements about the whole view. They move to
+`tests/test_view_invariants.py`, addressed to every row the suite did not
+deliberately break, with the deliberate ones named and argued for in
+`tests/ledger_pollution.py`. The registry is checked in both directions: an
+entry naming a key fragment no test produces fails, and a violating row no
+entry explains fails. A hand-listed registry is acceptable here for the
+reason D43 gives about the encodings - what has to be enumerated is a set of
+intentions, and an intention is not in the code.
+
+Two assertions were not scoped but rewritten, because a stronger form exists
+that holds at every ledger size. `has_more` no longer asserts "false when the
+ledger is small"; it asserts that it agrees with whether truncation actually
+happened, in both directions. And the backfilled record's appearance on the
+page is asserted as "on the page, or the page is full of rows that sort above
+it", which is a complete statement rather than a conditional one.
+
+## D45. `committed: false` is a claim, and this service only makes it after reading the ledger
+
+Added in Phase 3c-3e, closing red-team A4 in both its forms.
+
+D40 made `committed` a fact about the ledger, and then collapsed two different
+facts onto one answer: `_committed_tx_for_value` returned `None` both when the
+ledger holds nothing under the key and when this process could not ask. So the
+one branch that exists to stop a guess made one whenever the confirming read
+was itself unavailable.
+
+**A4.1: the ordered route never got D40 at all.** Its generic handler answered
+`committed: false` with no ledger read. Driven with a relay that let the
+ExecAll commit and dropped its own response: the record at transaction 55, the
+counter advanced, the index entry at position 1000000017, the row on `/audit`
+reading `policy_allow`, and the response saying the write did not happen.
+`log_tool_call` raises on anything but `verified: true`, so the decision
+service denied a call whose allow decision is on the audit page. The retry is
+then 409 forever under D39.
+
+**A4.2: on the plain route, the confirming read can be cut too.** A relay that
+dropped the response and then refused every connection for 25 seconds left the
+record at transaction 118 with `committed: false`; on the erasure path the
+same cut reproduced Phase 3c-3c's `erasure_conflict` verbatim - DELETE 503,
+tombstone committed at 121, 772 bytes of payload still in `call_content`, and
+content writes for that call_id frozen at 409.
+
+Three changes, and they are one decision:
+
+- **The ordered route distinguishes "the ExecAll reached the wire" from "it
+  did not".** `OrderedCommitUncertain` carries the attempted position and the
+  real attempt count out of `_ordered_commit`; the route then asks the ledger
+  with the value as well as the key, exactly as `POST /write` does, and
+  confirms the position against the view index rather than reporting what it
+  intended to write. Everything raised before the ExecAll is still
+  `committed: false`, and that branch is now the only one that may say so
+  without reading anything. The comment claiming everything before the commit
+  could fail with nothing written was false, and it is corrected.
+- **A fourth response state.** `committed` is `bool | None`, and null means
+  the outcome is not established. It is refused exactly as false is, because
+  every caller keys on `verified`; what changes is that the service no longer
+  states a fact it does not have.
+- **The control plane asks the ledger itself when told null.** It has its own
+  path to ImmuDB, which the verifier's relay does not sit on. Without a
+  transaction to confirm against it asks the narrower question - is there a
+  `content_erasure` record for this call_id at all - through an explicit
+  `require_transaction=False`, because the exact-transaction rule P3c3d-7
+  added is a correctness rule on the GDPR path and a silent exemption from it
+  is how such rules stop applying. Both answers are safe: a tombstone found
+  means the ledger already says this call_id is erased and completing the
+  erasure removes the divergence; none found means nothing says erased, no
+  write is frozen, and the refusal leaves the row intact.
+
+**And the retry that D39 and D40 produced between them.** Neither decision
+creates it alone: a caller wrongly told `committed: false` about a write that
+committed can either retry, which `KeyMustNotExist` refuses forever, or
+disbelieve the response. D45 removes the cause. What is left is asserted from
+both ends - a caller who retries anyway gets a 409 that names the key and says
+a record is already committed under it, and a caller whose write genuinely did
+not land can retry and succeed.
+
 ## D34. The serialisation ceiling is accepted, documented, and measured
 
 The CAS globally serialises the ledger write path: every write contends on
@@ -650,6 +808,11 @@ writers gave up at 8 concurrent in either this phase's measurements or
   does not close, and every measurement D38 and D42 rest on
 - `docs/reports/phase-3c3d.md` - D38 through D42, and the reproduction of
   every refutation they close
+- `docs/reports/phase-3c3d-redteam.md` - the ten claims, six refuted
+- `docs/reports/phase-3c3d-order-sweep.md` - the five collection orders, the
+  four order-dependent tests, and the isolation run D44 rests on
+- `docs/reports/phase-3c3e.md` - D43, D44 and D45, the enumerations' failing
+  output before each fix, and every mutation
 - `docs/reports/phase-3c2.md` - where the defect was first observed
 - `tools/ail_backfill_index.py`, `tools/ail_ordering_cost_probe.py`
 - `tests/test_audit_ordering.py`

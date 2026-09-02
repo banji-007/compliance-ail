@@ -16,9 +16,22 @@ What that phase added to the deferred list rather than closing is recorded in RE
 
 **Closed in Phase 3c-3d (`docs/reports/phase-3c3d.md`, ADR-0014 D38-D42).** The red-team pass against 3c-3c refuted nine of ten claims, and a key-shape probe then established that the decision taken in response, D38 as originally written, was a rename that closed nothing. That set is closed. What it added to the deferred list rather than closing is the entry below on `/write-ordered` and a key of any shape, plus two Residual Limits entries in the README.
 
+**Closed in Phase 3c-3e (`docs/reports/phase-3c3e.md`, ADR-0014 D43-D45).** The red-team pass against 3c-3d refuted six of ten claims, and what all six had in common was one thing: a rule that has to hold at N sites, with nothing enumerating the sites. That set is closed, and the control that produced the fixes - an enumeration derived from the code, which fails until every site is covered - is now the rule rather than one test. What it added to the deferred list rather than closing is the entry below on per-test isolation, plus three Residual Limits entries in the README.
+
 ---
 
 ## Deferred (v1.1.0)
+
+### Per-test isolation was never measured
+
+Raised in Phase 3c-3d's order sweep and carried through 3c-3e.
+
+The sweep ran eleven modules alone against a destroyed and rebuilt ledger and found zero hidden dependence across 118 tests, which is what bounded D44's remediation to assertion scope rather than a suite-wide rewrite of preconditions. Two residuals stand:
+
+- **Thirty-five modules were not isolated.** Nothing in the sweep data points at them and nothing excludes them.
+- **Isolation was per module, not per test.** A dependence that one test in a module satisfies for a later test in the same module is invisible to it. Per-test isolation is 442 runs, and nothing measured indicates it.
+
+The shape of the work, when it is taken: `pytest --forked` or one process per test id, against a ledger destroyed between each, with the failing set diffed against the alphabetical baseline the way the module sweep does it.
 
 ### `/write-ordered` accepts a key of any shape into a view
 
