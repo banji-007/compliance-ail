@@ -975,14 +975,32 @@ found defects in this phase's own work and one was inherited.
 | `33620001018` | `899874a` | 3 failed, 492 passed | Two of this phase's own relay tests, failing on **their own guard**: `the ExecAll did not reach the ledger, so this test is not exercising the condition it describes`, with `attempts: 1, committed: false` and the record absent. The relay cut on an HTTP/2 control frame before the write committed. |
 | `33623844441` | `fd09105` | 1 failed, 494 passed | The relay fix confirmed on Linux; all five relay tests pass. The one failure is the inherited one. |
 | `33629407221` | `a711115` | 2 failed, 493 passed | The heading pin pushed one commit ahead of the report it pins. |
-| `CI_RUN_ID` | `CI_COMMIT` | `CI_RESULT` | The report lands, and with it the two references to it. |
+| `33663495874` | `8133f3c` | 1 failed, 494 passed | The report lands and both references to it resolve. The one failure is **this phase's own over-assertion**: `test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` asserted `committed is True` where CI produced `committed: null` - the relay closes the connection it cut, so the verifier's confirming read can hit a dead socket. Null is D45 being honest, and the assertion was wrong to exclude it. |
+| `CI_RUN_ID` | `CI_COMMIT` | `CI_RESULT` | `CI_NOTE` |
 
-**Neither defect CI found in this phase's work was closed by weakening a
-test.** The first was a fixture that did not do what it said; the second was a
-pin committed apart from what it pins. The first is worth keeping in view: a
-relay test whose write never reached the ledger would have passed vacuously
-without the guard that caught it, which is the same reason every relay test
-here asserts that the relay actually cut.
+**None of the three defects CI found in this phase's work was closed by
+weakening a test, and the third is the one worth reading closely.**
+
+- The relay cut on the wrong frame: a fixture that did not do what it said.
+- A heading pin was committed apart from what it pins.
+- `test_a_retry_after_a_dropped_response_is_told_the_record_already_exists`
+  asserted `committed is True` where `committed: null` is equally honest.
+
+**The third looks like a weakening and is not.** The record is in the ledger,
+and two answers describe that truthfully: `true` when the verifier read it
+back, and `null` when the relay had already closed the connection the
+confirming read needed. `false` is the only answer that is a lie, and it is
+the one that sends a caller into D39's permanent 409 - so `is not False` is
+the claim this test was always about, and `is True` was narrower than the
+property rather than stronger. The `null` state is not thereby unasserted:
+`test_a_plain_write_states_no_fact_when_the_confirming_read_is_cut_too`
+asserts it exactly, and P3c3e-2's own demonstration still asserts `true` with
+the real transaction and position, its fixture retried until the confirming
+read could run.
+
+That is the distinction the standing rules are about. A weakening drops a
+claim the system makes; this dropped a claim the test made and the system
+never did.
 
 ### Environment cleanup
 

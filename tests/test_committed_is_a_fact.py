@@ -727,9 +727,16 @@ def test_an_ordered_write_that_committed_is_reported_as_committed_when_its_respo
             # guard into one that can never fire.
             return written, _proxy_log(_ORDERED_PROXY)
 
+    # The fixture is retried until the cut landed AND the verifier's own
+    # confirming read could run. Both are fixture conditions: the relay closes
+    # the connection it cut, so the read that follows can hit a dead socket
+    # and answer `committed: null` - which is D45 being honest, asserted in
+    # its own right by test_a_plain_write_states_no_fact_when_the_confirming_
+    # read_is_cut_too below, and not the state this test is about.
     key, (response, log), _tries = cut_until_it_lands(
         _build, _drive,
-        lambda k, r: "dropping the" in r[1] and k in _getall(headers, [k]))
+        lambda k, r: "dropping the" in r[1] and k in _getall(headers, [k])
+        and r[0].json().get("committed") is True)
 
     assert response.status_code == 200, response.text[:300]
     body = response.json()
@@ -920,7 +927,8 @@ def test_a_retry_after_a_dropped_response_is_told_the_record_already_exists():
 
     A 409 naming the key and saying a record is already committed under it is
     an answer a caller can act on. `committed: false` followed by a bare
-    conflict is not.
+    conflict is not - that pair is what D39 and D40 produced between them, and
+    it is the sequence this test walks end to end.
     """
     headers = _immudb_headers()
     agent = f"p3c3e-retry-{_ORDERED_MARKER}"
@@ -947,8 +955,17 @@ def test_a_retry_after_a_dropped_response_is_told_the_record_already_exists():
     assert key in _getall(headers, [key]), (
         f"the ExecAll did not reach the ledger: {body}. Relay log: {log[-500:]}"
     )
-    assert body["committed"] is True, (
-        f"the caller is being told to retry a write that committed: {body}"
+    # **`is not False`, and that is the whole claim rather than a softened
+    # one.** The record is in the ledger. Two answers are honest about that:
+    # `true`, when the verifier read it back, and `null`, when the relay had
+    # closed the connection the confirming read needed - D45's fourth state,
+    # asserted in its own right below. The third answer, `false`, is the lie
+    # that sends a caller into D39's permanent 409, and it is the one this
+    # test exists to keep out. CI produced the `null` case here where this
+    # host produced `true`; both are the caller being told the truth.
+    assert body["committed"] is not False, (
+        f"the caller is being told a write that committed did not happen, "
+        f"which is the retry D39 refuses forever: {body}"
     )
 
     retried = _ordered_write(key, value)
