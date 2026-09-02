@@ -288,6 +288,40 @@ def _proxy_log(name: str = PROXY_NAME) -> str:
                           capture_output=True, text=True).stdout
 
 
+def cut_until_it_lands(build, drive, landed, attempts: int = 4):
+    """Drive a cut until the write it was aimed at actually reached the ledger.
+
+    **This retries the FIXTURE, never the assertion.** Every test below draws a
+    distinction its own message states: a write that reached the ledger and was
+    misreported is the defect under test, and a write that never reached the
+    ledger means the relay cut too early and the test exercised nothing. The
+    second is a miss, and a miss is what this retries.
+
+    Why a miss is possible at all. The cut fires on a HEADERS or DATA frame on
+    the marked request's own stream, which is the tightest signal available
+    from outside the process, and it is still a signal about frames rather
+    than about the commit. Measured over full-suite runs on this host it
+    misses roughly one attempt in thirty; observed once as
+    `attempts: 1, committed: false` with the record absent. Leaving that as a
+    failure would put a fixture's timing into the suite's order-dependence
+    measurement, which is the one thing this phase is trying to measure
+    cleanly.
+
+    `build` returns whatever a fresh attempt needs - a new key, so an attempt
+    that half-landed cannot poison the next one. `drive` performs the write
+    behind the relay and returns whatever the assertions need. `landed` says
+    whether the ledger has it. The last attempt's result is returned whether
+    it landed or not, so the caller's own guard is what reports a fixture that
+    never managed to cut.
+    """
+    for attempt in range(attempts):
+        subject = build()
+        result = drive(subject)
+        if landed(subject):
+            return subject, result, attempt + 1
+    return subject, result, attempts
+
+
 @contextlib.contextmanager
 def relay(mode: str, name: str, alias: str, marker: str = MARKER, **env: str):
     """The verifier talking to ImmuDB through a relay in one of the modes above.
@@ -635,16 +669,22 @@ def test_an_ordered_write_that_committed_is_reported_as_committed_when_its_respo
     """
     headers = _immudb_headers()
     agent = f"p3c3e-{_ORDERED_MARKER}"
-    call_id = uuid.uuid4().hex
-    key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
-    value = _ordered_record(call_id, agent)
 
-    with relay("response", _ORDERED_PROXY, "cutresponse", marker=_ORDERED_MARKER):
-        response = _ordered_write(key, value)
-        # Read inside the block: the relay container is removed on the way
-        # out, and a log read after that is empty, which would turn this
-        # guard into one that can never fire.
-        log = _proxy_log(_ORDERED_PROXY)
+    def _build():
+        return f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
+
+    def _drive(key):
+        value = _ordered_record(uuid.uuid4().hex, agent)
+        with relay("response", _ORDERED_PROXY, "cutresponse",
+                   marker=_ORDERED_MARKER):
+            written = _ordered_write(key, value)
+            # Read inside the block: the relay container is removed on the way
+            # out, and a log read after that is empty, which would turn this
+            # guard into one that can never fire.
+            return written, _proxy_log(_ORDERED_PROXY)
+
+    key, (response, log), _tries = cut_until_it_lands(
+        _build, _drive, lambda k: k in _getall(headers, [k]))
 
     assert response.status_code == 200, response.text[:300]
     body = response.json()
@@ -706,16 +746,22 @@ def test_a_plain_write_states_no_fact_when_the_confirming_read_is_cut_too():
     refused exactly as `false` is, because every caller keys on `verified`.
     """
     headers = _immudb_headers()
-    key = f"probe:{_ORDERED_MARKER}-plain-{uuid.uuid4().hex[:6]}"
     value = json.dumps({"record_type": "probe", "note": "x" * 900},
                        separators=(",", ":"))
 
-    with relay("blackhole", _BLACKHOLE_PROXY, "cutblackhole",
-               marker=_ORDERED_MARKER, CUT_BLACKHOLE_SECONDS="25"):
-        response = _CLIENT.post(f"{VERIFIER_URL}/write",
-                                json={"key": _b64(key), "value": _b64(value)},
-                                headers={"X-API-Key": VERIFIER_WRITE_KEY})
-        log = _proxy_log(_BLACKHOLE_PROXY)
+    def _build():
+        return f"probe:{_ORDERED_MARKER}-plain-{uuid.uuid4().hex[:6]}"
+
+    def _drive(key):
+        with relay("blackhole", _BLACKHOLE_PROXY, "cutblackhole",
+                   marker=_ORDERED_MARKER, CUT_BLACKHOLE_SECONDS="25"):
+            written = _CLIENT.post(f"{VERIFIER_URL}/write",
+                                   json={"key": _b64(key), "value": _b64(value)},
+                                   headers={"X-API-Key": VERIFIER_WRITE_KEY})
+            return written, _proxy_log(_BLACKHOLE_PROXY)
+
+    key, (response, log), _tries = cut_until_it_lands(
+        _build, _drive, lambda k: k in _getall(headers, [k]))
 
     assert response.status_code == 200, response.text[:300]
     body = response.json()
@@ -759,19 +805,27 @@ def test_an_erasure_completes_when_the_ledger_goes_away_after_the_tombstone_comm
     the ledger itself (D45).
     """
     headers = _immudb_headers()
-    call_id = f"e2{_ORDERED_MARKER}{uuid.uuid4().hex[:6]}"
 
-    wrote = _CLIENT.post(f"{CONTROL_PLANE_URL}/content",
-                         json={"call_id": call_id,
-                               "payload": {"q": "personal data " + "x" * 900}},
-                         headers={"X-API-Key": WRITE_API_KEY})
-    assert wrote.status_code == 204, wrote.text[:300]
+    def _build():
+        call_id = f"e2{_ORDERED_MARKER}{uuid.uuid4().hex[:6]}"
+        wrote = _CLIENT.post(f"{CONTROL_PLANE_URL}/content",
+                             json={"call_id": call_id,
+                                   "payload": {"q": "personal data " + "x" * 900}},
+                             headers={"X-API-Key": WRITE_API_KEY})
+        assert wrote.status_code == 204, wrote.text[:300]
+        return call_id
 
-    with relay("blackhole", _BLACKHOLE_PROXY, "cutblackhole",
-               marker=_ORDERED_MARKER, CUT_BLACKHOLE_SECONDS="20"):
-        deleted = _CLIENT.delete(f"{CONTROL_PLANE_URL}/content/{call_id}",
-                                 headers={"X-API-Key": WRITE_API_KEY})
-        log = _proxy_log(_BLACKHOLE_PROXY)
+    def _drive(call_id):
+        with relay("blackhole", _BLACKHOLE_PROXY, "cutblackhole",
+                   marker=_ORDERED_MARKER, CUT_BLACKHOLE_SECONDS="20"):
+            removed = _CLIENT.delete(f"{CONTROL_PLANE_URL}/content/{call_id}",
+                                     headers={"X-API-Key": WRITE_API_KEY})
+            return removed, _proxy_log(_BLACKHOLE_PROXY)
+
+    call_id, (deleted, log), _tries = cut_until_it_lands(
+        _build, _drive,
+        lambda cid: f"content_erasure:{cid}" in _getall(
+            headers, [f"content_erasure:{cid}"]))
 
     assert "blackholing immudb" in log, (
         "the relay never blackholed ImmuDB, so this test is not exercising the "
@@ -781,7 +835,7 @@ def test_an_erasure_completes_when_the_ledger_goes_away_after_the_tombstone_comm
     assert tombstone_key in _getall(headers, [tombstone_key]), (
         "no tombstone reached the ledger, so this test is not exercising the "
         "condition it describes: the attack is about a tombstone that "
-        "committed while the response could not say so"
+        f"committed while the response could not say so. Relay log: {log[-500:]}"
     )
 
     assert deleted.status_code == 204, (
@@ -823,13 +877,19 @@ def test_a_retry_after_a_dropped_response_is_told_the_record_already_exists():
     """
     headers = _immudb_headers()
     agent = f"p3c3e-retry-{_ORDERED_MARKER}"
-    call_id = uuid.uuid4().hex
-    key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
-    value = _ordered_record(call_id, agent)
+    value = _ordered_record(uuid.uuid4().hex, agent)
 
-    with relay("response", _ORDERED_PROXY, "cutresponse", marker=_ORDERED_MARKER):
-        first = _ordered_write(key, value)
-        log = _proxy_log(_ORDERED_PROXY)
+    def _build():
+        return f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
+
+    def _drive(key):
+        with relay("response", _ORDERED_PROXY, "cutresponse",
+                   marker=_ORDERED_MARKER):
+            written = _ordered_write(key, value)
+            return written, _proxy_log(_ORDERED_PROXY)
+
+    key, (first, log), _tries = cut_until_it_lands(
+        _build, _drive, lambda k: k in _getall(headers, [k]))
 
     body = first.json()
     assert "dropping the" in log, (
@@ -837,7 +897,7 @@ def test_a_retry_after_a_dropped_response_is_told_the_record_already_exists():
         f"the condition it describes. Relay log: {log[-500:]}"
     )
     assert key in _getall(headers, [key]), (
-        f"the ExecAll did not reach the ledger: {body}"
+        f"the ExecAll did not reach the ledger: {body}. Relay log: {log[-500:]}"
     )
     assert body["committed"] is True, (
         f"the caller is being told to retry a write that committed: {body}"
