@@ -136,6 +136,46 @@ BLACKHOLE_SECONDS = float(os.environ.get("CUT_BLACKHOLE_SECONDS", "25"))
 blackhole_until = [0.0]
 
 
+# The `response` and `blackhole` cuts fire on ONE frame and no other: a
+# HEADERS or DATA frame, on the stream the marked request was sent on.
+#
+# Both halves are load-bearing, and each was learned by getting it wrong.
+#
+# Frame TYPE, because "the first frame back after arming" is wrong: ImmuDB
+# answers on the same connection with SETTINGS, WINDOW_UPDATE and PING frames
+# that have nothing to do with the request, and cutting on one of those closes
+# the connection while the write is still in flight, so it never commits and
+# the test measures nothing. Observed on a Linux CI runner, where the same
+# relay that cut correctly on the development host produced
+# `attempts: 1, committed: false` with the record absent from the ledger.
+#
+# Frame STREAM, because the SDK multiplexes: a login, a state read and the
+# write share one connection, so a HEADERS frame answering some other RPC
+# arrives on another stream and is not evidence that this write committed.
+# Observed on this host after the type check was added, on the plain route:
+# the relay cut and blackholed, and the record was still absent.
+#
+# grpc-go writes response HEADERS when the handler returns, so HEADERS or DATA
+# on the request's own stream means ImmuDB finished it, which is the condition
+# these tests need. A frame header is 3 bytes of length, 1 of type, 1 of flags
+# and 4 of stream id, and one recv can carry several, so they are walked.
+def frame_stream(data):
+    if len(data) < 9:
+        return None
+    return int.from_bytes(data[5:9], "big") & 0x7FFFFFFF
+
+
+def carries_a_response(data, stream):
+    at = 0
+    while at + 9 <= len(data):
+        length = int.from_bytes(data[at:at + 3], "big")
+        if data[at + 3] in (0, 1):
+            if stream is None or frame_stream(data[at:]) == stream:
+                return True
+        at += 9 + length
+    return False
+
+
 def pump(src, dst, state, direction):
     try:
         while True:
@@ -143,7 +183,8 @@ def pump(src, dst, state, direction):
             if not data:
                 break
             if (direction == "down" and state.get("armed")
-                    and MODE in ("response", "blackhole")):
+                    and MODE in ("response", "blackhole")
+                    and carries_a_response(data, state.get("stream"))):
                 print("CUT: dropping the %dB response to the marked request "
                       "and closing" % len(data), flush=True)
                 if MODE == "blackhole":
@@ -168,8 +209,9 @@ def pump(src, dst, state, direction):
             if (direction == "up" and MARKER in data and len(data) >= ARM_MIN
                     and not state.get("armed")):
                 state["armed"] = True
-                print("CUT: armed on a %dB request carrying the marker" % len(data),
-                      flush=True)
+                state["stream"] = frame_stream(data)
+                print("CUT: armed on a %dB request carrying the marker, stream %s"
+                      % (len(data), state["stream"]), flush=True)
             if direction == "down" and state.get("armed"):
                 state["relayed"] = True
     except Exception as exc:
@@ -614,7 +656,8 @@ def test_an_ordered_write_that_committed_is_reported_as_committed_when_its_respo
     stored = _getall(headers, [key])
     assert key in stored, (
         "the ExecAll did not reach the ledger, so this test is not exercising "
-        f"the condition it describes. Response was {body}"
+        f"the condition it describes. Response was {body}. Relay log: "
+        f"{log[-500:]}"
     )
     ledger_tx = int(stored[key]["tx"])
 
@@ -684,7 +727,8 @@ def test_a_plain_write_states_no_fact_when_the_confirming_read_is_cut_too():
     stored = _getall(headers, [key])
     assert key in stored, (
         "the write did not reach the ledger, so this test is not exercising "
-        f"the condition it describes. Response was {body}"
+        f"the condition it describes. Response was {body}. Relay log: "
+        f"{log[-500:]}"
     )
 
     assert body["committed"] is not False, (
