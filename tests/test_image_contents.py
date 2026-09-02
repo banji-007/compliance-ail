@@ -1,53 +1,78 @@
-"""tests/test_image_contents.py - Phase 3c-3c, rewritten in Phase 3c-3d.
+"""tests/test_image_contents.py - Phase 3c-3c, rewritten in 3c-3d and 3c-3e.
 
-No image carries key material.
+No image carries key material, in any encoding, on any inspection surface.
 
 Why this exists. D35 moved the verifier's build context from `./verifier`
-(three files) to the repository root, so the image could carry
-`provenance/` - the canonicalization rule it needs to sign the fault record
-it now writes. That is correct and it widened what the context can reach
-from three files to the whole tree, including `keys/`.
+(three files) to the repository root, so the image could carry `provenance/` -
+the canonicalization rule it needs to sign the fault record it now writes.
+That is correct and it widened what the context can reach from three files to
+the whole tree, including `keys/`.
 
-The verifier image turned out clean, because its Dockerfile names every
-path it copies. What the check found instead was a sibling that does not:
+The verifier image turned out clean, because its Dockerfile names every path
+it copies. What the check found instead was a sibling that does not:
 `decision_service/Dockerfile`'s `COPY decision_service/ ./` bakes
-`decision_service/secrets/vault_api_token.txt` into the image on any
-machine where `make keygen` has run. Confirmed by writing a probe token and
-rebuilding - it was readable at `/app/secrets/vault_api_token.txt`. The
-token reaches the running service as a Compose secret at
-`/run/secrets/vault_api_token` and is never read from the image, so nothing
-depended on it being there.
+`decision_service/secrets/vault_api_token.txt` into the image on any machine
+where `make keygen` has run. `.dockerignore` now excludes both. **The image
+check does not consult `.dockerignore`**, deliberately: a rule in that file is
+a described mechanism, and what matters is what is in the artifact.
 
-`.dockerignore` now excludes both. **The first check below does not consult
-`.dockerignore`**, deliberately: a rule in that file is a described
-mechanism, and what matters is what is in the artifact. It inspects the
-built images.
+**Phase 3c-3d rewrote both checks, because both were name matching.** The
+image check matched `*.key` by filename and pruned site-packages; the red team
+put three live P-256 keys into an image under other names and it passed. The
+static check flagged a `COPY` only if the line contained `keys/` or `secrets`,
+which `COPY decision_service/ ./` does not.
 
-**P3c3d-9 (Phase 3c-3d): both lines were rewritten, because both were name
-matching.**
+**Phase 3c-3e (P3c3e-5): the rewrite was still one encoding on one surface,
+and the red team got past both.**
 
-The image check matched `*.key` and `vault_api_token` by filename and pruned
-site-packages, `/usr/share` and `/usr/lib`. The red team put three live P-256
-private keys into an image - `/app/deploy_credential.pem`, `/app/id_rsa` and
-`/usr/local/lib/python3.11/site-packages/leaked.key` - and it passed, 5
-passed. Reproduced here before the rewrite, against an image built
-`FROM p3c3dfix-decision-service` carrying exactly those three files:
-`returncode=0 hits=[]`. It detects key material by content now, and it does
-not prune the directories a key can be dropped into.
+  A10.1  The same key as DER - `openssl ec -outform DER` is one flag - rode
+         into the real image and the module reported `5 passed`. Read back out
+         with `docker cp` and re-armoured, it was byte-identical to the key on
+         the host.
 
-The static check flagged a `COPY` only if the line contained `keys/` or
-`secrets`, which `COPY decision_service/ ./` does not - the line that
-actually baked a credential was the one the string match missed. It resolves
-each COPY source against the repository now, applies `.dockerignore`, and
-asks what the daemon would actually receive.
+  A10.2  A PEM at column zero, deleted by a later layer, was invisible to a
+         check that walks the running filesystem, and came back
+         byte-identical out of `docker save` with two commands.
+
+So there are two enumerations here, and **both are hand-listed and both are
+weaker for it.** That is stated rather than implied, because this phase's rule
+is that an enumeration is derived from the code wherever it can be, and
+neither of these can be:
+
+  * The **encodings** are a fact about cryptography and about what tools
+    people have, not about this repository. Nothing in the tree names them, so
+    there is nothing to derive them from. What can be checked is that the
+    detector actually finds each one, which is what
+    `test_the_detector_finds_every_encoding_this_file_enumerates` does with
+    real key material generated in-process - so an encoding listed here and
+    not detected fails, and dropping one from the detector fails.
+
+  * The **inspection surfaces** are a fact about Docker's image format. Same
+    reasoning: nothing in the tree enumerates them.
+
+What is NOT enumerated, and is therefore the honest ceiling of both lists: an
+encoding nobody here thought of, and a surface nobody here thought of. The
+first list is a table anyone can extend; the second has the two that exist for
+a local image - what a running container sees, and what the image holds.
+
+**The bound on reading, stated:** only the first 16 KiB of a file is examined.
+A PEM P-256 key is about 230 bytes and an RSA 4096 key about 3.2 KiB, so a key
+file is covered whole; a key buried past 16 KiB of other content is not.
+Binary key material is additionally required to start at offset zero of the
+file, or of a base64 body inside it, which is what a key file is - a DER blob
+embedded in the middle of some other binary is not found, and
+`ecdsa/__pycache__/ssh.cpython-311.pyc`, which carries the OpenSSH magic
+string as a constant because it is the module that parses the format, is
+correctly not a hit.
 
 Requires the docker CLI and the images the compose stack was built from.
 """
 
 import fnmatch
-import re
+import io
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -63,46 +88,116 @@ from compose_helpers import COMPOSE_PROJECT, requires_docker_cli  # noqa: E402
 ROOT_CONTEXT_SERVICES = ("verifier", "ail-control-plane", "decision-service",
                          "anchor-service")
 
-# What key material looks like, structurally, and why this is not a list of
-# strings to grep for.
-#
-# A private key file carries a PEM armour BEGIN line at column zero, followed
-# by a matching END line at column zero. Source code that MENTIONS the same
-# header carries it inside a quoted string, so it is never at column zero -
-# which is exactly the difference between `keys/writer-verifier.key` and
-# `ecdsa/test_keys.py`, `cryptography/.../ssh.py` and their bytecode, all of
-# which a bare substring match flags. Those four are in every image this
-# project builds, so a substring match is not a check that can pass.
-#
-# The bound, stated: only the first 16 KiB of a file is read. A PEM P-256 key
-# is about 230 bytes and an RSA 4096 key about 3.2 KiB, so a key file is
-# covered whole; a key buried past 16 KiB of some other content is not.
-_KEY_MATERIAL = (
-    r"(?:\A|\n)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----\r?\n"
-    r"[\s\S]{0,20000}?"
-    r"(?:\A|\n)-----END [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----"
-    r"|(?:\A|\n)PuTTY-User-Key-File-\d+: "
-)
-
 # The vault token has no content signature - it is 64 hex characters - so it
 # is still matched by name, and that limit is stated rather than papered over.
 _CREDENTIAL_NAMES = ("vault_api_token",)
 
 _HEAD_BYTES = 16384
 
-# What must not be in an image. Private key material is found by CONTENT, not
-# by filename: a name blacklist is defeated by renaming the file, which is
-# exactly how three live P-256 keys rode into an image past the old version of
-# this check.
-#
-# Only /proc, /sys, /dev and /run are skipped, because they are kernel
-# interfaces rather than image contents. site-packages, /usr/share and
-# /usr/lib are walked: they were pruned before, and the red team's third key
-# was in site-packages.
-_FORBIDDEN = """
-import os, re
 
-PATTERN = re.compile({pattern!r}.encode())
+# ---------------------------------------------------------------------------
+# The detector. One source, two surfaces.
+# ---------------------------------------------------------------------------
+#
+# Written as a string because one of the two surfaces runs it inside the image
+# under test, where nothing from this repository is importable. The host-side
+# surface execs the same string, so the two surfaces cannot drift into
+# checking different things - which is the defect class this whole phase is
+# about, one level down.
+#
+# Stdlib only, for the same reason.
+_DETECTOR_SOURCE = r'''
+import base64 as _b64, re as _re
+
+# PEM, in every armour that says PRIVATE KEY, plus PuTTY's own header. The
+# BEGIN line has to be at column zero with a matching END: source code that
+# MENTIONS the same header carries it inside a quoted string, which is the
+# difference between keys/writer-verifier.key and ecdsa/test_keys.py,
+# cryptography/.../ssh.py and their bytecode - all of which a bare substring
+# match flags, and all of which are in every image this project builds.
+_ARMOUR = _re.compile(
+    br"(?:\A|\n)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----\r?\n"
+    br"[\s\S]{0,20000}?"
+    br"(?:\A|\n)-----END [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----"
+    br"|(?:\A|\n)PuTTY-User-Key-File-\d+: ")
+
+# DER, by ASN.1 structure rather than by extension. Each of these is the
+# distinctive prefix of a private key and of nothing else:
+#   PKCS8   version INTEGER (0 or 1), then an AlgorithmIdentifier SEQUENCE
+#           carrying one of three algorithm OIDs.
+#   SEC1    version INTEGER 1, then an OCTET STRING of exactly 32, 48 or 66
+#           bytes - the private scalar for P-256, P-384 or P-521.
+#   PKCS1   version INTEGER 0, then a long-form INTEGER, which is the modulus.
+_ALG_OIDS = (br"\x06\x07\x2a\x86\x48\xce\x3d\x02\x01",              # ecPublicKey
+             br"\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01",      # rsaEncryption
+             br"\x06\x03\x2b\x65\x70")                              # Ed25519
+_PKCS8 = _re.compile(br"\x02\x01[\x00\x01]\x30.{0,3}(?:" + br"|".join(_ALG_OIDS)
+                     + br")", _re.S)
+_SEC1 = _re.compile(br"\x02\x01\x01\x04[\x20\x30\x42]")
+_PKCS1 = _re.compile(br"\x02\x01\x00\x02[\x81\x82]")
+
+_OPENSSH_MAGIC = b"openssh-key-v1" + bytes([0])
+_DER_SEQUENCE = bytes([0x30])
+
+# A base64 body with the armour stripped. Long enough not to fire on ordinary
+# words; the shortest thing here is a P-256 SEC1 key at about 160 characters.
+_B64RUN = _re.compile(br"[A-Za-z0-9+/=\r\n]{120,}")
+
+
+def _binary_key_material(blob):
+    """Which binary encoding this blob STARTS with, or None.
+
+    Anchored at offset zero, which is what a key file is. Not anchored, the
+    OpenSSH magic matches `ecdsa/__pycache__/ssh.cpython-311.pyc`, which
+    carries it as a constant because it is the module that parses the format -
+    a mention, not material, and the same distinction the armour rule draws
+    with column zero.
+    """
+    if blob[:len(_OPENSSH_MAGIC)] == _OPENSSH_MAGIC:
+        return "openssh"
+    if blob[:1] != _DER_SEQUENCE:
+        return None
+    head = blob[:64]
+    if _PKCS8.search(head):
+        return "pkcs8-der"
+    if _SEC1.search(head):
+        return "sec1-der"
+    if _PKCS1.search(head):
+        return "pkcs1-der"
+    return None
+
+
+def key_material(head):
+    """Which encoding of private key material these bytes carry, or None."""
+    if _ARMOUR.search(head):
+        return "pem"
+    found = _binary_key_material(head)
+    if found:
+        return found
+    # And the same, inside a base64 body with no armour around it.
+    for run in _B64RUN.findall(head)[:20]:
+        try:
+            decoded = _b64.b64decode(_re.sub(br"[\r\n]", b"", run), validate=False)
+        except Exception:
+            continue
+        found = _binary_key_material(decoded)
+        if found:
+            return "base64-" + found
+    return None
+'''
+
+_DETECTOR = {}
+exec(compile(_DETECTOR_SOURCE, "<detector>", "exec"), _DETECTOR)  # noqa: S102
+key_material = _DETECTOR["key_material"]
+
+
+# The walk that runs INSIDE an image. Only /proc, /sys, /dev and /run are
+# skipped, because they are kernel interfaces rather than image contents.
+# site-packages, /usr/share and /usr/lib are walked: they were pruned before,
+# and the red team's third key was in site-packages.
+_IN_IMAGE_WALK = _DETECTOR_SOURCE + '''
+import os
+
 NAMES = {names!r}
 HEAD = {head}
 
@@ -123,11 +218,128 @@ for root, dirs, files in os.walk("/", onerror=lambda exc: None):
                 head = handle.read(HEAD)
         except Exception:
             continue
-        if PATTERN.search(head):
-            hits.append("content:" + path)
+        found = key_material(head)
+        if found:
+            hits.append(found + ":" + path)
 print("|".join(hits))
-""".format(pattern=_KEY_MATERIAL, names=list(_CREDENTIAL_NAMES), head=_HEAD_BYTES)
+'''.format(names=list(_CREDENTIAL_NAMES), head=_HEAD_BYTES)
 
+
+# ---------------------------------------------------------------------------
+# Enumeration one: the encodings. Hand-listed, and weaker for it.
+# ---------------------------------------------------------------------------
+
+def _signing_key():
+    import ecdsa
+    return ecdsa.SigningKey.generate(curve=ecdsa.NIST256p)
+
+
+def _armoured_openssh(key) -> bytes:
+    """An OpenSSH-format private key file, structurally.
+
+    The real thing is this armour around a base64 body whose first bytes are
+    the `openssh-key-v1` magic. Built rather than generated because
+    `ssh-keygen` is not a dependency of this suite; what the detector has to
+    find is the armour and the magic, and both are here.
+    """
+    import base64
+    body = (_DETECTOR["_OPENSSH_MAGIC"] + b"\x00\x00\x00\x04none" * 8
+            + key.to_string())
+    return (b"-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            + base64.encodebytes(body)
+            + b"-----END OPENSSH PRIVATE KEY-----\n")
+
+
+def _pkcs8_version_zero(key) -> bytes:
+    """PKCS8 as OpenSSL writes it.
+
+    `ecdsa` emits the PrivateKeyInfo version INTEGER as 1 and OpenSSL emits
+    it as 0; the two DER blobs are otherwise byte-identical for the same key,
+    measured against `openssl pkcs8 -topk8 -nocrypt -outform DER`. Both are
+    enumerated because the SEC1 signature also begins `02 01 01`, so a
+    detector that had lost its PKCS8 rule would still classify the version-1
+    form and would miss the one OpenSSL actually produces.
+    """
+    blob = bytearray(key.to_der(format="pkcs8"))
+    version = blob.index(b"")
+    blob[version + 2] = 0
+    return bytes(blob)
+
+
+def _base64_no_header(key) -> bytes:
+    import base64
+    return base64.encodebytes(key.to_der())
+
+
+# name -> (builder, what the detector should call it). Extend this table to
+# extend the check; a name here that the detector does not find fails.
+KEY_ENCODINGS = {
+    "pem":              (lambda key: key.to_pem(), "pem"),
+    "pem-pkcs8":        (lambda key: key.to_pem(format="pkcs8"), "pem"),
+    "der-sec1":         (lambda key: key.to_der(), "sec1-der"),
+    "der-pkcs8":        (lambda key: key.to_der(format="pkcs8"), "pkcs8-der"),
+    "der-pkcs8-openssl": (_pkcs8_version_zero, "pkcs8-der"),
+    "openssh":          (_armoured_openssh, "pem"),
+    "base64-no-header": (_base64_no_header, "base64-sec1-der"),
+}
+
+
+@pytest.mark.parametrize("encoding", sorted(KEY_ENCODINGS))
+def test_the_detector_finds_every_encoding_this_file_enumerates(encoding):
+    """Real key material, generated here, in each enumerated encoding.
+
+    This is the half of the encoding list that can be checked: the list itself
+    is a judgement, and whether the detector honours it is not. Dropping one
+    encoding from the detector fails exactly one of these.
+    """
+    build, expected = KEY_ENCODINGS[encoding]
+    blob = build(_signing_key())
+    found = key_material(blob)
+    assert found is not None, (
+        f"the detector does not find a private key encoded as {encoding}. "
+        f"First bytes: {blob[:40]!r}"
+    )
+    assert found == expected, (
+        f"a {encoding} key was detected as {found!r} rather than {expected!r}"
+    )
+
+
+def test_the_detector_does_not_fire_on_public_key_material_or_prose():
+    """The control. A detector that flags everything passes for the wrong
+    reason, and this one walks every file in four images."""
+    key = _signing_key()
+    for name, blob in (
+        ("public pem", key.get_verifying_key().to_pem()),
+        ("public der", key.get_verifying_key().to_der()),
+        ("prose", b"the private key lives in keys/ and is never copied\n" * 40),
+        ("empty", b""),
+    ):
+        assert key_material(blob) is None, (
+            f"the detector reports key material in {name}: {key_material(blob)}"
+        )
+
+
+def test_the_two_enumerations_are_hand_listed_and_say_so():
+    """This file's own weakest point, asserted so it cannot be quietly
+    forgotten.
+
+    Neither list can be derived: nothing in this repository enumerates the
+    encodings a private key can be written in, or the surfaces a Docker image
+    can be read on. What is here is two tables anyone can extend, and the
+    ceiling is an entry nobody thought of.
+    """
+    module_doc = sys.modules[__name__].__doc__
+    assert "hand-listed" in module_doc, (
+        "the module docstring no longer states that these enumerations are "
+        "hand-listed, which is the one thing a reader has to know about them"
+    )
+    assert len(KEY_ENCODINGS) >= 5, KEY_ENCODINGS
+    assert len(INSPECTION_SURFACES) >= 2, INSPECTION_SURFACES
+
+
+# ---------------------------------------------------------------------------
+# Enumeration two: the inspection surfaces. Hand-listed, and weaker for it.
+# ---------------------------------------------------------------------------
 
 def _image_name(service: str) -> str:
     """Compose names a built image {project}-{service}."""
@@ -140,15 +352,92 @@ def _image_exists(image: str) -> bool:
     return result.returncode == 0
 
 
-@requires_docker_cli
-@pytest.mark.parametrize("service", ROOT_CONTEXT_SERVICES)
-def test_no_image_built_from_the_repository_root_carries_key_material(service):
+def _running_filesystem(image: str) -> list[str]:
+    """What a reader of the RUNNING container can find.
+
+    This is the surface the check had before P3c3e-5, and on its own it is a
+    claim about the last layer rather than about the image.
     """
-    Asserted against the image, not against `.dockerignore`.
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "python", image, "-c",
+         _IN_IMAGE_WALK],
+        capture_output=True, text=True, timeout=1800,
+    )
+    assert result.returncode == 0, (
+        f"could not inspect {image}: {result.stderr[-300:]}"
+    )
+    return [hit for hit in result.stdout.strip().split("|") if hit.strip()]
+
+
+def _every_layer(image: str) -> list[str]:
+    """What the IMAGE contains, layer by layer, including deleted files.
+
+    `docker save` streamed through this process rather than written to disk:
+    the four images here are about 1.2 GB together and none of it needs to
+    land anywhere. Each blob in the archive is either a layer (a tar, possibly
+    gzipped) or JSON metadata; the metadata does not open as a tar and is
+    skipped.
+
+    This is the surface A10.2 used. `FROM <image>` / `COPY id_ecdsa` /
+    `RUN rm -f` leaves the key in the layer that added it, invisible to the
+    running filesystem and recoverable from the archive with two commands.
+    """
+    hits: list[str] = []
+    process = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                stream = archive.extractfile(member)
+                if stream is None:
+                    continue
+                blob = stream.read()
+                if not (blob[:2] == b"\x1f\x8b" or blob[257:262] == b"ustar"):
+                    continue          # image metadata, not a layer
+                try:
+                    inner = tarfile.open(fileobj=io.BytesIO(blob), mode="r:*")
+                except Exception:
+                    continue
+                with inner:
+                    for entry in inner:
+                        if not entry.isfile():
+                            continue
+                        name = Path(entry.name).name
+                        if any(fragment in name for fragment in _CREDENTIAL_NAMES):
+                            hits.append(f"name:{member.name}!{entry.name}")
+                            continue
+                        handle = inner.extractfile(entry)
+                        if handle is None:
+                            continue
+                        found = key_material(handle.read(_HEAD_BYTES))
+                        if found:
+                            hits.append(f"{found}:{member.name}!{entry.name}")
+    finally:
+        process.stdout.close()
+        process.wait()
+    return hits
+
+
+# name -> the function that reads it. Two, because a local image has two:
+# what a process inside it sees, and what the artifact holds.
+INSPECTION_SURFACES = {
+    "running-filesystem": _running_filesystem,
+    "every-layer-in-docker-save": _every_layer,
+}
+
+
+@requires_docker_cli
+@pytest.mark.parametrize("surface", sorted(INSPECTION_SURFACES))
+@pytest.mark.parametrize("service", ROOT_CONTEXT_SERVICES)
+def test_no_image_built_from_the_repository_root_carries_key_material(service, surface):
+    """Asserted against the image, not against `.dockerignore`.
 
     A rule in `.dockerignore` is a claim about what the daemon was sent. This
     is a claim about what a reader of the image can find, which is the one
-    that matters if the rule is ever wrong or removed.
+    that matters if the rule is ever wrong or removed - and it is asked on
+    both surfaces now, because a file deleted by a later layer answers
+    differently on each.
     """
     image = _image_name(service)
     if not _image_exists(image):
@@ -156,21 +445,16 @@ def test_no_image_built_from_the_repository_root_carries_key_material(service):
             f"image {image!r} is not built; this test inspects the images the "
             "running stack was built from"
         )
-
-    result = subprocess.run(
-        ["docker", "run", "--rm", "--entrypoint", "python", image, "-c", _FORBIDDEN],
-        capture_output=True, text=True, timeout=900,
-    )
-    assert result.returncode == 0, (
-        f"could not inspect {image}: {result.stderr[-300:]}"
-    )
-    found = [hit for hit in result.stdout.strip().split("|") if hit.strip()]
+    found = INSPECTION_SURFACES[surface](image)
     assert not found, (
-        f"{image} carries key material or a credential: {found}. No Dockerfile "
-        "should copy keys/ or decision_service/secrets/, and .dockerignore "
-        "keeps them out of the build context so a future COPY cannot reach "
-        "them by accident. `content:` means the file's bytes carry a private "
-        "key header, whatever the file is called."
+        f"{image} carries key material or a credential on the {surface} "
+        f"surface: {found}. No Dockerfile should copy keys/ or "
+        "decision_service/secrets/, and .dockerignore keeps them out of the "
+        "build context so a future COPY cannot reach them by accident. A hit "
+        "prefixed with an encoding name means the file's bytes ARE a private "
+        "key in that encoding, whatever the file is called; on the layer "
+        "surface it may be a file a later layer deleted, which is still in "
+        "the image."
     )
 
 
@@ -264,7 +548,7 @@ def _is_ignored(relative: Path, patterns: list[str]) -> bool:
 def _looks_like_key_material(path: Path) -> bool:
     """Private key material by content, plus the vault token by name.
 
-    Same rule as the image check above, applied to the source tree: the
+    The same detector the image checks run, applied to the source tree: the
     question asked is what the file is, not what it is called. A name
     blacklist is what let `COPY decision_service/ ./` through.
     """
@@ -275,7 +559,7 @@ def _looks_like_key_material(path: Path) -> bool:
             head = handle.read(_HEAD_BYTES)
     except Exception:
         return False
-    return re.search(_KEY_MATERIAL.encode(), head) is not None
+    return key_material(head) is not None
 
 
 def _copy_sources(line: str) -> list[str]:
@@ -294,9 +578,9 @@ def _copy_sources(line: str) -> list[str]:
 
 def test_no_dockerfile_copies_key_material():
     """The second line, static, over every Dockerfile rather than the four
-    images the test above happens to find built.
+    images the tests above happen to find built.
 
-    Not the criterion - the image inspection above is - but it catches a new
+    Not the criterion - the image inspection is - but it catches a new
     Dockerfile, or a removed `.dockerignore` rule, before anything is built.
 
     **What it asks.** For every COPY source, resolved against that

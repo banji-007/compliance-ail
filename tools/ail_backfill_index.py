@@ -175,7 +175,29 @@ def login(client: httpx.Client) -> dict:
 
 
 def scan_all(client: httpx.Client, headers: dict, prefix: str) -> list[dict]:
-    """Every key under a prefix, walked in pages because scan caps at 2500."""
+    """Every key under a prefix, walked in pages because scan caps at 2500.
+
+    **P3c3e-4 (Phase 3c-3e): the read asserts on what came back.** D42 stated
+    the rule and covered two of the four bounded reads in this repository;
+    this is one of the two it missed, and it is the one whose results are
+    zAdded straight into a view index (`backfill()` below). ImmuDB's REST
+    route drops an unrecognised or misspelled parameter without comment and
+    answers 200, so a `prefix` that did not survive turns this into a walk of
+    the whole ledger. Driven with a client that answers outside the prefix:
+
+        asked for prefix 'tool_call:', RETURNED, no complaint:
+           ail_seq:counter / ail_seq:reserve
+           ledger_fault:00000000000000000001:x:y / content_erasure:abc
+
+    Every one of those would then be zAdded into `ail_view:decision:v1` and
+    become a row on `/audit` - the sequence counter, the bound reserve, this
+    service's own account of a failed proof, and an Article 17 tombstone,
+    each rendered as a decision with `outcome_type: null`.
+
+    Raises rather than reporting, which is this module's rule: a backfill is
+    an offline pass that writes, and a pass that cannot trust what it read
+    must not write.
+    """
     out: list[dict] = []
     seek = ""
     while True:
@@ -187,6 +209,25 @@ def scan_all(client: httpx.Client, headers: dict, prefix: str) -> list[dict]:
         entries = resp.json().get("entries", [])
         if not entries:
             break
+        for entry in entries:
+            try:
+                key = unb64(entry["key"])
+            except Exception as exc:
+                raise SystemExit(
+                    f"refusing to backfill: a row returned for prefix {prefix!r} "
+                    f"has an unreadable key ({exc}), so what this pass would "
+                    "index cannot be established."
+                )
+            if not key.startswith(prefix.encode()):
+                raise SystemExit(
+                    f"refusing to backfill: a bounded read returned a key "
+                    f"outside the prefix it asked for: "
+                    f"{key.decode('utf-8', 'replace')!r} is not under "
+                    f"{prefix!r}. The bound was not applied, which is what a "
+                    "dropped or misspelled parameter looks like on this route: "
+                    "an unbounded read at HTTP 200. Every key this pass reads "
+                    "is zAdded into a view index and becomes a page row."
+                )
         out.extend(entries)
         if len(entries) < SCAN_PAGE:
             break
@@ -236,6 +277,39 @@ def indexed_keys(client: httpx.Client, headers: dict, view_set: str) -> set[byte
             break
         before = len(seen)
         for row in rows:
+            # P3c3e-4 (Phase 3c-3e): the read asserts on what came back, in
+            # the form its bound takes. This one is bounded by `minScore`,
+            # the same bound anchor_service::collect_positions carries, and
+            # a row scored below the minScore this page asked for means the
+            # bound was not applied. That is not a cosmetic difference here:
+            # an incomplete snapshot of what a view already holds is what
+            # indexes a record a second time, measured at 25 records holding
+            # two positions each from one pass over 2535 rows, which kills
+            # `/audit` with audit_ordering_fault at every limit permanently.
+            #
+            # Raised rather than reported, unlike the reconciler's copy: the
+            # reconciler reads and describes, this pass reads and then
+            # writes.
+            if min_score is not None:
+                try:
+                    score = float(row.get("score", 0.0))
+                except (TypeError, ValueError):
+                    raise SystemExit(
+                        f"refusing to backfill: a row in {view_set!r} has an "
+                        "unreadable score, so whether the read stayed inside "
+                        "the bound it asked for cannot be established."
+                    )
+                if score < min_score:
+                    raise SystemExit(
+                        f"refusing to backfill: a bounded read returned a row "
+                        f"outside the score bound it asked for: {score} is "
+                        f"below the requested minScore {min_score} in "
+                        f"{view_set!r}. The bound was not applied, which is "
+                        "what a dropped or misspelled parameter looks like on "
+                        "this route: an unbounded read at HTTP 200. An "
+                        "incomplete snapshot of this view produces records at "
+                        "two positions."
+                    )
             seen.add(unb64(row["key"]))
         try:
             min_score = float(rows[-1].get("score", 0.0))
