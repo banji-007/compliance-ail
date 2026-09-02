@@ -49,6 +49,7 @@ network and recreates the verifier pointed at it.
 """
 
 import base64
+import contextlib
 import json
 import os
 import subprocess
@@ -86,22 +87,53 @@ _CLIENT = httpx.Client(timeout=60.0)
 # The relay. Written as a string and passed to `python -c`, so the fixture
 # needs no bind mount and no host path translation.
 #
-# What it does, and why each condition is there. It arms on a request frame
-# carrying the marker AND at least CUT_ARM_MIN bytes, which is what
-# distinguishes a write (key plus a signed record) from the small reads the
-# same connection also carries. It relays that request and its response
-# untouched, so the write commits and the SDK sees its answer. It then drops
-# the next request frame of at least CUT_MIN_FRAME bytes and closes the
-# connection, so the client's next RPC fails and the HTTP/2 flow-control
-# frames in between do not count as that RPC.
+# Four modes (P3c3e-2, Phase 3c-3e), because the Phase 3c-3d red team drove
+# three different cuts and each lands on a different RPC. One relay, because
+# it is one fixture: what varies is which frame is dropped.
+#
+#   next-rpc   Relay the marked request AND its response, then drop the
+#              client's NEXT request of at least CUT_MIN_FRAME bytes and close,
+#              so the flow-control frames in between do not count as that RPC.
+#              "ImmuDB went away right after the write returned." P3c3d-6 and
+#              P3c3d-7 drive this one.
+#
+#   response   Relay the marked request upstream so it commits, then drop its
+#              OWN response and close. "Connection reset after commit, on the
+#              commit's own RPC." Red-team A4.1: the ordered write's ExecAll
+#              landed whole - record, counter advance and index entry - and
+#              the response said the write did not happen.
+#
+#   blackhole  `response`, and then refuse every connection for
+#              CUT_BLACKHOLE_SECONDS, so the read that would confirm the
+#              commit cannot run either. Red-team A4.2, the cut that
+#              reproduced the GDPR erasure_conflict in full.
+#
+#   drop-request  Relay everything until the marked request arrives, then drop
+#              that request WITHOUT relaying it and blackhole. Nothing about
+#              this write reaches the ledger, so its key is still free - the
+#              control for P3c3e-3, where the retry the caller is told to make
+#              has to succeed. A relay that refused every connection from the
+#              start would do instead, except that the verifier logs into
+#              ImmuDB in its lifespan and would never come up healthy.
+#
+# Arming is on a request frame carrying the marker AND at least CUT_ARM_MIN
+# bytes, which distinguishes a write (key plus a signed record) from the small
+# reads the same connection also carries. **Arming happens after the frame has
+# been relayed upstream**, not before: in `response` mode the down pump closes
+# both sockets as soon as it is armed, and arming first raced the up pump's
+# own `sendall` of the very request that is supposed to commit.
 _PROXY_SOURCE = """
-import os, socket, threading
+import os, socket, threading, time
 
 LISTEN = 3399
 UPSTREAM = ("immudb", 3322)
 MARKER = os.environ.get("CUT_MARKER", "ZZCUTZZ").encode()
 ARM_MIN = int(os.environ.get("CUT_ARM_MIN", "600"))
 MIN_FRAME = int(os.environ.get("CUT_MIN_FRAME", "40"))
+MODE = os.environ.get("CUT_MODE", "next-rpc")
+BLACKHOLE_SECONDS = float(os.environ.get("CUT_BLACKHOLE_SECONDS", "25"))
+
+blackhole_until = [0.0]
 
 
 def pump(src, dst, state, direction):
@@ -110,17 +142,34 @@ def pump(src, dst, state, direction):
             data = src.recv(65536)
             if not data:
                 break
-            if (direction == "up" and MARKER in data and len(data) >= ARM_MIN
-                    and not state.get("armed")):
-                state["armed"] = True
-                print("CUT: armed on a %dB request carrying the marker" % len(data),
-                      flush=True)
+            if (direction == "down" and state.get("armed")
+                    and MODE in ("response", "blackhole")):
+                print("CUT: dropping the %dB response to the marked request "
+                      "and closing" % len(data), flush=True)
+                if MODE == "blackhole":
+                    blackhole_until[0] = time.time() + BLACKHOLE_SECONDS
+                    print("CUT: blackholing immudb for %ss" % BLACKHOLE_SECONDS,
+                          flush=True)
+                break
             if (direction == "up" and state.get("relayed")
                     and len(data) >= MIN_FRAME):
                 print("CUT: the marked response was relayed; cutting the NEXT RPC",
                       flush=True)
                 break
+            if (direction == "up" and MODE == "drop-request"
+                    and MARKER in data and len(data) >= ARM_MIN):
+                print("CUT: dropping the %dB marked request without relaying it"
+                      % len(data), flush=True)
+                blackhole_until[0] = time.time() + BLACKHOLE_SECONDS
+                print("CUT: blackholing immudb for %ss" % BLACKHOLE_SECONDS,
+                      flush=True)
+                break
             dst.sendall(data)
+            if (direction == "up" and MARKER in data and len(data) >= ARM_MIN
+                    and not state.get("armed")):
+                state["armed"] = True
+                print("CUT: armed on a %dB request carrying the marker" % len(data),
+                      flush=True)
             if direction == "down" and state.get("armed"):
                 state["relayed"] = True
     except Exception as exc:
@@ -150,10 +199,17 @@ server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(("0.0.0.0", LISTEN))
 server.listen(64)
-print("CUT: listening on %d -> %s:%d" % (LISTEN, UPSTREAM[0], UPSTREAM[1]),
-      flush=True)
+print("CUT: listening on %d -> %s:%d mode=%s"
+      % (LISTEN, UPSTREAM[0], UPSTREAM[1], MODE), flush=True)
 while True:
     conn, _ = server.accept()
+    if time.time() < blackhole_until[0]:
+        print("CUT: refusing a connection", flush=True)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        continue
     handle(conn)
 """
 
@@ -185,9 +241,48 @@ def _getall(headers: dict, keys: list[str]) -> dict:
             for e in resp.json().get("entries", [])}
 
 
-def _proxy_log() -> str:
-    return subprocess.run(["docker", "logs", PROXY_NAME],
+def _proxy_log(name: str = PROXY_NAME) -> str:
+    return subprocess.run(["docker", "logs", name],
                           capture_output=True, text=True).stdout
+
+
+@contextlib.contextmanager
+def relay(mode: str, name: str, alias: str, marker: str = MARKER, **env: str):
+    """The verifier talking to ImmuDB through a relay in one of the modes above.
+
+    A context manager rather than a fixture, because more than one mode is
+    driven in this module and two module-scoped fixtures that each recreate
+    the verifier would leave it pointed at whichever ran last. Teardown is
+    unconditional and includes the verifier's address: a session that left it
+    pointed at a stopped relay would fail every later test in a way that
+    reads as a code regression.
+    """
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    arguments = [
+        "docker", "run", "-d", "--name", name,
+        "--network", f"{COMPOSE_PROJECT}_default",
+        "--network-alias", alias,
+        "-e", f"CUT_MARKER={marker}",
+        "-e", f"CUT_MODE={mode}",
+    ]
+    for key, value in env.items():
+        arguments += ["-e", f"{key}={value}"]
+    arguments += ["python:3.11-slim", "python", "-c", _PROXY_SOURCE]
+    started = subprocess.run(arguments, capture_output=True, text=True)
+    assert started.returncode == 0, (
+        f"could not start the {mode} relay: {started.stderr[-400:]}"
+    )
+    try:
+        compose("up", "-d", "--force-recreate", "verifier",
+                env={"IMMUDB_ADDR": f"{alias}:3399"})
+        assert wait_for_health(f"{VERIFIER_URL}/health"), (
+            f"the verifier did not come back pointed at the {mode} relay"
+        )
+        yield name
+    finally:
+        compose("up", "-d", "--force-recreate", "verifier", check=False)
+        wait_for_health(f"{VERIFIER_URL}/health")
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
 
 def _anchor_state() -> str:
@@ -204,28 +299,8 @@ def cut_proxy():
     that left the verifier pointed at a stopped relay would fail every later
     test in a way that reads as a code regression.
     """
-    subprocess.run(["docker", "rm", "-f", PROXY_NAME], capture_output=True)
-    started = subprocess.run([
-        "docker", "run", "-d", "--name", PROXY_NAME,
-        "--network", f"{COMPOSE_PROJECT}_default",
-        "--network-alias", PROXY_ALIAS,
-        "-e", f"CUT_MARKER={MARKER}",
-        "python:3.11-slim", "python", "-c", _PROXY_SOURCE,
-    ], capture_output=True, text=True)
-    assert started.returncode == 0, (
-        f"could not start the relay: {started.stderr[-400:]}"
-    )
-    try:
-        compose("up", "-d", "--force-recreate", "verifier",
-                env={"IMMUDB_ADDR": f"{PROXY_ALIAS}:3399"})
-        assert wait_for_health(f"{VERIFIER_URL}/health"), (
-            "the verifier did not come back pointed at the relay"
-        )
+    with relay("next-rpc", PROXY_NAME, PROXY_ALIAS):
         yield
-    finally:
-        compose("up", "-d", "--force-recreate", "verifier", check=False)
-        wait_for_health(f"{VERIFIER_URL}/health")
-        subprocess.run(["docker", "rm", "-f", PROXY_NAME], capture_output=True)
 
 
 # ---------------------------------------------------------------------------
@@ -437,3 +512,349 @@ def test_an_erasure_completes_when_its_tombstone_commits_and_the_state_call_fail
     again = _CLIENT.delete(f"{CONTROL_PLANE_URL}/content/{call_id}",
                            headers={"X-API-Key": WRITE_API_KEY})
     assert again.status_code == 204, again.text[:300]
+
+
+# ---------------------------------------------------------------------------
+# P3c3e-2 (Phase 3c-3e): the same property, on the route that never got it.
+# ---------------------------------------------------------------------------
+#
+# Red-team A4.1, verbatim. This file had four tests when it was written in
+# Phase 3c-3d and every one of them drove `POST /write`. `POST /write-ordered`
+# - the route ledger/immudb_ledger.py takes for every decision and every
+# intent - still answered `committed: false` from a generic handler that asked
+# the ledger nothing:
+#
+#     WRITE -> 200 {"tx_id": null, "seq": null, "verified": false,
+#                   "committed": false, "attempts": 0,
+#                   "detail": "StatusCode.UNAVAILABLE ... Socket closed"}
+#     LEDGER-> {"tool_call:p3c3dred-a4:...": {"tx": "55", "revision": "1"}}
+#     view   -> (1000000017, 'tool_call:p3c3dred-a4:...', '55')
+#     /audit -> 1 row for this call_id, "outcome_type": "policy_allow"
+#
+# The whole ExecAll landed - record, counter advance, index entry - and the
+# response said the write did not happen. log_tool_call raises on anything
+# but verified: true, so the decision service denied a call whose allow
+# decision is on the audit page.
+
+_ORDERED_MARKER = "ZZORDZZ"
+_ORDERED_PROXY = f"{COMPOSE_PROJECT}-p3c3e-cutresponse"
+_BLACKHOLE_PROXY = f"{COMPOSE_PROJECT}-p3c3e-blackhole"
+_DROP_REQUEST_PROXY = f"{COMPOSE_PROJECT}-p3c3e-droprequest"
+
+VIEW_DECISION = "ail_view:decision:v1"
+
+
+def _ordered_record(call_id: str, agent: str) -> str:
+    """A decision record big enough for the relay to arm on.
+
+    The relay arms on a request frame of at least CUT_ARM_MIN bytes carrying
+    the marker, which is how a write is told apart from the small reads the
+    same connection carries. A real decision record is comfortably past that;
+    `note` makes it so regardless of what the record's own fields cost.
+    """
+    return json.dumps({
+        "record_type": "decision", "call_id": call_id, "agent_id": agent,
+        "timestamp": "2026-09-02T00:00:00", "tool_name": "query_database",
+        "outcome_type": "policy_allow", "fault_class": None,
+        "policy_revision": "p3c3e-test", "reasons": [],
+        "input_sha256": uuid.uuid4().hex, "content_state": "unavailable",
+        "profile": "observed", "note": "x" * 700,
+    }, separators=(",", ":"))
+
+
+def _ordered_write(key: str, value: str, view: str = "decision"):
+    return _CLIENT.post(f"{VERIFIER_URL}/write-ordered",
+                        json={"key": _b64(key), "value": _b64(value),
+                              "view": view},
+                        headers={"X-API-Key": VERIFIER_WRITE_KEY})
+
+
+def _members_at_position(headers: dict, view_set: str, score: float):
+    """Which keys the view holds at exactly this position."""
+    resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/zscan", json={
+        "set": _b64(view_set), "desc": False, "limit": 100,
+        "minScore": {"score": score}, "maxScore": {"score": score},
+    }, headers=headers)
+    resp.raise_for_status()
+    return [base64.b64decode(row["entry"]["key"]).decode()
+            for row in resp.json().get("entries", [])]
+
+
+@requires_stack
+@requires_docker_cli
+def test_an_ordered_write_that_committed_is_reported_as_committed_when_its_response_is_dropped():
+    """
+    A4.1, driven. The ExecAll's own response is dropped after it commits.
+
+    Everything the ExecAll carries is in the ledger afterwards - the record,
+    the advanced counter and the index entry at the allocated position - so a
+    response saying the write did not happen is a false statement about the
+    ledger, and it is the statement ledger/immudb_ledger.py acts on.
+    """
+    headers = _immudb_headers()
+    agent = f"p3c3e-{_ORDERED_MARKER}"
+    call_id = uuid.uuid4().hex
+    key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
+    value = _ordered_record(call_id, agent)
+
+    with relay("response", _ORDERED_PROXY, "cutresponse", marker=_ORDERED_MARKER):
+        response = _ordered_write(key, value)
+        # Read inside the block: the relay container is removed on the way
+        # out, and a log read after that is empty, which would turn this
+        # guard into one that can never fire.
+        log = _proxy_log(_ORDERED_PROXY)
+
+    assert response.status_code == 200, response.text[:300]
+    body = response.json()
+    assert "dropping the" in log, (
+        "the relay never dropped a response, so this test is not exercising "
+        f"the condition it describes. Relay log: {log[-500:]}"
+    )
+
+    stored = _getall(headers, [key])
+    assert key in stored, (
+        "the ExecAll did not reach the ledger, so this test is not exercising "
+        f"the condition it describes. Response was {body}"
+    )
+    ledger_tx = int(stored[key]["tx"])
+
+    assert body["committed"] is True, (
+        f"the record is in the ledger at transaction {ledger_tx} and the "
+        f"ordered route says the write never happened: {body}"
+    )
+    assert body["tx_id"] == ledger_tx, (
+        f"the response names transaction {body['tx_id']} and the ledger holds "
+        f"this record at {ledger_tx}: {body}"
+    )
+    assert body["verified"] is False, (
+        f"no proof ran on this write, so nothing verified: {body}"
+    )
+    assert body["attempts"] >= 1, (
+        f"the commit took at least one attempt and the response reports "
+        f"{body['attempts']}: {body}"
+    )
+
+    # The position, confirmed against the view rather than taken from the
+    # response. A response naming a position the index does not hold would be
+    # the same class of claim in a different field.
+    assert body["seq"] is not None, (
+        "the ExecAll that committed the record committed its zAdd too, and "
+        f"the response reports no position: {body}"
+    )
+    members = _members_at_position(headers, VIEW_DECISION, float(body["seq"]))
+    assert key in members, (
+        f"the response says this record holds position {body['seq']} and the "
+        f"decision view at that position holds {members}"
+    )
+
+
+@requires_stack
+@requires_docker_cli
+def test_a_plain_write_states_no_fact_when_the_confirming_read_is_cut_too():
+    """
+    A4.2 on `POST /write`. The write's response is dropped and ImmuDB is then
+    unreachable, so the read D40 added cannot run either.
+
+    Before D45 the route answered `committed: false` here - one RPC further
+    along than the guess D40 removed, and the same guess. The record was at
+    transaction 118.
+
+    `committed: null` is the whole fix: this service says what it knows. It is
+    refused exactly as `false` is, because every caller keys on `verified`.
+    """
+    headers = _immudb_headers()
+    key = f"probe:{_ORDERED_MARKER}-plain-{uuid.uuid4().hex[:6]}"
+    value = json.dumps({"record_type": "probe", "note": "x" * 900},
+                       separators=(",", ":"))
+
+    with relay("blackhole", _BLACKHOLE_PROXY, "cutblackhole",
+               marker=_ORDERED_MARKER, CUT_BLACKHOLE_SECONDS="25"):
+        response = _CLIENT.post(f"{VERIFIER_URL}/write",
+                                json={"key": _b64(key), "value": _b64(value)},
+                                headers={"X-API-Key": VERIFIER_WRITE_KEY})
+        log = _proxy_log(_BLACKHOLE_PROXY)
+
+    assert response.status_code == 200, response.text[:300]
+    body = response.json()
+    assert "blackholing immudb" in log, (
+        "the relay never blackholed ImmuDB, so this test is not exercising the "
+        f"condition it describes. Relay log: {log[-500:]}"
+    )
+
+    stored = _getall(headers, [key])
+    assert key in stored, (
+        "the write did not reach the ledger, so this test is not exercising "
+        f"the condition it describes. Response was {body}"
+    )
+
+    assert body["committed"] is not False, (
+        f"the record is in the ledger at transaction {stored[key]['tx']} and "
+        f"the response says the write did not happen: {body}"
+    )
+    assert body["committed"] is None, (
+        "the confirming read could not run, so `committed: true` is not a fact "
+        f"this service has either: {body}"
+    )
+    assert body["verified"] is False, body
+
+
+@requires_stack
+@requires_docker_cli
+def test_an_erasure_completes_when_the_ledger_goes_away_after_the_tombstone_commits():
+    """
+    A4.2's consequence, which is the one that matters: the GDPR path.
+
+    The same cut on `POST /write` reproduced Phase 3c-3c's `erasure_conflict`
+    verbatim against the head that reported it closed - DELETE 503, the
+    tombstone committed at transaction 121, 772 bytes of payload still in
+    `call_content`, and content writes for that call_id frozen at 409. The
+    subject's data unerasable through the documented route and unwritable.
+
+    The control plane has its own path to ImmuDB, which this relay does not
+    sit on, so when the verifier says the outcome is not established it asks
+    the ledger itself (D45).
+    """
+    headers = _immudb_headers()
+    call_id = f"e2{_ORDERED_MARKER}{uuid.uuid4().hex[:6]}"
+
+    wrote = _CLIENT.post(f"{CONTROL_PLANE_URL}/content",
+                         json={"call_id": call_id,
+                               "payload": {"q": "personal data " + "x" * 900}},
+                         headers={"X-API-Key": WRITE_API_KEY})
+    assert wrote.status_code == 204, wrote.text[:300]
+
+    with relay("blackhole", _BLACKHOLE_PROXY, "cutblackhole",
+               marker=_ORDERED_MARKER, CUT_BLACKHOLE_SECONDS="20"):
+        deleted = _CLIENT.delete(f"{CONTROL_PLANE_URL}/content/{call_id}",
+                                 headers={"X-API-Key": WRITE_API_KEY})
+        log = _proxy_log(_BLACKHOLE_PROXY)
+
+    assert "blackholing immudb" in log, (
+        "the relay never blackholed ImmuDB, so this test is not exercising the "
+        f"condition it describes. Relay log: {log[-500:]}"
+    )
+    tombstone_key = f"content_erasure:{call_id}"
+    assert tombstone_key in _getall(headers, [tombstone_key]), (
+        "no tombstone reached the ledger, so this test is not exercising the "
+        "condition it describes: the attack is about a tombstone that "
+        "committed while the response could not say so"
+    )
+
+    assert deleted.status_code == 204, (
+        f"the erasure was refused while its tombstone was in the ledger: "
+        f"{deleted.status_code} {deleted.text[:300]}. The ledger says this "
+        "call_id was erased, the store still holds the payload, and content "
+        "writes for it are now frozen at 409."
+    )
+    again = _CLIENT.delete(f"{CONTROL_PLANE_URL}/content/{call_id}",
+                           headers={"X-API-Key": WRITE_API_KEY})
+    assert again.status_code == 204, again.text[:300]
+
+
+# ---------------------------------------------------------------------------
+# P3c3e-3: a retry the caller was wrongly told to make.
+# ---------------------------------------------------------------------------
+#
+# D39 and D40 are each correct and their interaction was not. A caller told
+# `committed: false` about a write that committed has two options and both are
+# wrong: believe the response and retry, which D39's KeyMustNotExist refuses
+# with 409 forever, or disbelieve it. The red team drove exactly that:
+#
+#     RETRY (relay gone) -> 409 {"detail": "a record is already committed
+#                                under this key (tool_call:p3c3dred-a4:...)"}
+#
+# P3c3e-2 removes the cause: the caller is no longer told that a write which
+# committed did not. These two tests establish the interaction is closed from
+# both ends - a caller who retries anyway is told plainly that the record
+# exists, and a caller whose write genuinely did not land is not refused.
+
+@requires_stack
+@requires_docker_cli
+def test_a_retry_after_a_dropped_response_is_told_the_record_already_exists():
+    """The retry the caller should no longer make, made anyway.
+
+    A 409 naming the key and saying a record is already committed under it is
+    an answer a caller can act on. `committed: false` followed by a bare
+    conflict is not.
+    """
+    headers = _immudb_headers()
+    agent = f"p3c3e-retry-{_ORDERED_MARKER}"
+    call_id = uuid.uuid4().hex
+    key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
+    value = _ordered_record(call_id, agent)
+
+    with relay("response", _ORDERED_PROXY, "cutresponse", marker=_ORDERED_MARKER):
+        first = _ordered_write(key, value)
+        log = _proxy_log(_ORDERED_PROXY)
+
+    body = first.json()
+    assert "dropping the" in log, (
+        "the relay never dropped a response, so this test is not exercising "
+        f"the condition it describes. Relay log: {log[-500:]}"
+    )
+    assert key in _getall(headers, [key]), (
+        f"the ExecAll did not reach the ledger: {body}"
+    )
+    assert body["committed"] is True, (
+        f"the caller is being told to retry a write that committed: {body}"
+    )
+
+    retried = _ordered_write(key, value)
+    assert retried.status_code == 409, (
+        f"a second write under a key the ledger already holds answered "
+        f"{retried.status_code}: {retried.text[:300]}"
+    )
+    detail = retried.json().get("detail", "")
+    assert key in detail and "already committed" in detail, (
+        "the refusal does not tell the caller that the record they are "
+        f"retrying already exists: {detail!r}"
+    )
+
+
+@requires_stack
+@requires_docker_cli
+def test_a_write_that_genuinely_did_not_land_can_be_retried():
+    """The other end of it: no legitimate retry is permanently denied.
+
+    The relay refuses every connection, so the ordered write fails before its
+    ExecAll reaches the wire. `committed: false` is a fact on that branch and
+    on no other, and the key is free. With the ledger back, the same key
+    written again succeeds - which is what makes `committed: false` an
+    instruction a caller can follow.
+    """
+    headers = _immudb_headers()
+    agent = f"p3c3e-legit-{uuid.uuid4().hex[:6]}"
+    call_id = uuid.uuid4().hex
+    key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
+    value = _ordered_record(call_id, agent)
+
+    with relay("drop-request", _DROP_REQUEST_PROXY, "cutdroprequest",
+               marker=agent, CUT_BLACKHOLE_SECONDS="5"):
+        failed = _ordered_write(key, value)
+        log = _proxy_log(_DROP_REQUEST_PROXY)
+
+    assert failed.status_code == 200, failed.text[:300]
+    body = failed.json()
+    assert "without relaying it" in log, (
+        "the relay never dropped the write request, so this test is not "
+        f"exercising the condition it describes. Relay log: {log[-500:]}"
+    )
+    assert body["verified"] is False, body
+    assert body["committed"] is not True, (
+        f"nothing reached the ledger and the response says it committed: {body}"
+    )
+    assert key not in _getall(headers, [key]), (
+        "the record reached the ledger through a relay that refuses every "
+        f"connection, so this test is not exercising its condition: {body}"
+    )
+
+    retried = _ordered_write(key, value)
+    assert retried.status_code == 200, (
+        f"the retry of a write that never landed was refused: "
+        f"{retried.status_code} {retried.text[:300]}"
+    )
+    again = retried.json()
+    assert again["verified"] is True and again["committed"] is True, (
+        f"a legitimate retry did not succeed: {again}"
+    )
+    assert key in _getall(headers, [key]), again

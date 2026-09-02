@@ -358,20 +358,30 @@ class WriteRequest(BaseModel):
 
 
 class WriteResponse(BaseModel):
-    """D35: three states, not two.
+    """D35: three states, not two. D45: four, because one of them was a guess.
 
     verified true                      the write committed and its proofs check out
     verified false, committed true     the write committed; its proof did not check
     verified false, committed false    the write did not happen
+    verified false, committed null     whether the write happened is not established
 
     The caller's rule is unchanged and still keyed on `verified`: anything
     but true raises in ledger/immudb_ledger.py and the decision service
     denies the call. `committed` is what stops the middle state being
     reported as the bottom one, which is the opposite of what happened.
+
+    D45 (Phase 3c-3e) adds the fourth. `committed: false` is a claim about
+    the ledger, and this service can only make it after reading the ledger.
+    When the write raised and the confirming read raised too, there is no
+    such claim to make, and the false one produced a tombstone in the ledger,
+    the payload still in the store, and content writes for that subject
+    frozen at 409. Null is not a fifth kind of failure for a caller to
+    handle: it is refused exactly like false, because `verified` is what
+    every caller keys on, and it differs only in what it says happened.
     """
     tx_id: int | None
     verified: bool
-    committed: bool = False
+    committed: bool | None = False
     error_class: str | None = None
     # The `ledger_fault:` key qualifying this record's standing, when one
     # was written. Null when nothing needed qualifying, and null with
@@ -395,17 +405,24 @@ class OrderedWriteRequest(BaseModel):
 
 
 class OrderedWriteResponse(BaseModel):
-    """Same three states as WriteResponse, plus the allocated position.
+    """Same four states as WriteResponse, plus the allocated position.
 
     On a committed-unverified write the position is reported too: the
     ExecAll that committed the record committed the counter advance and the
     index entry with it, so a response withholding `seq` would describe a
     record as unpositioned while the index holds its position.
+
+    D45 (Phase 3c-3e): `seq` is reported on the committed-then-cut branch as
+    well, and it is confirmed against the view index rather than asserted
+    from what this process intended to write. `seq: null` beside
+    `committed: true` means the record is in the ledger and its position
+    could not be confirmed, which is a different statement from position
+    zero and from no position at all.
     """
     tx_id: int | None
     seq: int | None
     verified: bool
-    committed: bool = False
+    committed: bool | None = False
     attempts: int = 0
     error_class: str | None = None
     fault_record: str | None = None
@@ -583,7 +600,20 @@ def _set_without_verification(client, key: bytes, value: bytes) -> int:
     refuses any record that is not a fault record, so the only caller that
     gets through is _write_fault_record below; both write routes refuse a
     ledger_fault arriving from outside (D39); and no parameter on either
-    route selects this path. tests/test_ledger_faults.py asserts both halves.
+    route selects this path. tests/test_ledger_faults.py drives the guard
+    with a stub client, and tests/test_route_parity.py asserts over every
+    write route that a failed proof makes exactly one unverified write whose
+    bytes are a fault record about the record just committed.
+
+    **What is NOT bounded, stated rather than implied (P3c3e-9, Phase
+    3c-3e).** How many callers this function has. A static parse counted them
+    until this phase and was defeated three times - a plainly-named second
+    caller, an alias binding, and `globals()[...]` / `getattr(sys.modules
+    [__name__], ...)`, which carry the name only as a string literal and are
+    invisible to any reference walk. It is retired rather than repaired,
+    because a source parse is not a control against anything that can write
+    Python. The guard bounds what this path WRITES; nothing bounds how many
+    callers reach it. See README section 5.
 
     The condition that produces a fault is precisely the condition that
     breaks every proof, so requiring a verified write here would mean the
@@ -668,6 +698,35 @@ def _set_without_verification(client, key: bytes, value: bytes) -> int:
 # over-width returns empty (keyprobe report section 4).
 FAULT_KEY_TX_PAD = 20
 
+# P3c3e-6 (Phase 3c-3e): the ledger's own maximum key length, measured.
+#
+# `POST /api/v2/db/set` on this ImmuDB accepts a key of 1023 bytes and answers
+# HTTP 500 "max key length exceeded" at 1024. Measured on the running stack at
+# 1000, 1020, 1023, 1024, 1025, 1030 and 1050 bytes.
+#
+# Why this is here rather than left to the ledger to refuse. The fault key
+# carried a caller-supplied `call_id` unvalidated, so a `call_id` past about
+# a thousand characters pushed the whole key past this bound and NO FAULT
+# RECORD WAS WRITTEN. Driven by the Phase 3c-3d red team (A1) under a live
+# proof failure, control first:
+#
+#     32-char call_id   -> fault_record ledger_fault:...:36eac951...:21c158f1
+#                          page row carries the fault
+#     1200-char call_id -> fault_record null, "max key length exceeded"
+#                          page row: {"outcome_type": "policy_allow",
+#                                     "ledger_fault": null}
+#
+# A committed record whose write-time proof failed, on the audit page reading
+# `policy_allow` with nothing recording why - which is exactly the condition
+# D35 says the fault record exists to remove, selected by the caller by
+# choosing its own call_id.
+MAX_LEDGER_KEY_BYTES = 1023
+
+# What is left for the identity once the fixed parts are spent:
+# "ledger_fault:" + 20 digits + ":" + identity + ":" + 16 hex nonce.
+FAULT_KEY_FIXED_BYTES = len(FAULT_KEY_PREFIX) + FAULT_KEY_TX_PAD + 1 + 1 + 16
+MAX_FAULT_IDENTITY_BYTES = MAX_LEDGER_KEY_BYTES - FAULT_KEY_FIXED_BYTES
+
 
 def fault_key_tx_bound(tx_id: int) -> str:
     """`ledger_fault:{tx_id:020d}` - the bound a page-side range read is built
@@ -697,15 +756,75 @@ def _fault_identity(record_value: bytes, record_key: bytes) -> str:
     except Exception:
         call_id = None
     if call_id:
-        return str(call_id)
+        identity = str(call_id)
+        # P3c3e-6 (Phase 3c-3e): the call_id is caller-supplied and goes into
+        # a key, so it is bounded here rather than at the ledger. Past the
+        # budget it is refused AS AN IDENTITY and the digest fallback is used
+        # instead, so the fault is still written; the alternative - letting
+        # the ledger refuse the key - is how a committed record ended up on
+        # the page unqualified with `ledger_fault: null`.
+        #
+        # Nothing is lost by the substitution. A fault joins onto its record
+        # by `committed_key`, not by identity, and the fallback is derivable
+        # from a page row: the row's `ledger_key` is the base64 raw key and
+        # the fallback is sha256 of those bytes.
+        if len(identity.encode("utf-8", "replace")) <= MAX_FAULT_IDENTITY_BYTES:
+            return identity
+        logger.error(
+            "The call_id on the record at key %s is %d bytes and a fault key "
+            "has %d for its identity component, so this fault is keyed by the "
+            "digest of the record key instead. The fault is written either "
+            "way; the call_id is not a usable key component at this length.",
+            record_key.decode("utf-8", "replace")[:120],
+            len(identity.encode("utf-8", "replace")), MAX_FAULT_IDENTITY_BYTES,
+        )
     return "key:" + hashlib.sha256(record_key).hexdigest()[:32]
 
 
 def _fault_key(record_value: bytes, record_key: bytes, committed_tx_id: int,
                nonce: str) -> str:
-    """The composite key, assembled from its three named parts."""
+    """The composite key, assembled from its three named parts.
+
+    P3c3e-6: the assembled key is checked against the ledger's own maximum
+    before it is handed to the ledger. `_fault_identity` bounds the one
+    component that is caller-supplied, so reaching this raise means an
+    invariant in this module is broken rather than that a caller found
+    something - and a fault key that cannot be written has to fail here,
+    loudly, and not silently at the ledger where the failure lands on a
+    response the middleware discards.
+    """
     identity = _fault_identity(record_value, record_key)
-    return f"{fault_key_tx_bound(committed_tx_id)}:{identity}:{nonce}"
+    key = f"{fault_key_tx_bound(committed_tx_id)}:{identity}:{nonce}"
+    encoded = len(key.encode("utf-8", "replace"))
+    if encoded > MAX_LEDGER_KEY_BYTES:
+        raise ValueError(
+            f"the fault key for the record at transaction {committed_tx_id} "
+            f"would be {encoded} bytes and this ledger refuses a key above "
+            f"{MAX_LEDGER_KEY_BYTES}. A fault that cannot be written must fail "
+            "here: a qualification that silently does not exist leaves a "
+            "committed record on the page with nothing recording why its "
+            "proof failed, which is the condition this record exists to "
+            "remove."
+        )
+    return key
+
+
+def _fault_failure_detail(fault_error: str | None) -> str:
+    """The sentence a response carries when the qualification was not written.
+
+    P3c3e-6 (Phase 3c-3e). `fault_record_error` has always been on the
+    response and the middleware discards the response, so the only place an
+    unwritten fault was visible was the verifier's own log. It is in `detail`
+    now as well, which is the field every caller that logs anything logs, and
+    it says what the absence means rather than naming an exception.
+    """
+    if not fault_error:
+        return ""
+    return (
+        f". NO FAULT RECORD WAS WRITTEN for this record ({fault_error}), so "
+        "nothing durable records why its proof failed and the audit page will "
+        "show it with ledger_fault null"
+    )
 
 
 def _write_fault_record(client, *, record_key: bytes, record_value: bytes,
@@ -721,10 +840,70 @@ def _write_fault_record(client, *, record_key: bytes, record_value: bytes,
     is leave a committed record unqualified with nothing recording why, which
     is the condition this record exists to remove.
     """
+    # P3c3e-7 (Phase 3c-3e): the transaction in the key is DERIVED from the
+    # committed record, not taken from the caller of this function.
+    #
+    # The key's leading component is what places a fault in a page's
+    # transaction window, and the body carries `committed_tx_id` as well. A
+    # fault keyed at a transaction its record does not occupy is invisible at
+    # HTTP 200 - it falls outside the window of the page its record is on, so
+    # nothing fetches it, and nothing on the reading side can compare two
+    # numbers it never sees. The red team drove exactly that (A2): record at
+    # transaction 100, fault keyed at 1000100, page row `ledger_fault: null`,
+    # no error and no log line.
+    #
+    # Derivation rather than a cross-check, because it is available on both
+    # fault-producing paths: both reach here immediately after a commit, and
+    # the read is a plain `get`, which is what `_committed_tx_for` already
+    # relies on when a proof has just failed. So the two numbers cannot
+    # disagree - there is only one, and it comes from the ledger.
+    #
+    # `tx_id` is still passed in and is still used, for the body and for the
+    # response, and it is cross-checked against the derived value. A
+    # disagreement is not silently smoothed over: it means this process's
+    # account of the write and the ledger's disagree, and a qualification
+    # written under either number would be a claim neither supports.
+    state, derived_tx = _committed_tx_for_value(client, record_key, record_value)
+    if state != PRESENT:
+        message = (
+            f"the record this fault would qualify is {state} in the ledger, so "
+            "the transaction its key must carry cannot be derived. No fault "
+            "record was written."
+        )
+        logger.error(
+            "FAULT RECORD NOT WRITTEN for committed tx=%s key=%s: %s The record "
+            "stands in the ledger with nothing recording why its proof failed.",
+            tx_id, record_key.decode("utf-8", "replace"), message,
+        )
+        return None, message
+    if tx_id is not None and int(tx_id) != derived_tx:
+        message = (
+            f"this write reported transaction {tx_id} and the ledger holds "
+            f"these bytes at {derived_tx}. A fault key names the transaction "
+            "its record occupies, and a fault keyed at any other transaction "
+            "is absent from that record's page. No fault record was written."
+        )
+        logger.error(
+            "FAULT RECORD NOT WRITTEN for key=%s: %s",
+            record_key.decode("utf-8", "replace"), message,
+        )
+        return None, message
+    tx_id = derived_tx
+
     # D38: the nonce is minted here, once per fault, and is what makes two
     # faults about one record two records rather than two versions of one.
     nonce = uuid.uuid4().hex[:16]
-    key = _fault_key(record_value, record_key, tx_id, nonce)
+    try:
+        key = _fault_key(record_value, record_key, tx_id, nonce)
+    except ValueError as exc:
+        # P3c3e-6: a key that cannot be written fails at construction, and
+        # loudly. It used to reach the ledger and be refused there, on a
+        # response field the middleware discards.
+        logger.error(
+            "FAULT RECORD NOT WRITTEN for committed tx=%s key=%s: %s",
+            tx_id, record_key.decode("utf-8", "replace"), exc,
+        )
+        return None, f"{type(exc).__name__}: {exc}"
     fault = {
         "record_type": FAULT_RECORD_TYPE,
         "fault_class": "write_verification_failed",
@@ -943,8 +1122,23 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
         # than inferring one - the exception carries no transaction id, and
         # a response that guessed would be the same kind of claim this item
         # exists to remove.
-        tx_id = _committed_tx_for(client, key)
-        if tx_id is None:
+        state, tx_id = _committed_tx_for(client, key)
+        if state == UNKNOWN:
+            # D45: the proof failed, which means the commit already happened,
+            # and the read that would name its transaction could not run.
+            # Reporting `committed: false` here would describe a record that
+            # is in the ledger as never having been written.
+            logger.error(
+                "verifiedSet: proof failed and the ledger could not be read back; "
+                "the commit precedes the proof, so whether a record is present "
+                "under this key is not established"
+            )
+            return WriteResponse(
+                tx_id=None, verified=False, committed=None, error_class=error_class,
+                detail="proof verification failed and the ledger could not be "
+                       "read back; whether the record committed is not established",
+            )
+        if state == ABSENT:
             # Nothing under this key: the write genuinely did not land, and
             # the bottom state is the honest one.
             logger.error("verifiedSet: proof failed and no record is present for the key")
@@ -960,7 +1154,7 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
             tx_id=tx_id, verified=False, committed=True, error_class=error_class,
             fault_record=fault_key, fault_record_error=fault_error,
             detail="proof verification failed; the record committed at "
-                   f"transaction {tx_id}",
+                   f"transaction {tx_id}" + _fault_failure_detail(fault_error),
         )
     except Exception as exc:
         # D40 (Phase 3c-3d): committed describes what is in the ledger, not
@@ -983,8 +1177,22 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
         # not fail, it could not be attempted, and that is not tamper evidence
         # - the same rule the ordered route's corresponding branch applies.
         logger.error("verifiedSet error: %s", exc)
-        tx_id = _committed_tx_for_value(client, key, value)
-        if tx_id is None:
+        state, tx_id = _committed_tx_for_value(client, key, value)
+        if state == UNKNOWN:
+            # D45: the write raised AND the read that would settle it could
+            # not run. Neither `committed: true` nor `committed: false` is a
+            # fact here, and the second one is the guess the red team drove
+            # all the way to an unerasable subject record.
+            logger.error(
+                "verifiedSet: the write raised and the ledger could not be read "
+                "back, so whether the record committed is not established: %s", exc,
+            )
+            return WriteResponse(
+                tx_id=None, verified=False, committed=None,
+                detail=f"{exc}; the ledger could not be read back, so whether "
+                       "the record committed is not established",
+            )
+        if state == ABSENT:
             return WriteResponse(tx_id=None, verified=False, committed=False,
                                  detail=str(exc))
         logger.error(
@@ -1015,26 +1223,52 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
     return WriteResponse(tx_id=resp.id, verified=True, committed=True)
 
 
-def _committed_tx_for_value(client, key: bytes, value: bytes) -> int | None:
-    """The transaction holding exactly these bytes under `key`, or None.
+# D45 (Phase 3c-3e): a read that could not run is not a read that found
+# nothing.
+#
+# Both helpers below answered `None` for two different facts - the ledger
+# holds nothing under this key, and this process could not ask. D40 made
+# `committed` a fact about the ledger and then collapsed those two onto the
+# same answer, so the one branch that exists to stop a guess made one
+# whenever the confirming read was itself unavailable. Driven live by the
+# Phase 3c-3d red team (A4.2): a relay that dropped the write's response and
+# then refused every connection for 25 seconds produced
+# `{tx_id: null, verified: false, committed: false}` with the record at
+# transaction 118, and on the erasure path the same cut gave DELETE 503, the
+# tombstone committed at 121, 772 bytes of payload still in the store and
+# content writes for that call_id frozen at 409.
+#
+# Three answers, so the caller is never told a fact this service does not
+# have. `unknown` is what a response reports as `committed: null`.
+PRESENT = "present"
+ABSENT = "absent"
+UNKNOWN = "unknown"
+
+
+def _committed_tx_for_value(client, key: bytes, value: bytes) -> tuple[str, int | None]:
+    """`(state, tx)` for exactly these bytes under `key`.
 
     D40. Stricter than _committed_tx_for below, and deliberately so: it is
     called when nothing is known about whether the write landed, so a record
     that was already under this key before the call must not be reported as
     the call's own. Byte equality is the whole check, and it is exact.
+
+    D45: a read that raised answers `unknown`, never `absent`. A record under
+    this key holding *different* bytes is `absent` and not `unknown` - that
+    is an answer, and it is the answer that says this write did not land.
     """
     try:
         got = client.get(key)
     except Exception as exc:
         logger.error("Could not read back a key whose write raised: %s", exc)
-        return None
+        return UNKNOWN, None
     if got is None or got.value != value:
-        return None
-    return int(got.tx)
+        return ABSENT, None
+    return PRESENT, int(got.tx)
 
 
-def _committed_tx_for(client, key: bytes) -> int | None:
-    """The transaction holding `key`, or None if the ledger holds nothing.
+def _committed_tx_for(client, key: bytes) -> tuple[str, int | None]:
+    """`(state, tx)` for whatever the ledger holds under `key`.
 
     Read with a plain `get`, deliberately: this is called when a proof has
     just failed, so a verified read would fail the same way and answer
@@ -1042,15 +1276,21 @@ def _committed_tx_for(client, key: bytes) -> int | None:
     present under this key at this transaction. It is the same question the
     caller would ask, asked here so the caller does not have to guess from a
     response that withheld it.
+
+    D45: `unknown` when the read could not run. On this path the commit is
+    already known to have happened - `verifiedSet` commits at
+    service.VerifiableSet and every proof failure is raised after that line -
+    so answering `absent` here reported a committed record as never having
+    been written, which is the same false claim D40 removed one branch over.
     """
     try:
         got = client.get(key)
     except Exception as exc:
         logger.error("Could not read back a key whose proof failed: %s", exc)
-        return None
+        return UNKNOWN, None
     if got is None:
-        return None
-    return int(got.tx)
+        return ABSENT, None
+    return PRESENT, int(got.tx)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1469,33 @@ class ReserveMismatch(RuntimeError):
     """The ledger's bound reserve is not the reserve this service is configured
     with. Fail closed: a writer allocating against one seam and a reader
     paging against another is the condition D36 exists to make impossible."""
+
+
+class OrderedCommitUncertain(RuntimeError):
+    """The ExecAll was issued and its outcome is not known to this process.
+
+    D45 (Phase 3c-3e). The ordered write is one `ExecAll`, and everything
+    before it - the reserve read, the counter read, the ceiling check - can
+    fail with nothing written. Once the request is on the wire that stops
+    being true, and the two cases need different answers: before it,
+    `committed: false` is a fact; at or after it, it is a guess, and the
+    guess is what the Phase 3c-3d red team drove. A relay that let the
+    ExecAll commit and dropped its response left the record at transaction
+    55, the counter advanced, the index entry at position 1000000017 and the
+    row on `/audit` reading `policy_allow`, while the response said the write
+    did not happen.
+
+    Carries what the route needs in order to ask the ledger instead of
+    guessing: the position this attempt would have allocated, and how many
+    attempts the commit actually took. `attempts` was reported as 0 on this
+    branch while the commit had taken one.
+    """
+
+    def __init__(self, cause: Exception, attempted_seq: int, attempts: int):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.attempted_seq = attempted_seq
+        self.attempts = attempts
 
 
 # Cached so reading it costs no round trip per write. Re-read at cold start
@@ -1461,9 +1728,18 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
                     _seq_cache = None
                 _reserve_cache = None
                 continue
-            raise
+            # D45: the request was on the wire when this raised, so whether
+            # it committed is not known here. Everything above this call can
+            # fail with nothing written; from here it cannot, and the two
+            # need different answers.
+            raise OrderedCommitUncertain(exc, next_seq, attempts) from exc
 
-        tx_id = int(resp.id)
+        try:
+            tx_id = int(resp.id)
+        except Exception as exc:
+            # Same reason: the ExecAll returned, so it committed, and this is
+            # a response this process could not read.
+            raise OrderedCommitUncertain(exc, next_seq, attempts) from exc
         with _seq_lock:
             _seq_cache = (next_seq, tx_id)
         if bound_reserve is None:
@@ -1474,6 +1750,40 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
         f"sequence allocation gave up after {attempts} rejected attempts; "
         "the ledger write did not happen"
     )
+
+
+def _committed_position_for(client, view_set: bytes, key: bytes,
+                            attempted_seq: int) -> int | None:
+    """The position this key actually holds in `view_set`, or None.
+
+    D45 (Phase 3c-3e). The ordered write's ExecAll writes the record, the
+    counter advance and the zAdd together, so a record confirmed present in
+    the ledger holds the position that ExecAll carried. `attempted_seq` is
+    what this process was going to write and is therefore a claim, not a
+    fact: it is used only as the bound of the read that confirms it, and the
+    position is reported only when the index agrees.
+
+    Bounded to exactly one score, which is why this is not a walk: the
+    question is whether THIS key is at THIS position, and a zScan bounded to
+    `[seq, seq]` answers it in one call. A view that does not answer, or
+    answers with some other key, gives None - reported as `seq: null` beside
+    `committed: true`, which says the record is in the ledger and its
+    position is not confirmed.
+    """
+    try:
+        entries = client.zScan(zset=view_set, minscore=float(attempted_seq),
+                               maxscore=float(attempted_seq), limit=100)
+    except Exception as exc:
+        logger.error(
+            "Could not confirm the position of a record whose write raised: %s", exc)
+        return None
+    for entry in getattr(entries, "entries", []) or []:
+        member = getattr(entry, "key", None)
+        if member is None:
+            member = getattr(getattr(entry, "entry", None), "key", None)
+        if member == key:
+            return attempted_seq
+    return None
 
 
 @app.post("/write-ordered", response_model=OrderedWriteResponse)
@@ -1529,9 +1839,17 @@ def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write
         logger.error("Refused an ordered write: %s", refusal)
         raise HTTPException(status_code=400, detail=refusal)
 
-    # Split from the commit deliberately: everything before this line can
-    # fail without anything having been written, and everything after it
-    # has a committed transaction to report.
+    # P3c3e-2 (Phase 3c-3e): the sentence that used to be here said
+    # "everything before this line can fail without anything having been
+    # written". That was false, and it is the sentence that would have caught
+    # A4.1. `_ordered_commit` issues the ExecAll inside this block, so a
+    # failure raised out of it can be a failure of a write that committed.
+    #
+    # Which one it is, is now carried by the exception type rather than
+    # assumed: OrderedCommitUncertain means the request reached the wire, and
+    # any other exception means it did not. The uncertain case asks the
+    # ledger; the certain case is the only one that may answer
+    # `committed: false` without reading anything.
     try:
         client = _get_client()
         tx_id, seq, attempts = _ordered_commit(client, key, value, view_set)
@@ -1542,8 +1860,51 @@ def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write
         # conflict is with the ledger's existing state.
         logger.error("Refused an ordered write: %s", exc)
         raise HTTPException(status_code=409, detail=str(exc))
+    except OrderedCommitUncertain as exc:
+        # D40 on this route, which never got it (red-team A4.1). The ExecAll
+        # was issued; whether it committed is a question for the ledger and
+        # not for this process's opinion of its own RPC. Asked with the value
+        # as well as the key, exactly as POST /write asks it: a record that
+        # was already under this key is not this write.
+        logger.error("ordered write error after the ExecAll was issued: %s", exc.cause)
+        state, tx_id = _committed_tx_for_value(client, key, value)
+        if state == UNKNOWN:
+            # D45: neither answer is a fact. Reported as such rather than as
+            # the bottom state, which is what put a committed record's row on
+            # `/audit` while the response said the write did not happen.
+            logger.error(
+                "ordered write: the ExecAll was issued and the ledger could not "
+                "be read back, so whether the record committed is not established"
+            )
+            return OrderedWriteResponse(
+                tx_id=None, seq=None, verified=False, committed=None,
+                attempts=exc.attempts,
+                detail=f"{exc.cause}; the ledger could not be read back, so "
+                       "whether the record committed is not established",
+            )
+        if state == ABSENT:
+            return OrderedWriteResponse(
+                tx_id=None, seq=None, verified=False, committed=False,
+                attempts=exc.attempts, detail=str(exc.cause),
+            )
+        seq = _committed_position_for(client, view_set, key, exc.attempted_seq)
+        logger.error(
+            "ordered write: the response was lost and the record is in the ledger "
+            "at tx=%s position=%s: %s", tx_id, seq, exc.cause,
+        )
+        return OrderedWriteResponse(
+            tx_id=tx_id, seq=seq, verified=False, committed=True,
+            attempts=exc.attempts,
+            detail=f"the ordered write's own response was not received ({exc.cause}); "
+                   f"the record committed at transaction {tx_id}"
+                   + (f" and holds position {seq}" if seq is not None
+                      else " and its position could not be confirmed"),
+        )
     except Exception as exc:
-        logger.error("ordered write error: %s", exc)
+        # Nothing reached the wire: the client could not be built, the
+        # reserve disagreed, the ceiling was reached, or the retry budget ran
+        # out. `committed: false` is a fact on this branch and on no other.
+        logger.error("ordered write error before the ExecAll was issued: %s", exc)
         return OrderedWriteResponse(
             tx_id=None, seq=None, verified=False, committed=False, detail=str(exc),
         )
@@ -1571,7 +1932,8 @@ def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write
             error_class=error_class, fault_record=fault_key,
             fault_record_error=fault_error,
             detail=f"proof verification failed; the record committed at transaction "
-                   f"{tx_id} and holds position {seq}",
+                   f"{tx_id} and holds position {seq}"
+                   + _fault_failure_detail(fault_error),
         )
     except Exception as exc:
         # The proof did not fail, the check could not be made. The record is
