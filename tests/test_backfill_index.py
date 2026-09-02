@@ -115,13 +115,23 @@ def _view_rows(headers: dict) -> dict[str, list[float]]:
 
 
 def _pad_view_past_the_ceiling(headers: dict, target: int = 2600) -> int:
-    """Bring the decision view above zscan's 2500-row ceiling.
+    """Bring THIS MODULE's own rows in the decision view above zscan's
+    2500-row ceiling.
 
     Records and their index entries in the same execall, in batches, because
     2600 round trips is minutes and 26 is seconds. Each row is a real record
     under a real key, which is what the snapshot has to see.
+
+    **P3c3e-10 (Phase 3c-3e): counted over this module's own rows, not over
+    the view.** It used to subtract everything already in the view, so on a
+    ledger another module had written to it padded fewer rows and this
+    module's own contribution fell below the ceiling - which matters now that
+    the duplication assertion below is scoped to this module's records
+    (D44). The view is still taken past the ceiling either way; what changed
+    is that this module's rows are what take it there, so the pass has to
+    page over them.
     """
-    existing = len(_view_rows(headers))
+    existing = len([key for key in _view_rows(headers) if "p3c3c-pad" in key])
     needed = max(0, target - existing)
     written = 0
     batch, score = [], _PAD_SCORE_BASE + existing
@@ -158,8 +168,11 @@ def test_one_pass_over_a_view_past_the_ceiling_leaves_no_record_at_two_positions
     thing that should be trusted here.
     """
     headers = _headers()
-    total = _pad_view_past_the_ceiling(headers)
-    assert total > 2500, f"the view is {total} rows, not past the ceiling"
+    padded = _pad_view_past_the_ceiling(headers)
+    assert padded > 2500, (
+        f"this module holds {padded} rows in the view, not past the ceiling"
+    )
+    assert len(_view_rows(headers)) > 2500, "the view is not past the ceiling"
 
     # Records with no index entry at all, which is what the pass exists for.
     unindexed = []
@@ -176,11 +189,32 @@ def test_one_pass_over_a_view_past_the_ceiling_leaves_no_record_at_two_positions
     summary = bf.backfill()
     assert summary["total_indexed"] >= len(unindexed), summary
 
+    # D44 (Phase 3c-3e): scoped to the records this module writes.
+    #
+    # This asserted over every key in the view. `tests/test_reconciliation.py`
+    # gives a record a second position on purpose, to prove the reconciler
+    # reports one, so the ledger-wide form failed whenever that module was
+    # collected first - which alphabetical collection happens to prevent and
+    # nothing else did.
+    #
+    # The scope is what this module wrote, and that is exactly where C2's
+    # defect appears: the pad rows are the ones past the snapshot's ceiling
+    # that got indexed a second time (25 of them, at 2535 rows), and the
+    # unindexed rows are the ones the pass exists to pick up. The ledger-wide
+    # statement is in tests/test_view_invariants.py, where the deliberate
+    # violations are named and argued for.
     rows = _view_rows(headers)
-    duplicated = {k: v for k, v in rows.items() if len(set(v)) > 1}
+    mine = {key: scores for key, scores in rows.items()
+            if "p3c3c-pad" in key or "p3c3c-unindexed" in key}
+    assert len(mine) > 2500, (
+        f"only {len(mine)} of this module's own rows are in the view, so one "
+        "pass over it says nothing about the snapshot's ceiling"
+    )
+    duplicated = {k: v for k, v in mine.items() if len(set(v)) > 1}
     assert not duplicated, (
-        f"{len(duplicated)} record(s) hold more than one position after a single "
-        f"backfill pass: {dict(list(duplicated.items())[:5])}"
+        f"{len(duplicated)} record(s) written by this module hold more than "
+        f"one position after a single backfill pass: "
+        f"{dict(list(duplicated.items())[:5])}"
     )
     for key in unindexed:
         assert key in rows, f"the pass did not index {key}"
@@ -197,14 +231,15 @@ def test_the_snapshot_sees_rows_beyond_the_first_page():
     it and this returns exactly the ceiling.
     """
     headers = _headers()
-    total = _pad_view_past_the_ceiling(headers)
+    _pad_view_past_the_ceiling(headers)
+    in_view = len(_view_rows(headers))
     bf = _backfill_module()
     with httpx.Client(timeout=120.0) as client:
         seen = bf.indexed_keys(client, bf.login(client), VIEW_DECISION)
     assert len(seen) > bf.SCAN_PAGE, (
-        f"the index snapshot stopped at {len(seen)} keys with {total} rows in the "
-        f"view and a page size of {bf.SCAN_PAGE}; every row past the ceiling is "
-        "invisible to it and will be indexed a second time"
+        f"the index snapshot stopped at {len(seen)} keys with {in_view} rows in "
+        f"the view and a page size of {bf.SCAN_PAGE}; every row past the ceiling "
+        "is invisible to it and will be indexed a second time"
     )
 
 

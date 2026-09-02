@@ -186,6 +186,48 @@ def _zscan(headers: dict, view_set: str, limit: int = 2500, desc: bool = True) -
     return resp.json().get("entries", [])
 
 
+def _view_rows_paged(headers: dict, view_set: str) -> list[tuple[str, float]]:
+    """Every (key, position) in a view, paged past zscan's 2500-row ceiling.
+
+    P3c3e-10 (Phase 3c-3e). `_zscan` above asks for one page at the ceiling,
+    which is the right shape for the tests that are about what a page holds.
+    A test asking whether ONE record is indexed cannot use it: once any module
+    takes the view past 2500 rows the answer becomes "not on the first page",
+    which is a different question.
+    """
+    out: list[tuple[str, float]] = []
+    seen: set[tuple[str, float]] = set()
+    min_score = None
+    while True:
+        body = {"set": _b64(view_set), "desc": False, "limit": 2500}
+        if min_score is not None:
+            body["minScore"] = {"score": min_score}
+        resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/zscan", json=body,
+                            headers=headers)
+        resp.raise_for_status()
+        rows = resp.json().get("entries", [])
+        if not rows:
+            break
+        before = len(seen)
+        for row in rows:
+            key = base64.b64decode(row["entry"]["key"]).decode("utf-8", "replace")
+            score = float(row.get("score", 0.0))
+            if (key, score) in seen:
+                continue
+            seen.add((key, score))
+            out.append((key, score))
+        min_score = float(rows[-1].get("score", 0.0))
+        if len(rows) < 2500 or len(seen) == before:
+            break
+    return out
+
+
+def _positions_in_view(headers: dict, view_set: str, key: str) -> list[float]:
+    """Which positions this key holds in this view. Empty means unindexed."""
+    return [score for member, score in _view_rows_paged(headers, view_set)
+            if member == key]
+
+
 def _counter(headers: dict) -> tuple[int, int] | None:
     """(value, tx it was last modified at), or None if never written.
 
@@ -935,29 +977,61 @@ def test_a_record_written_before_the_index_appears_in_the_ordered_page_after_bac
     _write_historical(key, _decision_value(call_id, agent))
 
     encoded = _b64(key)
+    headers = _immudb_headers()
 
-    # Deep enough to cover the whole ledger. Backfilled history is scored
-    # below every allocated position because it *is* older, so on a
-    # newest-first page it sits at the back - a shallow page not reaching it
-    # would say nothing about whether it is indexed.
-    before = _audit(limit=2500)
-    assert before["has_more"] is False, (
-        "the page does not cover the ledger, so absence from it would not "
-        "establish that the record is unindexed"
-    )
-    assert encoded not in [e["ledger_key"] for e in before["entries"]], (
-        "a record written with no index entry was already on the page, so "
+    # D44 (Phase 3c-3e): the precondition is established about this record,
+    # not about the size of the ledger.
+    #
+    # It used to be `before["has_more"] is False` at limit 2500 - "the page
+    # covers the whole ledger, so absence from it means unindexed". That is a
+    # ledger-wide claim this test does not control, and it stops being true
+    # the moment any other module takes the view past the page ceiling, which
+    # tests/test_backfill_index.py does on purpose. The condition actually
+    # under test is that the record has no entry in the view index, and that
+    # is asked of the index directly.
+    assert not _positions_in_view(headers, VIEW_DECISION, key), (
+        "a record written through POST /write already has an index entry, so "
         "this test cannot establish that the backfill is what put it there"
+    )
+    assert encoded not in [e["ledger_key"] for e in _audit(limit=2500)["entries"]], (
+        "a record with no index entry is on the ordered page, which selects "
+        "through the index"
     )
 
     summary = ail_backfill_index.backfill()
     assert summary["total_indexed"] >= 1, summary
 
-    after = _audit(limit=2500)
-    assert encoded in [e["ledger_key"] for e in after["entries"]], (
-        "a pre-index record is still absent from the ordered page after the "
-        f"backfill ran. backfill reported: {summary}"
+    indexed = _positions_in_view(headers, VIEW_DECISION, key)
+    assert len(indexed) == 1, (
+        "a pre-index record is still absent from the view index after the "
+        f"backfill ran, or holds more than one position: {indexed}. backfill "
+        f"reported: {summary}"
     )
+    assert indexed[0] <= RESERVED_POSITIONS, (
+        f"the backfill scored a historical record at {indexed[0]}, above the "
+        f"reserve of {RESERVED_POSITIONS}"
+    )
+
+    # And on the page, which is the point of indexing it at all. Stated in
+    # both directions, so the ledger's size cannot make it vacuous: either the
+    # record is on the page, or the page is full of rows that sort above it
+    # and its absence is the page's own boundary rather than a missing index
+    # entry. `/audit` is newest-first over the view and serves at most
+    # `min(limit + 1, 2500) - 1` rows.
+    page_limit = min(2500 + 1, 2500) - 1
+    after = _audit(limit=2500)
+    if encoded not in [e["ledger_key"] for e in after["entries"]]:
+        assert after["has_more"] is True, (
+            "the page covers everything behind it and the backfilled record "
+            f"is not on it. backfill reported: {summary}"
+        )
+        above = [score for _member, score in _view_rows_paged(headers, VIEW_DECISION)
+                 if score > indexed[0]]
+        assert len(above) >= page_limit, (
+            f"the record holds position {indexed[0]} and only {len(above)} "
+            f"rows sort above it, so a page of {page_limit} rows would reach "
+            "it. Its absence is not explained by the page's own boundary."
+        )
 
 
 @requires_stack
@@ -979,34 +1053,54 @@ def test_the_seam_is_monotone_across_the_boundary():
     old_key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
     _write_historical(old_key, _decision_value(uuid.uuid4().hex, agent))
     ail_backfill_index.backfill()
-    _new_decision()
+    new_key, _written = _new_decision()
 
     headers = _immudb_headers()
-    rows = _zscan(headers, VIEW_DECISION, limit=2500)
-    scores = [float(r.get("score", 0.0)) for r in rows]
 
-    history = [x for x in scores if x <= RESERVED_POSITIONS]
-    live = [x for x in scores if x > RESERVED_POSITIONS]
+    # D44 (Phase 3c-3e): scoped to the two records this test wrote.
+    #
+    # This used to assert over every row in the view. Two of its three
+    # assertions are true of the whole view and one is not - the suite
+    # deliberately injects a fractional position and two synthetic historical
+    # scores, to prove three detectors fire - so the ledger-wide form failed
+    # in reverse order, in two of three shuffles, and on any second run
+    # without `down -v`, while passing in CI because collection is
+    # alphabetical (docs/reports/phase-3c3d-order-sweep.md).
+    #
+    # The ledger-wide statements did not go away. They are in
+    # tests/test_view_invariants.py, addressed to every row the suite did not
+    # deliberately break, with the deliberate ones named and argued for in
+    # tests/ledger_pollution.py. What is left here is what this test can
+    # honestly say: about the two records it wrote.
+    old_positions = _positions_in_view(headers, VIEW_DECISION, old_key)
+    new_positions = _positions_in_view(headers, VIEW_DECISION, new_key)
+    assert len(old_positions) == 1 and len(new_positions) == 1, (
+        "this test wrote a backfilled record and an allocated one, and the "
+        f"view holds {old_positions} and {new_positions} for them, so there "
+        "is no seam here to check"
+    )
+    old_score, new_score = old_positions[0], new_positions[0]
+    old_tx = int(_getall(headers, [old_key])[old_key]["tx"])
 
-    assert history, "no backfilled history to check the seam against"
-    assert live, "no allocated positions to check the seam against"
-    assert max(history) < min(live), (
-        f"the seam is not monotone: highest historical position {max(history)} "
-        f"is not below lowest allocated position {min(live)}"
+    assert old_score <= RESERVED_POSITIONS, (
+        f"the record written before the index holds position {old_score}, "
+        f"above the reserve of {RESERVED_POSITIONS} that history occupies"
     )
-    assert all(float(x).is_integer() for x in live), (
-        "an allocated position is not an integer, so it did not come from the counter"
+    assert new_score > RESERVED_POSITIONS, (
+        f"the record written through the ordered route holds position "
+        f"{new_score}, inside the reserve"
     )
-
-    # Within history, the position IS the transaction id, so score order and
-    # commit order are the same order by construction.
-    by_score = sorted(
-        ((float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in rows
-         if float(r.get("score", 0.0)) <= RESERVED_POSITIONS)
+    assert old_score < new_score, (
+        f"the seam is not monotone across these two records: history at "
+        f"{old_score} is not below the allocation at {new_score}"
     )
-    assert [score for score, _tx in by_score] == [float(tx) for _score, tx in by_score], (
-        "a backfilled position is not its record's transaction id, so the "
-        f"historical ordering is not the ledger's: {by_score[:5]}"
+    assert float(new_score).is_integer(), (
+        f"the allocated position {new_score} is not an integer, so it did not "
+        "come from the counter"
+    )
+    assert old_score == float(old_tx), (
+        f"the backfilled position {old_score} is not its record's transaction "
+        f"id {old_tx}, so the historical ordering is not the ledger's"
     )
 
 
