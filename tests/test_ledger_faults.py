@@ -28,7 +28,6 @@ trust anchor is a file inside the verifier container and is only re-read at
 process start.
 """
 
-import ast
 import base64
 import json
 import os
@@ -504,7 +503,7 @@ def test_a_fault_record_is_never_accepted_from_a_caller():
 
 def test_the_unverified_write_path_checks_the_bytes_it_writes():
     """
-    P3c3d-12, first half. D35's structural constraint, asserted on the
+    P3c3d-12. D35's structural constraint, asserted on the
     function that carries it.
 
     The decision path must be *unable* to reach the one write in this system
@@ -522,7 +521,10 @@ def test_the_unverified_write_path_checks_the_bytes_it_writes():
     source = (REPO_ROOT / "verifier" / "main.py").read_text(encoding="utf-8")
     body = source[source.index("def _set_without_verification"):]
     body = body[:body.index(chr(10) + "def ")]
-    namespace = {"json": json, "FAULT_RECORD_TYPE": "ledger_fault"}
+    # FAULT_KEY_PREFIX and the pad because the slice runs to the next `def`,
+    # which since P3c3e-6 includes the fault key's length budget.
+    namespace = {"json": json, "FAULT_RECORD_TYPE": "ledger_fault",
+                 "FAULT_KEY_PREFIX": "ledger_fault:"}
     exec(compile(body, "verifier/main.py", "exec"), namespace)  # noqa: S102
     guard = namespace["_set_without_verification"]
 
@@ -561,53 +563,38 @@ def test_the_unverified_write_path_checks_the_bytes_it_writes():
     )
 
 
-def test_the_unverified_write_path_has_exactly_one_caller_including_aliases():
-    """
-    P3c3d-12, second half. The parse, rewritten so a binding cannot dodge it.
-
-    It used to count lines containing `_set_without_verification(` with the
-    paren. `_unverified_write = _set_without_verification` has no paren, so a
-    second caller through the alias was invisible: the red team added one and
-    the parse found one caller where the file had two.
-
-    Counted over the AST now, on every reference to the name rather than on
-    every line that looks like a call. A binding is a `Name` load and is
-    counted; so is passing the function as an argument, or putting it in a
-    dict. There is no spelling of "reach this function" that is not a
-    reference to its name, so this is not a line count with a better regex -
-    it is the question the line count was standing in for.
-    """
-    source = (REPO_ROOT / "verifier" / "main.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-
-    definitions = [node for node in ast.walk(tree)
-                   if isinstance(node, ast.FunctionDef)
-                   and node.name == "_set_without_verification"]
-    assert len(definitions) == 1, (
-        f"_set_without_verification is defined {len(definitions)} times"
-    )
-
-    # Every place inside the fault writer that names it, so a caller outside
-    # that function is identifiable rather than merely counted.
-    writers = [node for node in ast.walk(tree)
-               if isinstance(node, ast.FunctionDef) and node.name == "_write_fault_record"]
-    assert len(writers) == 1, "there is no single fault writer to allow"
-    allowed = {id(node) for node in ast.walk(writers[0])}
-
-    references = [node for node in ast.walk(tree)
-                  if isinstance(node, ast.Name)
-                  and node.id == "_set_without_verification"]
-    outside = [node for node in references if id(node) not in allowed]
-    assert not outside, (
-        "the unverified write path is named outside _write_fault_record, at "
-        f"line(s) {[node.lineno for node in outside]}. Every reference is a way "
-        "to reach it, including a binding with no parentheses, which is how "
-        "this check was defeated before it counted references instead of lines."
-    )
-    assert len(references) == 1, (
-        f"_set_without_verification is referenced {len(references)} times; it "
-        "must have exactly one caller, the fault writer"
-    )
+# P3c3e-9 (Phase 3c-3e): the caller-count parse is retired, and nothing
+# replaces the half it was carrying.
+#
+# `test_the_unverified_write_path_has_exactly_one_caller_including_aliases`
+# stood here. It counted `ast.Name` nodes whose `id` was
+# `_set_without_verification` and asserted there was exactly one, inside
+# `_write_fault_record`. It was defeated three times in three passes:
+#
+#   1. a plainly-named second caller, past the line count it started as;
+#   2. `_unverified_write = _set_without_verification`, a binding with no
+#      parentheses, past the same line count;
+#   3. `globals()["_set_" + "without_verification"](...)` and
+#      `getattr(sys.modules[__name__], _UNVERIFIED)(...)`, past the AST
+#      reference walk that replaced it - `2 passed, 18 deselected`, with both
+#      callers proved to reach the function.
+#
+# A source parse is not a control against anything that can write Python, and
+# keeping it invites the belief that it is a second line. Catching the third
+# form means flagging dynamic lookup, which is defeatable in turn; and the
+# reference walk is itself a source parse, so it cannot be repaired by another
+# one.
+#
+# **What replaces it: nothing, and the two properties are not the same
+# property.** The runtime guard above covers what gets WRITTEN - it reads the
+# bytes it is about to commit and refuses anything that is not a fault record,
+# which the test above drives rather than describes, and
+# `tests/test_route_parity.py` asserts over every write route that a failed
+# proof makes exactly one unverified write and that its bytes are a fault
+# record about the record just committed. Neither bounds HOW MANY CALLERS
+# EXIST, which is what the parse counted. That is a Residual Limit, recorded
+# in README section 5 and in docs/reports/phase-3c3e.md, and it is not
+# quietly merged into the guard's property here.
 
 
 # ---------------------------------------------------------------------------

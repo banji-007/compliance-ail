@@ -55,6 +55,7 @@ assert.
 import base64
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
@@ -112,6 +113,38 @@ def _control_plane():
     return _load("p3c3d_control_plane", "control_plane/main.py")
 
 
+def _verifier_module():
+    """The whole verifier module, for the tests that execute its functions.
+
+    `_verifier_fault_key` below slices the key-construction block out of the
+    source instead, because that one is about the key FORMAT and wants no
+    live client near it. The Phase 3c-3e tests drive `_write_fault_record`
+    itself against a stub, which needs the module's own imports, its writer
+    key and its ledger-state constants - so it is loaded rather than sliced.
+
+    The writer key path is set for the duration of the import and restored,
+    not exported: the verifier reads it once at import, and leaving it set
+    would change what every other in-process import of verifier/main.py in
+    this session does, and which of them ran first.
+    """
+    import importlib.util
+
+    previous = os.environ.get("AIL_WRITER_SIGNING_KEY")
+    os.environ["AIL_WRITER_SIGNING_KEY"] = WRITER_VERIFIER_KEY
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "p3c3e_verifier", REPO_ROOT / "verifier" / "main.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["p3c3e_verifier"] = module
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            os.environ.pop("AIL_WRITER_SIGNING_KEY", None)
+        else:
+            os.environ["AIL_WRITER_SIGNING_KEY"] = previous
+    return module
+
+
 def _verifier_fault_key(record_value: bytes, record_key: bytes,
                         committed_tx_id: int, nonce: str) -> str:
     """The verifier's own key construction, executed rather than restated.
@@ -123,8 +156,8 @@ def _verifier_fault_key(record_value: bytes, record_key: bytes,
     source = (REPO_ROOT / "verifier" / "main.py").read_text(encoding="utf-8")
     start = source.index("FAULT_KEY_TX_PAD = 20")
     end = source.index("def _write_fault_record")
-    namespace = {"json": json, "hashlib": hashlib,
-                 "FAULT_KEY_PREFIX": "ledger_fault:"}
+    namespace = {"json": json, "hashlib": hashlib, "logger": logging.getLogger(
+        "p3c3d_fault_key_slice"), "FAULT_KEY_PREFIX": "ledger_fault:"}
     exec(compile(source[start:end], "verifier/main.py", "exec"), namespace)  # noqa: S102
     return namespace["_fault_key"](record_value, record_key, committed_tx_id, nonce)
 
@@ -500,7 +533,7 @@ def test_an_empty_page_issues_no_range_read():
                 f"a range read was issued for a page with no rows (client.{name})"
             )
 
-    assert control_plane._page_faults(_RefusesEverything(), "token", [], {}) == {}
+    assert control_plane._page_faults(_RefusesEverything(), "token", []) == {}
 
 
 def test_a_bounded_read_asserts_on_what_came_back():
@@ -538,48 +571,278 @@ def test_a_bounded_read_asserts_on_what_came_back():
 
 
 # ---------------------------------------------------------------------------
-# P3c3d-4: legacy faults still render.
+# P3c3e-8 (Phase 3c-3e): the legacy fault-key read path is gone.
 # ---------------------------------------------------------------------------
+#
+# `test_a_page_carrying_an_old_shape_and_a_new_shape_fault_renders_both` lived
+# here and asserted that a fault committed under the pre-D38
+# `ledger_fault:{call_id}` shape still rendered. That read is deleted, so the
+# test enforcing it is deleted with it rather than left passing against a path
+# that no longer exists.
+#
+# The path protected nothing. Every ledger that has ever held a fault record
+# in this project is a CI stack or a scratch stack destroyed by
+# `docker compose down -v`, and
+# tests/test_ledger_state_does_not_survive_teardown.py asserts that no volume
+# in either compose file survives that. What it cost was a caller-influenced
+# code path, and that is red-team A7.
 
 @requires_stack
-def test_a_page_carrying_an_old_shape_and_a_new_shape_fault_renders_both():
-    """
-    Every `ledger_fault:{call_id}` already committed keeps that shape
-    permanently, so the exact `getall` stays - with exactly today's keys, no
-    keys added, because a new-shape key carries a nonce and cannot go into a
-    getall at all. The range read is added beside it, which is the whole
-    added cost: two round trips per page against one.
+def test_a_crafted_call_id_no_longer_makes_one_fault_count_twice():
+    """A7, no longer constructible.
+
+    The attack, from the write credential alone. A new-shape fault key is
+    `ledger_fault:{tx:020d}:{identity}:{nonce}` and the write response hands
+    the whole key to whoever produced the fault. A second record whose
+    `call_id` is spelled exactly `{tx:020d}:{identity}:{nonce}` made the
+    page's legacy `getall` ask for `ledger_fault:` + that string, which is
+    byte-identical to the first record's fault key. The getall returned it,
+    `_merge_fault` folded it in, and the range read folded the same entry in
+    again:
+
+        BEFORE, one fault exists : {"committed_tx_id": 106, "count": 1}
+        second record's call_id  : 00000000000000000106:11a19025...:4ea2f03d
+        AFTER, still one fault   : {"committed_tx_id": 106, "count": 2}
+        faults in the ledger for it : 1
+
+    Driven exactly that way. The count has to stay 1, and the second record
+    has to be a page row of its own carrying no fault, because it has none.
     """
     headers = _immudb_headers()
 
-    old_call_id = uuid.uuid4().hex
-    old_key = _tool_key("p3c3d-legacy")
-    old_value = _decision_value(old_call_id, "p3c3d-legacy")
-    old_written = _write_ordered(old_key, old_value)
-    _seed_fault(headers, old_key, old_value, old_written["tx_id"],
-                old_written["seq"], "an old-shape fault",
-                key_override=f"ledger_fault:{old_call_id}")
+    victim_call_id = uuid.uuid4().hex
+    victim_key = _tool_key("p3c3e-a7-victim")
+    victim_value = _decision_value(victim_call_id, "p3c3e-a7-victim")
+    victim = _write_ordered(victim_key, victim_value)
+    fault_key, _tx = _seed_fault(headers, victim_key, victim_value,
+                                 victim["tx_id"], victim["seq"],
+                                 "the one fault that exists")
 
-    new_call_id = uuid.uuid4().hex
-    new_key = _tool_key("p3c3d-newshape")
-    new_value = _decision_value(new_call_id, "p3c3d-newshape")
-    new_written = _write_ordered(new_key, new_value)
-    _seed_fault(headers, new_key, new_value, new_written["tx_id"],
-                new_written["seq"], "a new-shape fault")
+    before = _row_for(_audit(2500), victim_key)
+    assert before["ledger_fault"] is not None, before
+    assert before["ledger_fault"]["count"] == 1, (
+        f"one fault exists and the page already counts more: {before}"
+    )
+
+    # The whole attack: a second, ordinary record whose call_id is spelled as
+    # the tail of the victim's fault key.
+    crafted = fault_key[len("ledger_fault:"):]
+    attacker_key = _tool_key("p3c3e-a7-attacker")
+    attacker_value = _decision_value(crafted, "p3c3e-a7-attacker")
+    _write_ordered(attacker_key, attacker_value)
 
     page = _audit(2500)
-    old_row = _row_for(page, old_key)
-    new_row = _row_for(page, new_key)
-    assert old_row["ledger_fault"] is not None, (
-        "a fault committed under the pre-D38 key shape stopped rendering; "
-        "those keys keep that shape permanently"
+    after = _row_for(page, victim_key)
+    assert after["ledger_fault"]["count"] == 1, (
+        "one fault is in the ledger and the page counts "
+        f"{after['ledger_fault']['count']} for it, from a call_id the "
+        f"attacker chose: {after}"
     )
-    assert old_row["ledger_fault"]["committed_tx_id"] == old_written["tx_id"], old_row
-    assert new_row["ledger_fault"] is not None, (
-        "the new-shape fault is not on the page, so the range read did not "
-        "find it"
+    attacker_row = _row_for(page, attacker_key)
+    assert attacker_row["ledger_fault"] is None, (
+        "the attacker's own record carries a fault that was written about a "
+        f"different record: {attacker_row}"
     )
-    assert new_row["ledger_fault"]["committed_tx_id"] == new_written["tx_id"], new_row
+
+
+# ---------------------------------------------------------------------------
+# P3c3e-6 (Phase 3c-3e): a fault key is bounded and its call_id is validated.
+# ---------------------------------------------------------------------------
+
+def test_an_over_long_call_id_is_refused_as_an_identity_and_the_fault_is_still_written():
+    """A1, closed at key construction.
+
+    ImmuDB refuses a key of 1024 bytes (measured on the running stack: 1023
+    accepted, 1024 answers "max key length exceeded"), and the fault key
+    inherited its length from an unvalidated caller-supplied `call_id`. Past
+    about a thousand characters NO FAULT RECORD WAS WRITTEN: the record
+    committed, its proof failed, and the audit page showed it reading
+    `policy_allow` with `ledger_fault: null`.
+
+    The call_id is refused as a key component now and the digest fallback is
+    used, so the fault still exists. Nothing is lost by the substitution - the
+    join onto a page row is `committed_key`, and the fallback is derivable
+    from the row's own `ledger_key`.
+    """
+    verifier = _verifier_module()
+    record_key = b"tool_call:p3c3e-long:abc:query_database"
+
+    ordinary = json.dumps({"record_type": "decision", "call_id": "a" * 32},
+                          separators=(",", ":")).encode()
+    assert verifier._fault_identity(ordinary, record_key) == "a" * 32
+
+    over_long = json.dumps(
+        {"record_type": "decision", "call_id": "a" * 1200},
+        separators=(",", ":")).encode()
+    identity = verifier._fault_identity(over_long, record_key)
+    assert identity.startswith("key:"), (
+        f"an over-long call_id was accepted as a key component: {identity[:80]}"
+    )
+    assert identity == "key:" + hashlib.sha256(record_key).hexdigest()[:32], (
+        "the fallback is not the digest a reader can derive from a page row: "
+        f"{identity}"
+    )
+
+    key = verifier._fault_key(over_long, record_key, 42, "0123456789abcdef")
+    assert len(key.encode()) <= verifier.MAX_LEDGER_KEY_BYTES, (
+        f"the assembled fault key is {len(key.encode())} bytes and this "
+        f"ledger refuses anything above {verifier.MAX_LEDGER_KEY_BYTES}: {key}"
+    )
+
+
+def test_a_fault_key_that_would_exceed_the_ledgers_maximum_fails_at_construction():
+    """The bound is asserted where the key is built, not at the ledger.
+
+    A key the ledger will refuse used to be discovered by the ledger refusing
+    it, on a response field the middleware discards. It raises here instead,
+    which is what makes the failure loud.
+
+    `_fault_identity` bounds the one caller-supplied component, so this raise
+    is unreachable through it by construction - which is exactly why the test
+    replaces `_fault_identity` to reach it. An invariant that can only be
+    checked by breaking another one still has to be checked.
+    """
+    verifier = _verifier_module()
+    record_key = b"tool_call:p3c3e-bound:abc:query_database"
+    original = verifier._fault_identity
+    verifier._fault_identity = lambda value, key: "z" * (
+        verifier.MAX_FAULT_IDENTITY_BYTES + 1)
+    try:
+        with pytest.raises(ValueError) as raised:
+            verifier._fault_key(b"{}", record_key, 42, "0123456789abcdef")
+    finally:
+        verifier._fault_identity = original
+    assert str(verifier.MAX_LEDGER_KEY_BYTES) in str(raised.value), raised.value
+
+
+def test_an_unwritable_fault_is_reported_rather_than_silently_absent():
+    """A fault that could not be written says so in the response `detail`.
+
+    `fault_record_error` has always been on the response and the middleware
+    discards the response, so the only place an unwritten fault was visible
+    was the verifier's own log. The sentence in `detail` says what the absence
+    means: nothing durable records why this record's proof failed.
+    """
+    verifier = _verifier_module()
+    detail = verifier._fault_failure_detail("RuntimeError: max key length exceeded")
+    assert "NO FAULT RECORD WAS WRITTEN" in detail, detail
+    assert "ledger_fault null" in detail, detail
+    assert verifier._fault_failure_detail(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# P3c3e-7 (Phase 3c-3e): a fault key's transaction is not caller-supplied.
+# ---------------------------------------------------------------------------
+
+def test_the_fault_keys_transaction_is_derived_from_the_committed_record():
+    """A2's writing half.
+
+    The key's leading component places a fault inside a page's transaction
+    window, and the body carries `committed_tx_id` as well. Nothing compared
+    them, and a fault keyed at a transaction its record does not occupy is
+    invisible at HTTP 200 - outside the window, never fetched, page row
+    `ledger_fault: null`, no error and no log line.
+
+    The transaction is read back from the ledger now, so the two numbers
+    cannot disagree: there is one, and it comes from the ledger. Driven with a
+    client whose ledger holds the record at a different transaction than the
+    caller passes.
+    """
+    verifier = _verifier_module()
+    record_key = b"tool_call:p3c3e-derive:abc:query_database"
+    record_value = json.dumps({"record_type": "decision",
+                               "call_id": "p3c3e-derive"},
+                              separators=(",", ":")).encode()
+
+    class _LedgerHoldsItAt:
+        def __init__(self, tx):
+            self.tx = tx
+            self.written = []
+
+        def get(self, key):
+            if key != record_key:
+                return None
+            return type("Got", (), {"tx": self.tx, "value": record_value})()
+
+        def set(self, key, value):
+            self.written.append((key, value))
+            return type("Resp", (), {"id": 999})()
+
+    # The caller's number agrees with the ledger: the fault is written, and
+    # its key names that transaction.
+    agrees = _LedgerHoldsItAt(1234)
+    key, error = verifier._write_fault_record(
+        agrees, record_key=record_key, record_value=record_value,
+        tx_id=1234, seq=None, view="decision",
+        error_class="consistency_failure", detail="probe")
+    assert error is None, error
+    assert key.startswith(verifier.fault_key_tx_bound(1234) + ":"), key
+    assert len(agrees.written) == 1, agrees.written
+
+    # The caller's number disagrees. Refused, and it says which two numbers.
+    disagrees = _LedgerHoldsItAt(1234)
+    key, error = verifier._write_fault_record(
+        disagrees, record_key=record_key, record_value=record_value,
+        tx_id=99999, seq=None, view="decision",
+        error_class="consistency_failure", detail="probe")
+    assert key is None, key
+    assert error is not None and "99999" in error and "1234" in error, error
+    assert not disagrees.written, (
+        "a fault was written under a transaction the record does not occupy: "
+        f"{disagrees.written}"
+    )
+
+
+def test_a_fault_whose_key_and_body_disagree_is_not_rendered():
+    """A2's reading half.
+
+    The writer cannot produce such a pair any more. This is the other end of
+    the same rule, on the page: a fault that arrives inside a window carrying
+    a body about a record at a different transaction is refused rather than
+    attributed to a row by `committed_key` alone.
+    """
+    control_plane = _control_plane()
+    body = _fault_record("tool_call:p3c3e-mismatch:abc:query_database",
+                         "unused", 500, None, "a mismatched fault")
+    encoded_body = _b64(json.dumps(body, separators=(",", ":")))
+    raw_matching = {
+        "key": _b64(control_plane._fault_key_tx_bound(500) + ":x:y"),
+        "value": encoded_body,
+        "tx": "500",
+    }
+    assert control_plane._rendered_fault(raw_matching) is not None, (
+        "the control shape does not render, so this test cannot show that the "
+        "mismatched one is what is refused"
+    )
+
+    raw_mismatched = {
+        "key": _b64(control_plane._fault_key_tx_bound(501) + ":x:y"),
+        "value": encoded_body,
+        "tx": "501",
+    }
+    assert control_plane._rendered_fault(raw_mismatched) is None, (
+        "a fault whose key names one transaction and whose body names another "
+        "was rendered as a record's standing"
+    )
+
+
+def test_the_key_transaction_reader_is_the_inverse_of_the_bound_builder():
+    """The two halves of the format agree, at the boundaries.
+
+    A reader parsing a different number of digits than the writer pads would
+    place every fault at the wrong transaction, silently, at HTTP 200.
+    """
+    control_plane = _control_plane()
+    for tx_id in (0, 1, 999999, 2 ** 53, 2 ** 64 - 1):
+        encoded = _b64(control_plane._fault_key_tx_bound(tx_id) + ":identity:nonce")
+        assert control_plane._fault_key_transaction(encoded) == tx_id, tx_id
+
+    assert control_plane._fault_key_transaction(_b64("content_erasure:abc")) is None
+    assert control_plane._fault_key_transaction(_b64("ledger_fault:12:x:y")) is None, (
+        "a transaction component narrower than the pad was read as a "
+        "transaction"
+    )
+    assert control_plane._fault_key_transaction("not base64 at all") is None
 
 
 # ---------------------------------------------------------------------------
