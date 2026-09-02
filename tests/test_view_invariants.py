@@ -27,8 +27,10 @@ invariant, and it says so in every order.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import httpx
@@ -47,14 +49,16 @@ from ledger_pollution import (  # noqa: E402
     ONE_POSITION_PER_KEY, TESTS_DIR, explains, registered_for,
 )
 
-IMMUDB_URL      = os.getenv("IMMUDB_URL",      "http://localhost:8080")
-IMMUDB_USER     = os.getenv("IMMUDB_USER",     "immudb")
-IMMUDB_PASSWORD = os.getenv("IMMUDB_PASSWORD", "immudb")
+IMMUDB_URL         = os.getenv("IMMUDB_URL",      "http://localhost:8080")
+IMMUDB_USER        = os.getenv("IMMUDB_USER",     "immudb")
+IMMUDB_PASSWORD    = os.getenv("IMMUDB_PASSWORD", "immudb")
+VERIFIER_URL       = os.getenv("VERIFIER_URL",       "http://localhost:8003")
+VERIFIER_WRITE_KEY = os.getenv("VERIFIER_WRITE_KEY", "test-verifier-write-key")
 
 VIEW_DECISION = "ail_view:decision:v1"
 RESERVED_POSITIONS = int(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
 
-requires_stack = pytest.mark.needs_stack("immudb")
+requires_stack = pytest.mark.needs_stack("immudb", "verifier")
 
 _CLIENT = httpx.Client(timeout=120.0)
 
@@ -70,6 +74,42 @@ def _headers() -> dict:
     })
     resp.raise_for_status()
     return {"Authorization": f"Bearer {resp.json()['token']}"}
+
+
+def _seed_one_decision() -> str:
+    """Put one ordinary record in the decision view, and return its key.
+
+    **Every ledger-wide test below builds this precondition rather than
+    assuming it, and that is not a formality.** Written against a virtually
+    empty ledger these tests read zero rows, and a check over zero rows
+    asserts nothing at all - so they guard on the view being non-empty. In
+    reverse collection order this module runs before anything else writes a
+    decision, and the guard fired: `the decision view is empty, so this
+    asserts nothing`, three times.
+
+    That is D44's own defect, in the file that enforces D44: an assertion
+    resting on state some other module happened to leave. One write through
+    the ordered route is all it takes, and it makes the invariant hold over a
+    row this module put there whatever else has run.
+    """
+    agent = f"p3c3e-view-{uuid.uuid4().hex[:8]}"
+    key = f"tool_call:{agent}:{uuid.uuid4().hex}:query_database"
+    value = json.dumps({
+        "record_type": "decision", "call_id": uuid.uuid4().hex,
+        "agent_id": agent, "timestamp": "2026-09-02T00:00:00",
+        "tool_name": "query_database", "outcome_type": "policy_allow",
+        "fault_class": None, "policy_revision": "p3c3e-view",
+        "reasons": [], "input_sha256": uuid.uuid4().hex,
+        "content_state": "unavailable", "profile": "observed",
+    }, separators=(",", ":"))
+    resp = _CLIENT.post(f"{VERIFIER_URL}/write-ordered",
+                        json={"key": _b64(key), "value": _b64(value),
+                              "view": "decision"},
+                        headers={"X-API-Key": VERIFIER_WRITE_KEY})
+    assert resp.status_code == 200, resp.text[:300]
+    body = resp.json()
+    assert body.get("verified") is True and body.get("committed") is True, body
+    return key
 
 
 def _view_rows(headers: dict) -> list[tuple[str, float, int]]:
@@ -151,8 +191,12 @@ def test_every_allocated_position_is_an_integer_or_a_registered_violation():
     from the counter. `tests/test_reconciliation.py` injects exactly one on
     purpose to prove the reconciler reports it; every other one is a defect.
     """
+    mine = _seed_one_decision()
     rows = _view_rows(_headers())
-    assert rows, "the decision view is empty, so this asserts nothing"
+    assert any(key == mine for key, _score, _tx in rows), (
+        "this test's own record is not in the view, so the walk below is not "
+        "reading what it thinks it is"
+    )
     offenders = [(key, score) for key, score, _tx in rows
                  if score > RESERVED_POSITIONS and not float(score).is_integer()
                  and not registered_for(key, INTEGER_POSITION)]
@@ -174,8 +218,12 @@ def test_every_record_holds_one_position_or_is_a_registered_violation():
     to the key's current transaction, and D33 requires strictly increasing
     transaction with increasing position.
     """
+    mine = _seed_one_decision()
     rows = _view_rows(_headers())
-    assert rows, "the decision view is empty, so this asserts nothing"
+    assert any(key == mine for key, _score, _tx in rows), (
+        "this test's own record is not in the view, so the walk below is not "
+        "reading what it thinks it is"
+    )
     positions: dict[str, set[float]] = {}
     for key, score, _tx in rows:
         positions.setdefault(key, set()).add(score)
@@ -220,8 +268,12 @@ def test_a_historical_position_is_its_transaction_or_a_registered_violation():
     reach the zscan ceiling cheaply, one to give a record a second position in
     the range that was assumed to be history - and both are registered.
     """
+    mine = _seed_one_decision()
     rows = _view_rows(_headers())
-    assert rows, "the decision view is empty, so this asserts nothing"
+    assert any(key == mine for key, _score, _tx in rows), (
+        "this test's own record is not in the view, so the walk below is not "
+        "reading what it thinks it is"
+    )
     offenders = [(key, score, tx) for key, score, tx in rows
                  if score <= RESERVED_POSITIONS and score != float(tx)
                  and not registered_for(key, HISTORY_SCORE_IS_ITS_TRANSACTION)]
@@ -242,6 +294,7 @@ def test_the_registered_violations_are_the_only_exemptions_in_use():
     perfectly ordinary rows is an exemption with a blast radius nobody
     intended.
     """
+    _seed_one_decision()
     rows = _view_rows(_headers())
     for entry in DELIBERATE_VIOLATIONS:
         matched = [(key, score, tx) for key, score, tx in rows
