@@ -964,7 +964,7 @@ that holds at two places, with the two able to disagree.
 
 ### CI
 
-**Run `CI_RUN_ID`, `CI_RESULT`.** Commit `CI_COMMIT` on `p3c3b-order`, PR #14.
+**Run `33665124730`, green: 495 passed, 9 skipped, 199.81s.** Commit `3109e0f` on `p3c3b-order`, PR #14.
 
 The runs before it are recorded rather than only fixed, because two of them
 found defects in this phase's own work and one was inherited.
@@ -976,7 +976,7 @@ found defects in this phase's own work and one was inherited.
 | `33623844441` | `fd09105` | 1 failed, 494 passed | The relay fix confirmed on Linux; all five relay tests pass. The one failure is the inherited one. |
 | `33629407221` | `a711115` | 2 failed, 493 passed | The heading pin pushed one commit ahead of the report it pins. |
 | `33663495874` | `8133f3c` | 1 failed, 494 passed | The report lands and both references to it resolve. The one failure is **this phase's own over-assertion**: `test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` asserted `committed is True` where CI produced `committed: null` - the relay closes the connection it cut, so the verifier's confirming read can hit a dead socket. Null is D45 being honest, and the assertion was wrong to exclude it. |
-| `CI_RUN_ID` | `CI_COMMIT` | `CI_RESULT` | `CI_NOTE` |
+| `33665124730` | `3109e0f` | **495 passed, 9 skipped** | Green. |
 
 **None of the three defects CI found in this phase's work was closed by
 weakening a test, and the third is the one worth reading closely.**
@@ -1026,7 +1026,25 @@ Removed:
   material this session produced outside the tree - a PKCS8 DER written to the
   scratchpad while measuring the detector's ASN.1 signatures - went with it.
 
-CLEANUP_VERIFICATION
+Verified empty afterwards, each filtered on the project name:
+
+```
+$ docker ps -a  --format '{{.Names}}'      | grep -i p3c3efix  ->  (nothing)
+$ docker images --format '{{.Repository}}' | grep -i p3c3efix  ->  (nothing)
+$ docker volume ls --format '{{.Name}}'    | grep -i p3c3efix  ->  (nothing)
+$ docker network ls --format '{{.Name}}'   | grep -i p3c3efix  ->  (nothing)
+```
+
+**Could not remove: nothing of this run.** The Docker daemon stayed healthy
+throughout.
+
+Untouched, and belonging to earlier runs rather than this one: the
+`ail-scratch_*` and `compliance-ail_*` volumes. They were present at the start
+and are left as found.
+
+The scratch clone is removed after this report is pushed, which is the last
+act of the session - the report cannot be written from a directory that no
+longer exists.
 
 The primary working directory was never used for a stack. Nothing was written
 there by this run.
