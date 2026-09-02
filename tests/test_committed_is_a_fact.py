@@ -54,6 +54,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -288,6 +289,37 @@ def _proxy_log(name: str = PROXY_NAME) -> str:
                           capture_output=True, text=True).stdout
 
 
+def _verifier_container_id() -> str:
+    """Which container is serving the verifier right now."""
+    result = compose("ps", "-q", "verifier", check=False)
+    return (result.stdout or "").strip()
+
+
+def _wait_for_a_new_verifier(previous: str, timeout_seconds: float = 120.0) -> bool:
+    """Block until the verifier is a DIFFERENT container than `previous`.
+
+    **`wait_for_health` alone is not enough, and this is why.** `compose up -d
+    --force-recreate` returns before the replacement is serving, and the
+    outgoing container answers `/health` while it is on its way out - so a
+    health poll issued immediately can pass against the container that is
+    about to die. The test then writes through a verifier still pointed at
+    ImmuDB, the relay never sees a connection at all, and the write lands
+    with the relay log holding nothing but its own startup line.
+
+    Observed exactly that in a full-suite run: `the relay never dropped a
+    response ... Relay log: CUT: listening on 3399 -> immudb:3322
+    mode=response`. The retry above could not help, because the write had
+    landed - by going around the fixture.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = _verifier_container_id()
+        if current and current != previous:
+            return True
+        time.sleep(1)
+    return False
+
+
 def cut_until_it_lands(build, drive, landed, attempts: int = 4):
     """Drive a cut until the write it was aimed at actually reached the ledger.
 
@@ -309,15 +341,20 @@ def cut_until_it_lands(build, drive, landed, attempts: int = 4):
 
     `build` returns whatever a fresh attempt needs - a new key, so an attempt
     that half-landed cannot poison the next one. `drive` performs the write
-    behind the relay and returns whatever the assertions need. `landed` says
-    whether the ledger has it. The last attempt's result is returned whether
-    it landed or not, so the caller's own guard is what reports a fixture that
-    never managed to cut.
+    behind the relay and returns whatever the assertions need. `landed` is
+    given both, and answers whether the FIXTURE did its job: the relay cut and
+    the write reached the ledger. Both halves, because either one alone has a
+    failure mode the other hides - a write that never landed means the cut was
+    too early, and a write that landed with a relay log holding nothing means
+    it went around the relay entirely.
+
+    The last attempt's result is returned whether it worked or not, so the
+    caller's own guards are what report a fixture that never managed it.
     """
     for attempt in range(attempts):
         subject = build()
         result = drive(subject)
-        if landed(subject):
+        if landed(subject, result):
             return subject, result, attempt + 1
     return subject, result, attempts
 
@@ -348,15 +385,22 @@ def relay(mode: str, name: str, alias: str, marker: str = MARKER, **env: str):
     assert started.returncode == 0, (
         f"could not start the {mode} relay: {started.stderr[-400:]}"
     )
+    outgoing = _verifier_container_id()
     try:
         compose("up", "-d", "--force-recreate", "verifier",
                 env={"IMMUDB_ADDR": f"{alias}:3399"})
+        assert _wait_for_a_new_verifier(outgoing), (
+            f"the verifier was not replaced, so it is not pointed at the {mode} "
+            "relay"
+        )
         assert wait_for_health(f"{VERIFIER_URL}/health"), (
             f"the verifier did not come back pointed at the {mode} relay"
         )
         yield name
     finally:
+        replaced = _verifier_container_id()
         compose("up", "-d", "--force-recreate", "verifier", check=False)
+        _wait_for_a_new_verifier(replaced)
         wait_for_health(f"{VERIFIER_URL}/health")
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
@@ -684,7 +728,8 @@ def test_an_ordered_write_that_committed_is_reported_as_committed_when_its_respo
             return written, _proxy_log(_ORDERED_PROXY)
 
     key, (response, log), _tries = cut_until_it_lands(
-        _build, _drive, lambda k: k in _getall(headers, [k]))
+        _build, _drive,
+        lambda k, r: "dropping the" in r[1] and k in _getall(headers, [k]))
 
     assert response.status_code == 200, response.text[:300]
     body = response.json()
@@ -761,7 +806,8 @@ def test_a_plain_write_states_no_fact_when_the_confirming_read_is_cut_too():
             return written, _proxy_log(_BLACKHOLE_PROXY)
 
     key, (response, log), _tries = cut_until_it_lands(
-        _build, _drive, lambda k: k in _getall(headers, [k]))
+        _build, _drive,
+        lambda k, r: "blackholing immudb" in r[1] and k in _getall(headers, [k]))
 
     assert response.status_code == 200, response.text[:300]
     body = response.json()
@@ -824,7 +870,8 @@ def test_an_erasure_completes_when_the_ledger_goes_away_after_the_tombstone_comm
 
     call_id, (deleted, log), _tries = cut_until_it_lands(
         _build, _drive,
-        lambda cid: f"content_erasure:{cid}" in _getall(
+        lambda cid, r: "blackholing immudb" in r[1]
+        and f"content_erasure:{cid}" in _getall(
             headers, [f"content_erasure:{cid}"]))
 
     assert "blackholing immudb" in log, (
@@ -889,7 +936,8 @@ def test_a_retry_after_a_dropped_response_is_told_the_record_already_exists():
             return written, _proxy_log(_ORDERED_PROXY)
 
     key, (first, log), _tries = cut_until_it_lands(
-        _build, _drive, lambda k: k in _getall(headers, [k]))
+        _build, _drive,
+        lambda k, r: "dropping the" in r[1] and k in _getall(headers, [k]))
 
     body = first.json()
     assert "dropping the" in log, (
