@@ -85,6 +85,7 @@ import json
 import logging
 import os
 import pathlib
+import pickle
 import sys
 import threading
 import uuid
@@ -218,18 +219,212 @@ SDK_IDENTIFIER = "immudb-py==1.5.0"
 _client = None
 
 
+def _state_verifying_key():
+    """The ECDSA public key ImmuDB signs its states with, or None.
+
+    The same key `ImmudbClient` loads into `_vk` from `publicKeyFile`, read
+    here as well because `_VerifiedRootService` is constructed before the
+    client exists and has to be able to check a state without it.
+    """
+    if not PUBKEY_FILE or not pathlib.Path(PUBKEY_FILE).exists():
+        return None
+    import ecdsa
+
+    with open(PUBKEY_FILE) as handle:
+        return ecdsa.VerifyingKey.from_pem(handle.read())
+
+
+class UnverifiedState(RuntimeError):
+    """A state this service refused to anchor at, and why."""
+
+
+class _VerifiedRootService:
+    """The persisted trust anchor. Never written or seeded from a state
+    nothing verified.
+
+    **D47 (Phase 3c-3f).** This replaces the SDK's `PersistentRootService`,
+    which is the sample implementation its own file calls a sample. Three
+    things about it put an unchecked state under every later proof:
+
+      * `init()` sets its cache from `CurrentState` when the state file is
+        absent or unreadable. That is the first boot of any deployment, and
+        the first proof after it runs from whatever the server said.
+      * `get()` does the same whenever the cache is `None`.
+      * `set()` writes whatever it is handed. `verifiedSet.call` and
+        `verifiedGet.call` hand it a state they verified under
+        `newstate.Verify(verifying_key)` first; `currentRoot.call` - which is
+        what `client.currentState()` reaches - hands it one nothing checked,
+        and the SDK's own `# IMPROVEMENT: we could check here, if state is
+        valid` sits on that line.
+
+    Neither seed is a `set`, so a rule about writes would not have caught
+    either. One class covers all three, which is why this is a class and not
+    a guard at the two call sites that used to call `currentState()`.
+
+    **What "verified" means here, stated exactly.** ImmuDB signs the state it
+    reports when the server runs with `--signingKey`, and the signature is
+    over `(db, txId, txHash)`. Checking it establishes that this state is one
+    this ledger published, rather than one the transport handed us. It does
+    not establish that a consistency proof ran to it; that is what the SDK's
+    verified handlers do, and it is why the two `currentState()` call sites
+    were removed rather than made to check a signature. Both controls are
+    here: a signature that does not verify is refused, and an anchor that
+    would move backwards is refused, because an anchor that can go backwards
+    can be replayed to a point before a record was written.
+
+    **Fail closed with no signing key.** A deployment with no
+    `IMMUDB_SIGNING_PUBKEY` cannot check any state, so seeding from the
+    server would be exactly the thing this class exists to stop. It refuses,
+    the way `GET /state` already answers 503 in the same condition. The
+    exception is an empty ledger: `txId == 0` has no history to be lied
+    about, and refusing there would mean a stack with no signing key cannot
+    start at all rather than cannot anchor.
+
+    **The state file itself is read exactly as before, and deliberately.**
+    D47 names the two `CurrentState` seeds, not the file. That file is the
+    operator's own volume, and corrupting it is the tamper vector ADR-0006's
+    `consistency_failure` exists to detect: `tests/anchor_helpers.py` flips a
+    byte in `txHash` and expects the next proof to fail. Verifying the file's
+    signature here would discard the corruption and re-seed from the server
+    instead, which would delete that detection rather than add to it.
+
+    The pickle format is the SDK's - `{dbname: State}` - so the file this
+    writes is the file `tests/anchor_helpers.py` and
+    `tests/test_committed_is_a_fact.py` already read.
+    """
+
+    def __init__(self, filename: str, verifying_key=None):
+        self._filename = filename
+        self._verifying_key = verifying_key
+        self._dbname = None
+        self._service = None
+        self._cache = None
+
+    # -- the check ---------------------------------------------------------
+
+    def _checked(self, state, source: str):
+        """`state`, or a refusal naming where it came from."""
+        from ecdsa.keys import BadSignatureError
+
+        if int(getattr(state, "txId", 0)) == 0:
+            return state
+        if self._verifying_key is None:
+            raise UnverifiedState(
+                f"refusing to anchor at the state {source} reports: no ImmuDB "
+                "signing key is configured (IMMUDB_SIGNING_PUBKEY), so no "
+                "state can be checked and anchoring at one would be taking "
+                "the server's word for the thing every later proof is "
+                "measured against"
+            )
+        try:
+            state.Verify(self._verifying_key)
+        except BadSignatureError as exc:
+            raise UnverifiedState(
+                f"refusing to anchor at the state {source} reports (tx "
+                f"{state.txId}): it is not signed by the configured ImmuDB "
+                f"key ({exc})"
+            ) from exc
+        return state
+
+    def _head(self, source: str):
+        from google.protobuf import empty_pb2
+        from immudb.rootService import State
+
+        state = State.FromGrpc(self._service.CurrentState(empty_pb2.Empty()))
+        return self._checked(state, source)
+
+    # -- the SDK's RootService interface -----------------------------------
+
+    def init(self, dbname: str, service):
+        """Seed one: the state file, or a checked head when it is not there."""
+        self._dbname = dbname
+        self._service = service
+        self._cache = None
+        try:
+            with open(self._filename, "rb") as handle:
+                states = pickle.load(handle)
+            if dbname in states:
+                self._cache = states[dbname]
+        except FileNotFoundError:
+            pass
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning("Could not read %s: %s", self._filename, exc)
+        if self._cache is None:
+            self._cache = self._head("ImmuDB, on a first boot with no state file")
+            logger.info("Trust anchor seeded from a checked state at tx=%d",
+                        self._cache.txId)
+
+    def get(self):
+        """Seed two: the same, whenever the cache is empty."""
+        if self._cache is None:
+            self._cache = self._head("ImmuDB, with no anchor held")
+        return self._cache
+
+    def set(self, state):
+        """The write. Checked, and never backwards."""
+        self._checked(state, "the caller of set()")
+        held = self._cache
+        if held is not None and int(state.txId) < int(held.txId):
+            raise UnverifiedState(
+                f"refusing to move the trust anchor backwards, from tx "
+                f"{held.txId} to tx {state.txId}: an anchor that can go "
+                "backwards can be replayed to a point before a record was "
+                "written"
+            )
+        self._cache = state
+        states = {}
+        try:
+            with open(self._filename, "rb") as handle:
+                states = pickle.load(handle)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning("Could not read %s: %s", self._filename, exc)
+        states[self._dbname] = state
+        with open(self._filename, "wb") as handle:
+            pickle.dump(states, handle)
+
+
+def head_state(client):
+    """The ledger's head, reported without moving this service's anchor.
+
+    D47. `client.currentState()` reaches `currentRoot.call`, which ends in an
+    unconditional `rs.set(state)`: it reports the head *and* overwrites the
+    anchor with it, after `verifiedSet.call` or `verifiedGet.call` has just
+    set a state a proof actually ran to. Reporting the head does not require
+    persisting it, so the RPC is made directly here and nothing is written.
+
+    `GET /state` reached the same conclusion about the same mutation in
+    Phase 3b and made the call directly; this is that argument applied to the
+    two remaining call sites, and that route now uses this helper rather than
+    holding a second copy of it.
+
+    The signature is checked, so what a caller is told the head is, is a head
+    this ledger published.
+    """
+    from google.protobuf import empty_pb2
+    from immudb.rootService import State
+
+    state = State.FromGrpc(client._stub.CurrentState(empty_pb2.Empty()))
+    if client._vk is not None:
+        state.Verify(client._vk)      # BadSignatureError on failure
+    return state
+
+
 def _get_client():
     global _client
     if _client is not None:
         return _client
 
     from immudb import ImmudbClient
-    from immudb.rootService import PersistentRootService
 
     pathlib.Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
 
-    rs = PersistentRootService(STATE_FILE)
     pubkey = PUBKEY_FILE if PUBKEY_FILE and pathlib.Path(PUBKEY_FILE).exists() else None
+    # D47 (Phase 3c-3f): not PersistentRootService. Both of that class's
+    # seeds take ImmuDB's word for the state every later proof is measured
+    # against - see _VerifiedRootService for what replaces them.
+    rs = _VerifiedRootService(STATE_FILE, _state_verifying_key())
 
     _client = ImmudbClient(IMMUDB_ADDR, rs=rs, publicKeyFile=pubkey)
     _client.login(
@@ -768,15 +963,42 @@ def _fault_identity(record_value: bytes, record_key: bytes) -> str:
         # by `committed_key`, not by identity, and the fallback is derivable
         # from a page row: the row's `ledger_key` is the base64 raw key and
         # the fallback is sha256 of those bytes.
-        if len(identity.encode("utf-8", "replace")) <= MAX_FAULT_IDENTITY_BYTES:
+        #
+        # P3c3f-8 (Phase 3c-3f): and it is judged on whether it can be
+        # written, not on its length alone. Both length checks measure with
+        # `errors="replace"` and the write is a plain strict `.encode()`, so
+        # a call_id of lone surrogates - well-formed JSON, `\ud800` on the
+        # wire, a str after `json.loads` - is one character to every check
+        # here and unencodable at the ledger. Driven by the Phase 3c-3e red
+        # team through the real POST /write route: `fault_record: None`,
+        # `UnicodeEncodeError`, and zero unverified writes, which is a
+        # committed record left on the page with `ledger_fault: null` - the
+        # outcome the fault record exists to prevent, reached past the budget
+        # rather than through it.
+        #
+        # The defect was never that it failed quietly; `fault_record_error`
+        # and `_fault_failure_detail` already made it loud. It is that an
+        # unusable identity was never judged unusable, so the digest fallback
+        # below - which exists for exactly this - was never reached.
+        unusable = None
+        if len(identity.encode("utf-8", "replace")) > MAX_FAULT_IDENTITY_BYTES:
+            unusable = (
+                f"it is {len(identity.encode('utf-8', 'replace'))} bytes and a "
+                f"fault key has {MAX_FAULT_IDENTITY_BYTES} for its identity "
+                "component"
+            )
+        else:
+            try:
+                identity.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                unusable = f"it cannot be encoded for the ledger ({exc})"
+        if unusable is None:
             return identity
         logger.error(
-            "The call_id on the record at key %s is %d bytes and a fault key "
-            "has %d for its identity component, so this fault is keyed by the "
-            "digest of the record key instead. The fault is written either "
-            "way; the call_id is not a usable key component at this length.",
-            record_key.decode("utf-8", "replace")[:120],
-            len(identity.encode("utf-8", "replace")), MAX_FAULT_IDENTITY_BYTES,
+            "The call_id on the record at key %s is not a usable key "
+            "component: %s. This fault is keyed by the digest of the record "
+            "key instead, and the fault is written either way.",
+            record_key.decode("utf-8", "replace")[:120], unusable,
         )
     return "key:" + hashlib.sha256(record_key).hexdigest()[:32]
 
@@ -1206,13 +1428,18 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
         )
 
     # D40: the state read is outside the proof's own try, and its failure
-    # cannot describe the write. `currentState()` is a second RPC issued after
-    # `verifiedSet` has already committed, proved and persisted the new
-    # anchor; wrapping it in the same handler let a transport failure on that
-    # call report the whole write as never having occurred. It is logged here
-    # and changes nothing about the response.
+    # cannot describe the write. It is a second RPC issued after `verifiedSet`
+    # has already committed, proved and persisted the new anchor; wrapping it
+    # in the same handler let a transport failure on that call report the
+    # whole write as never having occurred. It is logged here and changes
+    # nothing about the response.
+    #
+    # D47 (Phase 3c-3f): `head_state`, not `client.currentState()`. This line
+    # reports the head for a log message, and the SDK's way of reporting it
+    # overwrites the anchor `verifiedSet` had just set under a proof with an
+    # unproven one, on the write key.
     try:
-        state = client.currentState()
+        state = head_state(client)
         logger.info("Verified write: tx=%d state_id=%d", resp.id, state.txId)
     except Exception as exc:
         logger.warning(
@@ -1769,6 +1996,23 @@ def _committed_position_for(client, view_set: bytes, key: bytes,
     answers with some other key, gives None - reported as `seq: null` beside
     `committed: true`, which says the record is in the ledger and its
     position is not confirmed.
+
+    **P3c3f-4 (Phase 3c-3f): the position returned is read from what came
+    back.** This function used to return `attempted_seq` on a key match, so
+    the number it reported was the number it asked for and the docstring's
+    "the position is reported only when the index agrees" was true only while
+    the bound held. D42's whole subject is that a bound can silently not
+    hold. Driven by the Phase 3c-3e red team: asked for
+    `minscore=maxscore=1000000042.0`, answered with this key at score
+    1000000007.0, and it returned 1000000042.
+
+    On a disagreement it answers None and does not raise. `seq: null` beside
+    `committed: true` is what D45 already means by "the record is in the
+    ledger and its position could not be confirmed", and this path exists to
+    report uncertainty honestly; raising would change the response contract
+    of the one branch written not to guess. The disagreement is logged at
+    error with both scores, because a view answering outside its bound is a
+    fact about the ledger and not about this call.
     """
     try:
         entries = client.zScan(zset=view_set, minscore=float(attempted_seq),
@@ -1781,8 +2025,30 @@ def _committed_position_for(client, view_set: bytes, key: bytes,
         member = getattr(entry, "key", None)
         if member is None:
             member = getattr(getattr(entry, "entry", None), "key", None)
-        if member == key:
-            return attempted_seq
+        if member != key:
+            continue
+        try:
+            returned = float(getattr(entry, "score"))
+        except (AttributeError, TypeError, ValueError):
+            logger.error(
+                "The view %s returned this record with no readable score, so "
+                "the position it holds cannot be confirmed: key=%s asked=%s",
+                view_set.decode("utf-8", "replace"),
+                key.decode("utf-8", "replace")[:120], attempted_seq,
+            )
+            return None
+        if returned != float(attempted_seq):
+            logger.error(
+                "The view %s answered a read bounded to [%s, %s] with this "
+                "record at position %s. The bound was not applied, so the "
+                "position this record holds is not confirmed by this read: "
+                "key=%s",
+                view_set.decode("utf-8", "replace"), float(attempted_seq),
+                float(attempted_seq), returned,
+                key.decode("utf-8", "replace")[:120],
+            )
+            return None
+        return int(returned)
     return None
 
 
@@ -1974,6 +2240,11 @@ def current_state(_: None = Depends(_require_read_key)):
     mutates the thing every later proof is measured against. The RPC is made
     directly and the persisted anchor is left exactly where it was.
 
+    D47 (Phase 3c-3f): that direct RPC is `head_state()` now, shared with the
+    two call sites in POST /write and POST /verify that were still calling
+    `currentState()` when this docstring was written. One copy, so the rule
+    and its argument cannot drift apart at three sites.
+
     The signature is verified here, against the ImmuDB public key mounted on
     this service's own volume, before the state is handed out. currentRoot's
     handler does not verify it, and an unverified state would be a state the
@@ -1987,8 +2258,6 @@ def current_state(_: None = Depends(_require_read_key)):
     to the same credential.
     """
     from ecdsa.keys import BadSignatureError
-    from google.protobuf import empty_pb2
-    from immudb.rootService import State
 
     client = _get_client()
     if client._vk is None:
@@ -2000,19 +2269,16 @@ def current_state(_: None = Depends(_require_read_key)):
             ),
         )
     try:
-        state = State.FromGrpc(client._stub.CurrentState(empty_pb2.Empty()))
-    except Exception as exc:
-        logger.error("CurrentState RPC failed: %s", exc)
-        raise HTTPException(status_code=503, detail=f"ImmuDB unavailable: {exc}")
-
-    try:
-        state.Verify(client._vk)
+        state = head_state(client)
     except BadSignatureError as exc:
         logger.error("CurrentState signature did not verify: %s", exc)
         raise HTTPException(
             status_code=503,
             detail="ImmuDB's current state is not signed by the configured key",
         )
+    except Exception as exc:
+        logger.error("CurrentState RPC failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"ImmuDB unavailable: {exc}")
 
     return CurrentStateResponse(
         db=state.db,
@@ -2141,15 +2407,22 @@ def verify(payload: VerifyRequest, _: None = Depends(_require_read_key)):
                 error_class="anchor_precedes_record",
             )
 
-        # Unchanged from Phase 3a on the unanchored path, deliberately:
-        # client.currentState() calls rs.set() on the way out, so it both
-        # reports the head and advances this service's persisted anchor to
-        # it, and that has been this endpoint's behaviour since Phase 1.3.
-        # On the anchored path it is not called at all - the persisted
-        # anchor must not move because someone asked a question about an
-        # old record, and _PinnedRootService.set() already refuses to move
-        # the one the proof itself ran against.
-        state = client.currentState() if payload.anchor is None else client._rs.get()
+        # D47 (Phase 3c-3f): `head_state`, not `client.currentState()`.
+        #
+        # This line reports the head in `state_id`, and it did so by calling
+        # the SDK method that advances the persisted anchor to it on the way
+        # out. That made this read-gated route a route that mutates durable
+        # state: driven by the Phase 3c-3e red team, four writes made
+        # straight to ImmuDB moved the head from 11 to 15, the anchor stayed
+        # at 11 because nothing had asked the verifier anything, and one
+        # `POST /verify` on the READ key moved it to 15. What was intended in
+        # Phase 1.3 was reporting the head; overwriting a verified anchor
+        # with an unverified one was a consequence of how the SDK reports it.
+        #
+        # `GET /state` reached the opposite conclusion about the same
+        # mutation in the same credential tier and wrote the argument down.
+        # The anchored path is unchanged and was already correct.
+        state = head_state(client) if payload.anchor is None else client._rs.get()
         logger.info(
             "Verified read: tx=%d anchor=%d state_id=%d verified=%s",
             resp.id,

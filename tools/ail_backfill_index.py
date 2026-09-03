@@ -200,6 +200,7 @@ def scan_all(client: httpx.Client, headers: dict, prefix: str) -> list[dict]:
     """
     out: list[dict] = []
     seek = ""
+    seek_key: bytes | None = None
     while True:
         body = {"prefix": b64(prefix), "desc": False, "limit": SCAN_PAGE}
         if seek:
@@ -228,10 +229,37 @@ def scan_all(client: httpx.Client, headers: dict, prefix: str) -> list[dict]:
                     "an unbounded read at HTTP 200. Every key this pass reads "
                     "is zAdded into a view index and becomes a page row."
                 )
+            # P3c3f-5 (Phase 3c-3f): the SECOND bound, driven.
+            #
+            # This read carries two selective bounds and only `prefix` was
+            # asserted on. `seekKey` is exclusive and this scan is ascending,
+            # so every key on a page after the first must sort strictly above
+            # the key that page seeked from. A client that honours `prefix`
+            # and drops `seekKey` - what a dropped paging parameter looks like
+            # on this route - returns the same full page forever, and the
+            # loop's only exit is `len(entries) < SCAN_PAGE`, which a full
+            # page never satisfies. Measured by the Phase 3c-3e red team at
+            # 225 identical pages and about 562,500 accumulated rows in eight
+            # seconds, with no refusal and no termination; measured again here
+            # at 767 pages in eight seconds before this line existed.
+            #
+            # The coverage table called this site covered on the strength of
+            # the prefix driver alone, which is why the table is keyed by
+            # site AND bound now (tests/test_bounded_reads.py).
+            if seek_key is not None and key <= seek_key:
+                raise SystemExit(
+                    f"refusing to backfill: a bounded read seeked past "
+                    f"{seek_key.decode('utf-8', 'replace')!r} and returned "
+                    f"{key.decode('utf-8', 'replace')!r}, which does not sort "
+                    "above it. The seekKey bound was not applied, so this walk "
+                    "is reading the same page repeatedly and would index every "
+                    "row on it again at a new position."
+                )
         out.extend(entries)
         if len(entries) < SCAN_PAGE:
             break
         seek = entries[-1]["key"]
+        seek_key = unb64(seek)
     return out
 
 
