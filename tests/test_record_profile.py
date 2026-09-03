@@ -28,6 +28,9 @@ import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bounded_read_checks import assert_under_prefix  # noqa: E402
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
 os.environ.setdefault("DECISION_SERVICE_URL", "http://localhost:8010/decide")
@@ -68,7 +71,12 @@ def _raw_scan(prefix: str, limit: int = 500) -> list[dict]:
             headers={"Authorization": f"Bearer {token}"},
         )
         scan.raise_for_status()
-        return scan.json().get("entries", [])
+        entries = scan.json().get("entries", [])
+        # P3c3f-3 (D46): the bound, asserted on what came back.
+        assert_under_prefix(
+            [base64.b64decode(e["key"]).decode("utf-8", "replace")
+             for e in entries], prefix, f"_raw_scan({prefix!r})")
+        return entries
 
 
 def _find_raw_decision_by_agent_id(agent_id: str) -> dict:

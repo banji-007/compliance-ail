@@ -43,6 +43,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+
+from bounded_read_checks import assert_at_or_above_min_score  # noqa: E402
 
 IMMUDB_URL        = os.getenv("IMMUDB_URL",        "http://localhost:8080")
 IMMUDB_USER       = os.getenv("IMMUDB_USER",       "immudb")
@@ -105,9 +108,14 @@ def _view_rows(headers: dict) -> dict[str, list[float]]:
         if not rows:
             break
         before = sum(len(v) for v in out.values())
-        for row in rows:
-            key = base64.b64decode(row["entry"]["key"]).decode()
-            out.setdefault(key, []).append(float(row.get("score", 0.0)))
+        page = [(base64.b64decode(row["entry"]["key"]).decode(),
+                 float(row.get("score", 0.0))) for row in rows]
+        # P3c3f-3 (D46): the bound, asserted on what came back. An under-read
+        # here hides a record holding two positions, which is what this
+        # module exists to detect.
+        assert_at_or_above_min_score(page, min_score, "_view_rows")
+        for key, score in page:
+            out.setdefault(key, []).append(score)
         min_score = float(rows[-1].get("score", 0.0))
         if len(rows) < 2500 or sum(len(v) for v in out.values()) == before:
             break

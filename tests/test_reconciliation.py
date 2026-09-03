@@ -47,6 +47,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
+from bounded_read_checks import assert_at_or_above_min_score  # noqa: E402
+
 CONTROL_PLANE_URL  = os.getenv("CONTROL_PLANE_URL",       "http://localhost:8002")
 READ_API_KEY       = os.getenv("CONTROL_PLANE_READ_KEY",  "test-read-key")
 VERIFIER_URL       = os.getenv("VERIFIER_URL",            "http://localhost:8003")
@@ -143,9 +145,15 @@ def _positions_for_key(key: str) -> list[float]:
         rows = resp.json().get("entries", [])
         if not rows:
             return sorted(found)
-        for row in rows:
-            if base64.b64decode(row["entry"]["key"]).decode("utf-8", "replace") == key:
-                found.append(float(row.get("score", 0.0)))
+        page = [(base64.b64decode(row["entry"]["key"]).decode("utf-8", "replace"),
+                 float(row.get("score", 0.0))) for row in rows]
+        # P3c3f-3 (D46): the bound, asserted on what came back. An under-read
+        # here reports one position for a key that holds two, which is the
+        # finding this module drives the reconciler to produce.
+        assert_at_or_above_min_score(page, min_score, "_positions_for_key")
+        for member, score in page:
+            if member == key:
+                found.append(score)
         next_score = float(rows[-1].get("score", 0.0))
         if len(rows) < 2500 or next_score == min_score:
             return sorted(found)

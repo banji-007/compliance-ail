@@ -47,9 +47,23 @@ def _parse(compose_text: str):
     """Service mounts and the file's own top-level `volumes:` names.
 
     A small reader rather than a YAML dependency, for the same reason
-    tests/test_image_contents.py gives: this repository has none, and what is
-    needed here is two shapes - `- name:/path` under a service's `volumes:`,
-    and the bare names under the top-level `volumes:` block.
+    tests/test_image_contents.py gives: this repository has none.
+
+    **Two shapes of mount, not one (P3c3f-9, Phase 3c-3f).** Compose accepts a
+    short form, `- name:/path`, and a long form:
+
+        - type: bind
+          source: ./ledger-on-the-host
+          target: /var/lib/immudb
+
+    The reader used to `spec.split(":")` every list item, so the long form's
+    first line became a mount named `type` at target `" bind"`, which is in no
+    stateful path list and was skipped. `docker compose config` resolves that
+    file to a host bind mount of ImmuDB's data directory, and a host path
+    survives `down -v` entirely - the exact thing this module exists to
+    exclude. `assert covered` does not save it: one short-form stateful mount
+    left anywhere in the file satisfies that, which is the realistic case
+    where one service is changed and the others are not.
     """
     mounts: list[tuple[str, str, str]] = []       # (service, source, target)
     declared: dict[str, str] = {}                 # name -> the lines under it
@@ -57,6 +71,24 @@ def _parse(compose_text: str):
     section = None
     top_level_volumes = False
     pending_volume = None
+    long_form: dict[str, str] | None = None
+
+    def _flush_long_form():
+        """One long-form entry, once it is complete, as (source, target).
+
+        An entry with no `source` is an anonymous volume, which Compose
+        creates and `down -v` removes - but it is not declared in the file,
+        so it is reported under a name the caller's "this file declares no
+        such volume" branch refuses rather than being dropped silently.
+        """
+        nonlocal long_form
+        if long_form is None:
+            return
+        entry, long_form = long_form, None
+        target = entry.get("target", "")
+        if target:
+            mounts.append((service or "", entry.get("source") or "<anonymous>",
+                           target))
 
     for raw in compose_text.splitlines():
         if not raw.strip() or raw.strip().startswith("#"):
@@ -65,6 +97,7 @@ def _parse(compose_text: str):
         line = raw.strip()
 
         if indent == 0:
+            _flush_long_form()
             top_level_volumes = line.startswith("volumes:")
             section = None
             if line.startswith("services:"):
@@ -81,20 +114,36 @@ def _parse(compose_text: str):
             continue
 
         if indent == 2 and line.endswith(":"):
+            _flush_long_form()
             service = line[:-1].strip()
             section = None
             continue
         if indent == 4 and line.startswith("volumes:"):
+            _flush_long_form()
             section = "volumes"
             continue
         if indent == 4 and line.endswith(":"):
+            _flush_long_form()
             section = None
             continue
-        if section == "volumes" and line.startswith("- "):
+        if section != "volumes":
+            _flush_long_form()
+            continue
+
+        if line.startswith("- "):
+            _flush_long_form()
             spec = line[2:].strip()
+            key, _colon, value = spec.partition(":")
+            if key.strip() in ("type", "source", "target") and _colon:
+                long_form = {key.strip(): value.strip()}
+                continue
             parts = spec.split(":")
             if len(parts) >= 2:
                 mounts.append((service or "", parts[0], parts[1]))
+        elif long_form is not None and ":" in line:
+            key, _colon, value = line.partition(":")
+            long_form[key.strip()] = value.strip()
+    _flush_long_form()
     return mounts, declared
 
 
@@ -134,6 +183,25 @@ def test_every_stateful_mount_is_a_named_volume_that_down_v_removes(compose_name
     )
 
 
+def external_volumes(declared: dict[str, str]) -> list[str]:
+    """The volume names this file declares `external`.
+
+    **P3c3f-9: case-insensitive, and a function rather than a line inside the
+    test below.** The test that drives the three spellings has to drive THIS
+    rule. Spelled inline in both places, the phase's own mutation left the
+    suite at `6 passed` against a check the test was written to catch, which is
+    this phase's subject one level up: a rule holding at two sites with nothing
+    tying them together.
+
+    YAML's boolean is `true`, `True` or `TRUE`; Compose parses all three and
+    `docker compose config` resolves every one of them to `external: true`.
+    The Phase 3c-3e red team wrote `external: True` and this check reported
+    nothing, which is a ledger written into a volume `down -v` leaves alone.
+    """
+    return sorted(name for name, body in declared.items()
+                  if re.search(r"external:\s*true", body, re.IGNORECASE))
+
+
 @pytest.mark.parametrize("compose_name", COMPOSE_FILES)
 def test_no_volume_is_external(compose_name):
     """`down -v` removes the volumes the project created and leaves an
@@ -141,10 +209,90 @@ def test_no_volume_is_external(compose_name):
     across every run by design."""
     path = REPO_ROOT / compose_name
     _mounts, declared = _parse(path.read_text(encoding="utf-8"))
-    external = sorted(name for name, body in declared.items()
-                      if re.search(r"external:\s*true", body))
+    external = external_volumes(declared)
     assert not external, (
         f"{compose_name} declares external volume(s) {external}. `docker "
         "compose down -v` does not remove those, so a ledger written into one "
         "survives every teardown this project performs."
+    )
+
+
+# ---------------------------------------------------------------------------
+# P3c3f-9: the two spellings Compose accepts and this parse could not see.
+# ---------------------------------------------------------------------------
+
+# Verified against `docker compose -p p3c3ffixb9 config`, which resolves this
+# to a bind mount of ImmuDB's data directory to a host path and to
+# `external: true` on the named volume. Neither is hypothetical YAML.
+_BOTH_SPELLINGS = """services:
+  immudb:
+    image: busybox
+    volumes:
+      - type: bind
+        source: ./ledger-on-the-host
+        target: /var/lib/immudb
+  verifier:
+    image: busybox
+    volumes:
+      - verifier-state:/data/verifier-state
+volumes:
+  verifier-state:
+    external: True
+"""
+
+
+def test_a_long_form_bind_mount_of_the_ledger_is_seen():
+    """The mount spelling the parse could not read.
+
+    `spec.split(":")` on `- type: bind` produced a mount named `type` at
+    target `" bind"`, which matches no stateful container path and was
+    skipped. The stack it describes keeps its ledger on the host, where
+    `down -v` cannot touch it.
+
+    Driven through the same check the compose files go through, so this
+    asserts what the test does rather than what the parse returns.
+    """
+    mounts, _declared = _parse(_BOTH_SPELLINGS)
+    stateful = [(service, source, target) for service, source, target in mounts
+                if target in STATEFUL_CONTAINER_PATHS]
+    assert ("immudb", "./ledger-on-the-host", "/var/lib/immudb") in stateful, (
+        "the long-form bind mount of ImmuDB's data directory is not a mount "
+        f"this parse produced. It produced: {mounts}"
+    )
+
+    offenders = [f"{source} at {target}" for service, source, target in stateful
+                 if source.startswith(".") or source.startswith("/")]
+    assert offenders, (
+        "the host path this file binds the ledger to is not refused, so a "
+        "ledger that survives every `down -v` this project performs passes "
+        "this module"
+    )
+
+    # And the control: the short-form mount in the same file is still read.
+    assert ("verifier", "verifier-state", "/data/verifier-state") in mounts, (
+        "the short-form mount stopped being parsed, so a parse that returns "
+        f"nothing at all would satisfy the assertion above: {mounts}"
+    )
+
+
+def test_an_external_volume_is_seen_whatever_case_yaml_spells_true_in():
+    """`external: True` is external to Compose and was not to the regex.
+
+    YAML's boolean is case-insensitive and Compose resolves `True`, `TRUE`
+    and `true` alike. `down -v` does not remove an external volume, so a
+    ledger written into one survives every teardown.
+    """
+    for spelling in ("true", "True", "TRUE"):
+        _mounts, declared = _parse(_BOTH_SPELLINGS.replace("external: True",
+                                                           f"external: {spelling}"))
+        external = external_volumes(declared)
+        assert external == ["verifier-state"], (
+            f"`external: {spelling}` is not reported as an external volume: "
+            f"{declared}"
+        )
+
+    _mounts, declared = _parse(_BOTH_SPELLINGS.replace("    external: True\n", ""))
+    assert not external_volumes(declared), (
+        "a volume with no `external:` key is reported as external, so the "
+        "check above would pass against a file with no external volume in it"
     )

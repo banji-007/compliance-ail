@@ -690,6 +690,77 @@ def test_an_over_long_call_id_is_refused_as_an_identity_and_the_fault_is_still_w
     )
 
 
+def test_a_call_id_that_cannot_be_encoded_is_refused_as_an_identity_too():
+    """P3c3f-8 (Phase 3c-3f). A1's outcome, reached past the budget rather
+    than through it.
+
+    Both length checks measure with `errors="replace"` and the write is a
+    plain strict `.encode()`, so a `call_id` of lone surrogates is one
+    character to every check here and unencodable at the ledger. It is
+    caller-supplied and it arrives as well-formed JSON: a `\\ud800` escape on
+    the wire, and `json.loads` hands back a `str` holding the surrogate.
+
+    Driven by the Phase 3c-3e red team through the real `POST /write` against
+    a client whose proof fails, which is the condition a fault record exists
+    for:
+
+        committed        : True   tx_id: 77
+        fault_record     : None
+        fault_record_err : UnicodeEncodeError ... surrogates not allowed
+        unverified writes the route actually made: 0
+
+    A committed record, its proof failed, and nothing durable recording why -
+    the page row reading `ledger_fault: null` that this record type exists to
+    prevent, selected by the caller by choosing its own call_id.
+
+    **The defect was not loudness.** `fault_record_error` carried the
+    exception and `_fault_failure_detail`'s sentence was already in `detail`
+    on unmodified head, so "or it fails loudly" was closed by running the
+    existing code. The defect is that `_fault_identity` judged the call_id on
+    length alone, so an identity that could never be written was never judged
+    unusable and the digest fallback - which exists for exactly this - was
+    never reached.
+    """
+    verifier = _verifier_module()
+    record_key = b"tool_call:p3c3f-surrogate:abc:query_database"
+
+    # The record value as it arrives: ASCII on the wire, carrying the
+    # surrogate as a JSON escape. `chr(92)` rather than a backslash literal so
+    # nothing between this source and the file can eat it.
+    escape = chr(92) + "ud800"
+    surrogate_record = (
+        '{"record_type":"decision","call_id":"' + escape * 300 + '"}'
+    ).encode("ascii")
+    assert len(json.loads(surrogate_record.decode())["call_id"]) == 300, (
+        "the probe record does not carry 300 lone surrogates, so it is not "
+        "the input this test is about"
+    )
+
+    identity = verifier._fault_identity(surrogate_record, record_key)
+    assert identity.startswith("key:"), (
+        "a call_id that cannot be encoded for the ledger was accepted as a "
+        f"key component: {identity[:80]!r}"
+    )
+    assert identity == "key:" + hashlib.sha256(record_key).hexdigest()[:32], (
+        f"the fallback is not the digest derivable from a page row: {identity}"
+    )
+
+    # The whole point: the key the write hands the ledger encodes.
+    key = verifier._fault_key(surrogate_record, record_key, 77,
+                              "0123456789abcdef")
+    assert key.encode(), key
+    assert len(key.encode()) <= verifier.MAX_LEDGER_KEY_BYTES, key
+
+    # And the control, so this passes for the right reason: the same 300
+    # characters that CAN be encoded are still accepted as the identity.
+    encodable = ('{"record_type":"decision","call_id":"' + "a" * 300
+                 + '"}').encode()
+    assert verifier._fault_identity(encodable, record_key) == "a" * 300, (
+        "an ordinary 300-character call_id was refused as an identity, so the "
+        "refusal above is about length rather than about encodability"
+    )
+
+
 def test_a_fault_key_that_would_exceed_the_ledgers_maximum_fails_at_construction():
     """The bound is asserted where the key is built, not at the ledger.
 

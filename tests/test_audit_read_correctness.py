@@ -66,6 +66,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from bounded_read_checks import assert_at_or_above_min_score  # noqa: E402
+
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
 READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 WRITE_API_KEY = os.getenv("CONTROL_PLANE_WRITE_KEY", "test-write-key")
@@ -400,8 +405,13 @@ def _view_row_count(view_set: str) -> int:
             if not rows:
                 break
             before = len(seen)
-            for row in rows:
-                seen.add((row["entry"]["key"], float(row.get("score", 0.0))))
+            page = [(row["entry"]["key"], float(row.get("score", 0.0)))
+                    for row in rows]
+            # P3c3f-3 (D46): the bound, asserted on what came back. This
+            # number is compared against what /audit reports as its total.
+            assert_at_or_above_min_score(
+                page, min_score, f"_view_row_count({view_set})")
+            seen.update(page)
             min_score = float(rows[-1].get("score", 0.0))
             if len(rows) < 2500 or len(seen) == before:
                 break

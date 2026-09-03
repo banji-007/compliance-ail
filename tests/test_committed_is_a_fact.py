@@ -64,6 +64,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
+from bounded_read_checks import assert_inside_score_window  # noqa: E402
+
 from compose_helpers import (  # noqa: E402
     COMPOSE_PROJECT, compose, requires_docker_cli, wait_for_health,
 )
@@ -357,6 +359,46 @@ def cut_until_it_lands(build, drive, landed, attempts: int = 4):
         if landed(subject, result):
             return subject, result, attempt + 1
     return subject, result, attempts
+
+
+def confirming_read_could_not_run(response) -> bool:
+    """Whether `committed: null` means the FIXTURE missed, rather than the
+    route lying.
+
+    **P3c3f-1 (Phase 3c-3f). This is the retry predicate's third conjunct, and
+    it is a function so the enforcing test can drive the same one the call
+    site uses.**
+
+    The predicate at the ordered-write call site read
+    `r[0].json().get("committed") is True`, which is the assertion twenty
+    lines below it. `cut_until_it_lands`'s docstring says in bold that it
+    retries the fixture and never the assertion, and `is True` excludes `null`
+    AND `false`. `false` is the defect: the Phase 3c-3e red team injected A4.1
+    intermittently, the route answered `committed=false tx_id=null` for a
+    record present at transaction 8, the predicate called that a miss, drove
+    the whole write again, and the suite read `1 passed`. Reproduced here at
+    `attempts: 2` with the lie discarded.
+
+    `is not None` is the condition, and it is not the correction the
+    instruction named. `is not False` was proposed, on the argument that null
+    is honest and false is the only lie - which is right about the assertion
+    and backwards here, because a predicate answering False is what causes a
+    retry:
+
+        committed  true  -> the fixture worked            -> stop, and assert
+        committed  false -> the fixture worked, route lied -> STOP, and assert
+        committed  null  -> the confirming read could not run -> retry
+
+    `is not False` stops on null and retries on false, which is wrong in both
+    of the two rows that matter.
+
+    Null is a fixture condition on these tests specifically: the relay closes
+    the connection it cut, so the read the route makes to settle `committed`
+    can hit a dead socket. That is D45 being honest and it is asserted in its
+    own right by
+    `test_a_plain_write_states_no_fact_when_the_confirming_read_is_cut_too`.
+    """
+    return response.json().get("committed") is None
 
 
 @contextlib.contextmanager
@@ -696,8 +738,15 @@ def _members_at_position(headers: dict, view_set: str, score: float):
         "minScore": {"score": score}, "maxScore": {"score": score},
     }, headers=headers)
     resp.raise_for_status()
-    return [base64.b64decode(row["entry"]["key"]).decode()
-            for row in resp.json().get("entries", [])]
+    rows = resp.json().get("entries", [])
+    page = [(base64.b64decode(row["entry"]["key"]).decode(),
+             float(row.get("score", 0.0))) for row in rows]
+    # P3c3f-3 (D46): the window, asserted on what came back. Without it a
+    # dropped bound makes "this key is at this position" true of every
+    # position the view holds.
+    assert_inside_score_window(page, score, score,
+                               f"_members_at_position({view_set})")
+    return [member for member, _score in page]
 
 
 @requires_stack
@@ -733,10 +782,15 @@ def test_an_ordered_write_that_committed_is_reported_as_committed_when_its_respo
     # and answer `committed: null` - which is D45 being honest, asserted in
     # its own right by test_a_plain_write_states_no_fact_when_the_confirming_
     # read_is_cut_too below, and not the state this test is about.
+    #
+    # P3c3f-1: `confirming_read_could_not_run`, not `committed is True`. The
+    # third conjunct used to be the assertion below, so a route answering
+    # `committed: false` about a record in the ledger was retried past instead
+    # of failing. See that function for the transcript.
     key, (response, log), _tries = cut_until_it_lands(
         _build, _drive,
         lambda k, r: "dropping the" in r[1] and k in _getall(headers, [k])
-        and r[0].json().get("committed") is True)
+        and not confirming_read_could_not_run(r[0]))
 
     assert response.status_code == 200, response.text[:300]
     body = response.json()
@@ -1027,3 +1081,121 @@ def test_a_write_that_genuinely_did_not_land_can_be_retried():
         f"a legitimate retry did not succeed: {again}"
     )
     assert key in _getall(headers, [key]), again
+
+
+# ---------------------------------------------------------------------------
+# P3c3f-1: the retry helper, driven. No stack, no containers, no relay.
+# ---------------------------------------------------------------------------
+
+class _Answered:
+    """One response from a route, with the two fields the predicate reads."""
+
+    def __init__(self, body: dict):
+        self._body = body
+        self.status_code = 200
+        self.text = json.dumps(body)
+
+    def json(self) -> dict:
+        return self._body
+
+
+# The three answers a write route can give about the ledger, and what the
+# fixture is supposed to do with each. Written down here because the whole
+# defect was that one of these rows was treated as another.
+_A41 = {"tx_id": None, "seq": None, "verified": False, "committed": False,
+        "attempts": 1}
+_HONEST = {"tx_id": 8, "seq": 1000000004, "verified": False,
+           "committed": True, "attempts": 1}
+_UNKNOWN = {"tx_id": None, "seq": None, "verified": False, "committed": None,
+            "attempts": 1}
+
+
+def _replaying(answers):
+    """A `drive` that returns each answer in turn, then repeats the last."""
+    calls = []
+
+    def drive(_subject):
+        answer = answers[min(len(calls), len(answers) - 1)]
+        calls.append(answer)
+        return _Answered(answer), "dropping the response for the marked stream"
+
+    return drive, calls
+
+
+def _landed(subject, result):
+    """The predicate the ordered-write test above uses, minus the ledger read.
+
+    The `_getall` conjunct is a live ledger query; the two conjuncts kept here
+    are the ones that decide what the helper does with an answer.
+    """
+    return ("dropping the" in result[1]
+            and not confirming_read_could_not_run(result[0]))
+
+
+def test_the_retry_helper_does_not_retry_past_a_route_that_says_committed_false():
+    """P3c3f-1. `cut_until_it_lands` retries the fixture and never the
+    assertion, and this is what makes that sentence true rather than aspirational.
+
+    The route answers the A4.1 shape once - `committed: false, tx_id: null`
+    about a record that is in the ledger - and then correctly. The helper must
+    stop at the first answer and hand it to the caller's assertions, which is
+    where it fails. Retrying past it is how a real, intermittent A4.1 injection
+    left the suite at `1 passed` while the route lied on attempt one:
+
+        call 1: route ANSWERED committed=false tx_id=null;
+                ledger state=present tx=21
+        call 2: route told the truth; tx=22
+        1 passed, 8 deselected in 127.86s
+
+    Behavioural, not a parse. P3c3e-9 retired a source parse over this
+    directory after it was defeated three times, and a check retired for cause
+    does not come back as an acceptance criterion. Nothing here is read from
+    the source: the real helper is called with the real predicate.
+    """
+    drive, calls = _replaying([_A41, _HONEST])
+    _subject, (response, _log), tries = cut_until_it_lands(
+        lambda: "tool_call:p3c3f:probe:query_database", drive, _landed)
+
+    assert tries == 1, (
+        f"the helper drove {tries} attempts. The route answered "
+        f"{calls[0]} on the first one, which is a record in the ledger "
+        "reported as never written, and the predicate treated that as a "
+        "fixture miss and retried past it. The assertion this test's live "
+        "counterpart makes never saw the answer that would have failed it."
+    )
+    assert response.json()["committed"] is False, (
+        "the caller was handed something other than the answer the route "
+        f"actually gave first: {response.json()}"
+    )
+
+
+def test_the_retry_helper_still_retries_when_the_confirming_read_could_not_run():
+    """The other half, so the fix above is not just 'never retry'.
+
+    `committed: null` is D45 being honest: the relay closes the connection it
+    cut, so the read the route makes to settle whether the record committed
+    can hit a dead socket. That is a fixture condition and it is what this
+    helper exists to retry. A predicate that stopped on it would hand the
+    caller `null` and fail an assertion about the route on a fact about the
+    fixture.
+    """
+    drive, calls = _replaying([_UNKNOWN, _HONEST])
+    _subject, (response, _log), tries = cut_until_it_lands(
+        lambda: "tool_call:p3c3f:probe:query_database", drive, _landed)
+
+    assert tries == 2, (
+        f"the helper stopped after {tries} attempt(s) on {calls[0]}, which is "
+        "the confirming read not having run rather than the route saying "
+        "anything about the ledger"
+    )
+    assert response.json()["committed"] is True, response.json()
+
+
+def test_the_retry_helper_stops_on_an_honest_answer():
+    """And the control, so neither test above passes against a helper that
+    always stops or always retries."""
+    drive, _calls = _replaying([_HONEST])
+    _subject, (response, _log), tries = cut_until_it_lands(
+        lambda: "tool_call:p3c3f:probe:query_database", drive, _landed)
+    assert tries == 1, tries
+    assert response.json()["committed"] is True, response.json()

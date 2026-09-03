@@ -64,6 +64,11 @@ IMMUDB_PASSWORD    = os.getenv("IMMUDB_PASSWORD",         "immudb")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+
+from bounded_read_checks import (  # noqa: E402
+    assert_at_or_above_min_score, assert_under_prefix,
+)
 
 SEQUENCE_KEY   = "ail_seq:commit"
 VIEW_DECISION  = "ail_view:decision:v1"
@@ -186,6 +191,27 @@ def _zscan(headers: dict, view_set: str, limit: int = 2500, desc: bool = True) -
     return resp.json().get("entries", [])
 
 
+def _keys_under_prefix(headers: dict, prefix: str, limit: int = 2500) -> set[str]:
+    """Every ledger key under a prefix, with the bound asserted on what came
+    back.
+
+    P3c3f-3 (D46): this was an inline scan inside the test below, so the
+    bounded read `tests/test_bounded_reads.py` now enumerates could not be
+    driven without a stack. A dropped prefix returns the whole ledger, and
+    the assertion it feeds - "the ledger holds no record under this test's
+    prefix that this test did not write" - then fails naming rows written by
+    every other module in the suite.
+    """
+    resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/scan", json={
+        "prefix": _b64(prefix), "desc": False, "limit": limit,
+    }, headers=headers)
+    resp.raise_for_status()
+    keys = {base64.b64decode(entry["key"]).decode("utf-8", "replace")
+            for entry in resp.json().get("entries", [])}
+    assert_under_prefix(sorted(keys), prefix, f"_keys_under_prefix({prefix!r})")
+    return keys
+
+
 def _view_rows_paged(headers: dict, view_set: str) -> list[tuple[str, float]]:
     """Every (key, position) in a view, paged past zscan's 2500-row ceiling.
 
@@ -209,9 +235,12 @@ def _view_rows_paged(headers: dict, view_set: str) -> list[tuple[str, float]]:
         if not rows:
             break
         before = len(seen)
-        for row in rows:
-            key = base64.b64decode(row["entry"]["key"]).decode("utf-8", "replace")
-            score = float(row.get("score", 0.0))
+        page = [(base64.b64decode(row["entry"]["key"]).decode("utf-8", "replace"),
+                 float(row.get("score", 0.0))) for row in rows]
+        # P3c3f-3 (D46): the bound, asserted on what came back.
+        assert_at_or_above_min_score(
+            page, min_score, f"_view_rows_paged({view_set})")
+        for key, score in page:
             if (key, score) in seen:
                 continue
             seen.add((key, score))
@@ -449,11 +478,7 @@ def test_a_retried_write_leaves_no_unindexed_record_behind():
     with ThreadPoolExecutor(max_workers=6) as pool:
         written = {k for chunk in pool.map(burst, range(6)) for k in chunk}
 
-    resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/scan", json={
-        "prefix": _b64(f"tool_call:{tag}"), "desc": False, "limit": 2500,
-    }, headers=headers)
-    resp.raise_for_status()
-    in_ledger = {base64.b64decode(e["key"]).decode() for e in resp.json().get("entries", [])}
+    in_ledger = _keys_under_prefix(headers, f"tool_call:{tag}")
 
     indexed = {base64.b64decode(r["key"]).decode()
                for r in _zscan(headers, VIEW_DECISION, limit=2500)}

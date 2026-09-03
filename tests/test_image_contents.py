@@ -55,15 +55,62 @@ encoding nobody here thought of, and a surface nobody here thought of. The
 first list is a table anyone can extend; the second has the two that exist for
 a local image - what a running container sees, and what the image holds.
 
-**The bound on reading, stated:** only the first 16 KiB of a file is examined.
-A PEM P-256 key is about 230 bytes and an RSA 4096 key about 3.2 KiB, so a key
-file is covered whole; a key buried past 16 KiB of other content is not.
+**Phase 3c-3f (P3c3f-7): three shapes closed, one bound kept with its cost.**
+The Phase 3c-3e red team shipped three shapes of the live
+`keys/writer-decision.key` in the real decision-service image at `18 passed`
+and recovered one byte-identical with `docker run` and `base64 -d`. Two
+detector gaps produced that, and both are closed: a decoded base64 body was
+offered to the binary rule but never to the PEM armour rule, so base64 of a
+PEM was not key material - which is how a Kubernetes Secret, a Helm value, a
+JSON config and a `.env` line each carry a key. And `_B64RUN.findall(head)[:20]`
+decoded the first twenty base64 runs only, so a DER key behind 21 decoy runs
+was invisible while the same key behind 19 was found. Gzip is caught now too.
+
+**The bound on reading, stated, and kept for a measured reason:** only the
+first 16 KiB of a file is examined. A PEM P-256 key is about 230 bytes and an
+RSA 4096 key about 3.2 KiB, so a key file is covered whole; a key buried past
+16 KiB of other content is not.
+
+That bound is a decision rather than an oversight, and here is what it buys,
+measured inside `decision-service` (6800 files, 43 MB read at 16 KiB against
+170 MB whole):
+
+    16 KiB head, first 20 base64 runs (the old detector)   17.7s, 16.5s
+    16 KiB head, every base64 run (this phase)             18.5s, 18.3s
+    whole files, every base64 run                          57.5s, 57.4s
+
+Dropping the twenty-run cap costs about a second and a half per image.
+Dropping the head bound is 3.1 times the work on the running-filesystem
+surface, four images and two surfaces, against a check pass that already
+measures about three and a half minutes.
+
+**And there is a second reason, which the measurement turned up.** The
+whole-file walk returns one hit:
+
+    base64-pkcs8-der /usr/local/lib/python3.11/site-packages/ecdsa/
+                     __pycache__/test_keys.cpython-311.pyc  (62047 bytes)
+
+That is a published test vector inside a dependency's bytecode, past 16 KiB,
+and it is real private key material by every rule here. Abandoning the bound
+therefore means an exemption list keyed by path - name matching, standing in
+front of a content check, which is exactly what the Phase 3c-3d red team got
+past and what the rewrite above exists to replace. Buying the bound is a scope
+call and it is not this phase's to make.
+
+**Gzip, closed rather than bounded.** A `.gz` of a PEM was the one archive
+shape missed while the same key inside an uncompressed `.tar` and inside a
+`.zip` was caught, because compression destroys the base64 body the `_B64RUN`
+rule decodes. A failed `gzip.decompress` on a 16 KiB head measures 0.010 ms
+and the four-image pass did not move, so it is caught. What is still not
+caught: a gzip member whose compressed form runs past the head, which raises
+`EOFError` and answers nothing, and any compression this list does not name.
+
 Binary key material is additionally required to start at offset zero of the
-file, or of a base64 body inside it, which is what a key file is - a DER blob
-embedded in the middle of some other binary is not found, and
-`ecdsa/__pycache__/ssh.cpython-311.pyc`, which carries the OpenSSH magic
-string as a constant because it is the module that parses the format, is
-correctly not a hit.
+file, of a base64 body inside it, or of a decompressed gzip member, which is
+what a key file is - a DER blob embedded in the middle of some other binary is
+not found, and `ecdsa/__pycache__/ssh.cpython-311.pyc`, which carries the
+OpenSSH magic string as a constant because it is the module that parses the
+format, is correctly not a hit.
 
 Requires the docker CLI and the images the compose stack was built from.
 """
@@ -107,7 +154,12 @@ _HEAD_BYTES = 16384
 #
 # Stdlib only, for the same reason.
 _DETECTOR_SOURCE = r'''
-import base64 as _b64, re as _re
+import base64 as _b64, gzip as _gzip, io as _io, re as _re
+
+# How much of a compressed body is decompressed before the detector gives up.
+# The same 16 KiB the caller reads, so a crafted member cannot cost more than
+# an ordinary file does.
+_DECOMPRESS_LIMIT = 16384
 
 # PEM, in every armour that says PRIVATE KEY, plus PuTTY's own header. The
 # BEGIN line has to be at column zero with a matching END: source code that
@@ -167,6 +219,52 @@ def _binary_key_material(blob):
     return None
 
 
+def _b64_candidates(run):
+    """The bodies a matched base64 run could actually be.
+
+    `=` is base64 PADDING and is only valid at the end of a body, so a run
+    holding `=` with more base64 characters after it is not one body: it is a
+    name, an assignment, and then the body. `AIL_WRITER_SIGNING_KEY_B64=<key>`
+    is that shape, and decoding the run whole shifts the alignment by four
+    characters and produces nothing. So the run is offered whole and then in
+    the pieces the padding runs cut it into.
+
+    P3c3f-7. Without this the `.env` line is not detected while the identical
+    key in a Kubernetes Secret is, because YAML happens to put a space between
+    the key and the value and `AIL_..._B64=` has no separator the run rule
+    breaks on.
+    """
+    flat = _re.sub(br"[\r\n]", b"", run)
+    seen = [flat]
+    for piece in _re.split(br"=+", flat):
+        # Re-padded: the split removed this piece's own trailing `=`, and
+        # b64decode refuses a body whose length is not a multiple of four
+        # however lenient it is about everything else.
+        piece = piece + b"=" * (-len(piece) % 4)
+        if len(piece) >= 120 and piece not in seen:
+            seen.append(piece)
+    return seen
+
+
+def _gzip_body(head):
+    """A gzip member's contents, bounded, or empty.
+
+    Anchored at offset zero by the magic, which is the same rule the binary
+    check draws: a `.gz` file is a gzip member at offset zero, and a byte
+    sequence that happens to contain the magic somewhere is a mention.
+
+    A member whose compressed form runs past the head raises `EOFError` and
+    answers nothing, so this catches a small compressed key and states that it
+    does not catch a large one.
+    """
+    if head[:2] != b"\x1f\x8b":
+        return b""
+    try:
+        return _gzip.GzipFile(fileobj=_io.BytesIO(head)).read(_DECOMPRESS_LIMIT)
+    except Exception:
+        return b""
+
+
 def key_material(head):
     """Which encoding of private key material these bytes carry, or None."""
     if _ARMOUR.search(head):
@@ -174,15 +272,51 @@ def key_material(head):
     found = _binary_key_material(head)
     if found:
         return found
-    # And the same, inside a base64 body with no armour around it.
-    for run in _B64RUN.findall(head)[:20]:
-        try:
-            decoded = _b64.b64decode(_re.sub(br"[\r\n]", b"", run), validate=False)
-        except Exception:
-            continue
-        found = _binary_key_material(decoded)
+
+    # P3c3f-7: gzip. Compression destroys the base64 body the archive rules
+    # below rely on, so a `.gz` of a PEM was not key material to this detector
+    # while the same PEM inside an uncompressed `.tar` or a `.zip` was. Cheap
+    # to close and measured: a failed `gzip.decompress` on a 16 KiB head is
+    # 0.010 ms, and the whole four-image pass did not move.
+    body = _gzip_body(head)
+    if body:
+        if _ARMOUR.search(body):
+            return "gzip-pem"
+        found = _binary_key_material(body)
         if found:
-            return "base64-" + found
+            return "gzip-" + found
+
+    # And the same, inside a base64 body with no armour around it.
+    #
+    # P3c3f-7 (Phase 3c-3f), two corrections here, both driven by the Phase
+    # 3c-3e red team against the real decision-service image:
+    #
+    #   1. A decoded body is offered to the ARMOUR rule as well as to the
+    #      binary one. It used to be offered to the binary rule alone, so
+    #      base64 of a PEM decoded to PEM text, failed the DER prefix test,
+    #      and was not key material - which is how a Kubernetes Secret, a Helm
+    #      value, a JSON config and a `.env` line all carry a key. Three
+    #      shapes of the live `keys/writer-decision.key` shipped in the real
+    #      image at `18 passed` and came back byte-identical with one
+    #      `docker run` and one `base64 -d`.
+    #
+    #   2. Every base64 run in the head is decoded, not the first twenty. A
+    #      DER key behind 21 decoy runs was not detected and behind 19 it was,
+    #      and that cap was stated in neither the module docstring nor
+    #      anywhere else. A 16 KiB head holds at most 136 runs at this rule's
+    #      120-character minimum, so the bound was buying very little; the
+    #      measurement is in the module docstring.
+    for run in _B64RUN.findall(head):
+        for candidate in _b64_candidates(run):
+            try:
+                decoded = _b64.b64decode(candidate, validate=False)
+            except Exception:
+                continue
+            if _ARMOUR.search(decoded):
+                return "base64-pem"
+            found = _binary_key_material(decoded)
+            if found:
+                return "base64-" + found
     return None
 '''
 
@@ -271,6 +405,59 @@ def _base64_no_header(key) -> bytes:
     return base64.encodebytes(key.to_der())
 
 
+def _base64_of_a_pem(key) -> bytes:
+    """A PEM, base64'd. How a secret manifest carries a key.
+
+    P3c3f-7. This is what the Phase 3c-3e red team shipped in the real
+    decision-service image at `18 passed`: `key_material` looked for PEM
+    armour in the RAW head only, so a decoded base64 body was offered to the
+    binary rule alone, failed the DER prefix test, and was not key material.
+    A Kubernetes Secret, a Helm value, a JSON config and a `.env` line all
+    carry a key exactly this way.
+    """
+    import base64
+    return base64.encodebytes(key.to_pem())
+
+
+def _kubernetes_secret(key) -> bytes:
+    """The same, in the manifest it usually arrives in."""
+    import base64
+    return (b"apiVersion: v1\nkind: Secret\nmetadata:\n  name: ail-writer\n"
+            b"type: Opaque\ndata:\n  writer.key: "
+            + base64.b64encode(key.to_pem()) + b"\n")
+
+
+def _dotenv_line(key) -> bytes:
+    import base64
+    return b"AIL_WRITER_SIGNING_KEY_B64=" + base64.b64encode(key.to_pem()) + b"\n"
+
+
+def _gzipped_pem(key) -> bytes:
+    """A PEM inside a gzip member.
+
+    Compression destroys the base64 body, so this was the one archive shape
+    the detector missed while catching the same key inside an uncompressed
+    `.tar` and inside a `.zip`.
+    """
+    import gzip
+    import io
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb") as handle:
+        handle.write(key.to_pem())
+    return buffer.getvalue()
+
+
+def _base64_behind_decoys(key) -> bytes:
+    """A base64 DER key behind 21 base64 runs that are not keys.
+
+    `_B64RUN.findall(head)[:20]` decoded the first twenty runs and no more, so
+    this was not detected and the same key behind 19 decoys was. That cap was
+    stated in neither the module docstring nor anywhere else.
+    """
+    import base64
+    return b" ".join([b"Q" * 130] * 21) + b" " + base64.b64encode(key.to_der())
+
+
 # name -> (builder, what the detector should call it). Extend this table to
 # extend the check; a name here that the detector does not find fails.
 KEY_ENCODINGS = {
@@ -281,6 +468,12 @@ KEY_ENCODINGS = {
     "der-pkcs8-openssl": (_pkcs8_version_zero, "pkcs8-der"),
     "openssh":          (_armoured_openssh, "pem"),
     "base64-no-header": (_base64_no_header, "base64-sec1-der"),
+    # P3c3f-7, the shapes the Phase 3c-3e red team got past.
+    "base64-of-a-pem":  (_base64_of_a_pem, "base64-pem"),
+    "kubernetes-secret": (_kubernetes_secret, "base64-pem"),
+    "dotenv-line":      (_dotenv_line, "base64-pem"),
+    "gzipped-pem":      (_gzipped_pem, "gzip-pem"),
+    "base64-behind-21-decoy-runs": (_base64_behind_decoys, "base64-sec1-der"),
 }
 
 
