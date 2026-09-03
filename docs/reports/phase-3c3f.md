@@ -16,7 +16,8 @@ the openssl commands `make keygen` runs, because `make` is not on PATH here.
 | `tests/test_committed_is_a_fact.py -k ordered_write_that_committed` | **1 passed** |
 | `tests/test_image_contents.py -k detector` | **10 passed** |
 
-**CI: run `33814949380`, green.** The first push, run `33813149212`, failed
+**CI: run `33814949380` green on the code and test commits, and run
+`33817540597` green on this report's own head.** The first push, run `33813149212`, failed
 with five failures; four of them were this phase's own work and section 11.5
 records what they were and what closed them. Note that the run before this
 session, `33799228793` at `be73c4c`, was already failing on
