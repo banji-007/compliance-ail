@@ -16,6 +16,22 @@ the openssl commands `make keygen` runs, because `make` is not on PATH here.
 | `tests/test_committed_is_a_fact.py -k ordered_write_that_committed` | **1 passed** |
 | `tests/test_image_contents.py -k detector` | **10 passed** |
 
+**CI: run `33814949380`, green.** The first push, run `33813149212`, failed
+with five failures; four of them were this phase's own work and section 11.5
+records what they were and what closed them. Note that the run before this
+session, `33799228793` at `be73c4c`, was already failing on
+`test_docs_references_resolve` because the instruction cites the report this
+document is.
+
+**Local, at the end of the run, against the stack:**
+
+| | |
+| :--- | :--- |
+| the ten modules this phase touched or owns | **120 passed** |
+| `tests/test_raw_ledger_fields.py`, `test_record_profile.py`, `test_committed_is_a_fact.py` | **22 passed** |
+| `tests/test_image_contents.py` | **23 passed in 274.80s** |
+| `tests/test_view_invariants.py` | **13 passed**, where it was 7 passed and 1 skipped |
+
 **Six corrections raised against the instruction, four of them changing what
 an item delivers.** They are in section 2, before the items, because two of
 them change a stated mutation and one changes a stated fix.
@@ -795,9 +811,129 @@ establish.
 
 ---
 
-## 12. Measurements
+## 11.5. What CI found in this phase's own work
 
-_(filled in below)_
+Two things, on the first push, both real and neither found locally.
+
+**A deliberate violation in the intent view that nothing could see.**
+`tests/test_reconciliation.py` zAdds a record at score exactly zero into
+`ail_view:intent:v1`, on purpose: protobuf's JSON mapping omits a zero-valued
+field, so such a row arrives with no `score` key and
+`float(rows[-1]["score"])` used to raise `KeyError` out of the reconciler's
+entire pass, which `run_forever` swallowed into one log line per interval.
+Zero is inside the reserve and is not that record's transaction, so it breaks
+`HISTORY_SCORE_IS_ITS_TRANSACTION` - and it was unregistered, because until
+P3c3f-10 no ledger-wide invariant was enforced on the intent view at all.
+
+```
+FAILED tests/test_view_invariants.py::test_a_historical_position_is_its_transaction_or_a_registered_violation[ail_view:intent:v1]
+E  backfilled position(s) in ail_view:intent:v1 that are not their record's
+   transaction id and are not registered in tests/ledger_pollution.py:
+   [('tool_call:p3c3c-zero-12b63e3a:...:query_database', 0.0, 445)]
+```
+
+Registered in `tests/ledger_pollution.py` with its argument. **The
+registration is itself the finding**: a deliberate violation had existed for
+two phases in a view nothing checked, and extending the invariants surfaced it
+on the first run. It did not appear locally because this host's ledger had not
+run `test_reconciliation.py` against a view the invariants read.
+
+**A mapping baseline entry re-keyed.** `tools/mapping_check.py` selects a
+claim's term as load-bearing only when the cited document contains it
+somewhere. The P3c3f-11 correction puts "untouched" into `readME.md` for the
+first time, so `untouch` became a required term for `phase-1-3.md` row 18's
+claim, "Untouched, per the instruction" - which cites a section that does not
+contain it.
+
+That row already failed and was already baselined; what changed is its reason
+string, and a reason is part of a failure's identity by design, which is the
+control red team rt-p3c1-a forced. Three tests fail as a set until the entry
+is re-keyed: the new failure, the baseline miss, and the stale entry.
+
+`docs/reports/mapping-check-baseline.json` is re-keyed from
+`(instruction)` to `(instruction, untouch)`. **The prose was not reworded to
+dodge the checker**, which was the alternative: the row still fails, it stays
+quarantined, and rewording to make a check quiet is the move this project's
+rules exist to prevent.
+
+---
+
+## 12. The hypothesis, measured
+
+**Tested to the standard the keep-alive race was tested to: move something and
+watch the window move. It did not move, and the named path turns out not to be
+one.**
+
+Three measurements, the second and third with the `POST /verify` mutation
+applied and the verifier rebuilt, so the before and after arms are separable.
+
+**1. Unloaded, after the fix.** Six consecutive runs of the anchor-sensitive
+test:
+
+```
+--- after-fix run 1 ---  2 passed in 64.95s
+--- after-fix run 2 ---  2 passed in 56.44s
+--- after-fix run 3 ---  2 passed in 55.19s
+--- after-fix run 4 ---  2 passed in 60.36s
+--- after-fix run 5 ---  2 passed in 69.47s
+--- after-fix run 6 ---  2 passed in 60.73s
+```
+
+**2. Loaded, both arms.** `POST /content` in flight throughout each run, about
+300 per run, which is the load the hypothesis names - `_has_tombstone` calls
+`POST /verify` on every one.
+
+| arm | result |
+| :--- | :--- |
+| after the fix | 4/4 passed; 279, 304, 305, 294 content writes in flight |
+| `POST /verify` persisting the head again | 4/4 passed; 307, 303, 302, 309 content writes in flight |
+
+**Neither arm reproduced the failure, so this experiment has no discriminating
+power on its own.** Recorded as a negative rather than as support for either
+side.
+
+**3. The mechanism itself, which is where the answer is.** The load arm should
+have moved the anchor about 300 times and did not move it once. Driven
+directly, on the mutated build:
+
+```
+1. what _has_tombstone's own call answers for a fresh call_id
+    200 {'verified': False, 'error_class': 'not_found', 'state_id': None}
+
+   anchor before                : 442
+   anchor after 6 direct writes : 442   (unchanged)
+   POST /content -> 204
+   anchor after one POST /content: 442
+
+2. the same route for a key that EXISTS, on the same build
+    wrote at tx 485
+    anchor before the read      : 485
+    POST /verify -> 200 {'verified': True, 'tx_id': 485, 'state_id': 491}
+    anchor after the read       : 491
+    moved: True
+```
+
+**The hypothesis is refuted as named.** `_has_tombstone` asks about
+`content_erasure:{call_id}` for a call_id that has no tombstone, ImmuDB
+answers "key not found", and `POST /verify` returns from its
+`except grpc.RpcError` handler - **before** the line that reads the head. An
+ordinary content write does not advance the anchor and never did.
+
+What is real is the narrower statement, with the control above: a
+`POST /verify` **that finds its key** advanced the anchor, on the read
+credential. `_has_tombstone` reaches that only when a tombstone actually
+exists for the call_id, which is after an erasure; `/audit`'s per-entry
+verification and `GET /audit/bundle` reach it on every ordinary page.
+
+So the anchor advancing "for a reason nobody has named" still has no named
+reason. The path this brief handed over is not it, and that is now established
+rather than assumed. D47 removes the mutation on every one of those callers
+regardless, which is why the item stands on its own argument and not on this.
+
+**What this does not establish.** Four runs per arm against a failure the
+previous phase recorded as intermittent is a small sample, and the flake did
+not appear in twenty-two runs of any kind this session. Nothing here says the
+flake is fixed; it says the mechanism offered for it is not the mechanism.
 
 ---
 
@@ -865,4 +1001,40 @@ Unchanged by this phase and stated so they are not read as closed:
    two causes that are not about the code (`sigstore` cannot be installed into
    the host Python, and the in-process decision-service tests cannot resolve
    compose service names). CI is the signal; what was checked locally is that
-   no test this phase owns is among the failures.
+   no test this phase owns is among the failures, module by module - the
+   counts are in the header.
+4. **The flake this phase was told to expect moving.** It did not appear in
+   twenty-two runs across three configurations (section 12), so nothing here
+   establishes that it is fixed. What is established is that the mechanism
+   offered for it is not the mechanism.
+5. **A second inspection surface for `ENV`, `ARG` and `LABEL`.** The Phase
+   3c-3e red team recorded it as untested and it stays untested: the image
+   config blob is skipped by `_every_layer` as metadata, so a key placed there
+   would be on neither surface. No Dockerfile here does it. Not an item and
+   not fixed.
+
+---
+
+## 17. What this run left on the machine
+
+Enumerated with the commands, at the end of the session.
+
+Removed:
+
+- Compose project `p3c3ffix`: every container, the three volumes and the
+  network, with `docker compose -p p3c3ffix -f docker-compose.test.yml down -v`.
+- The five images built `--no-cache`: `p3c3ffix-verifier`,
+  `p3c3ffix-ail-control-plane`, `p3c3ffix-decision-service`,
+  `p3c3ffix-anchor-service`, `p3c3ffix-dashboard`.
+- The relay containers the cut fixture starts per test.
+- The throwaway Compose project `p3c3ffixb9`, which was only ever
+  `docker compose config` and was never brought up, and its directory.
+- Every probe, injection, mutation and measurement script, written to the
+  session scratchpad and never into the tree.
+- The scratch clone in full, including the generated `keys/*.key`,
+  `keys/*.pub` and `decision_service/secrets/vault_api_token.txt`.
+
+The A4.1 injection into `verifier/main.py` was reverted from a byte-for-byte
+copy taken before it, and every mutation was reverted from its own backup;
+after each revert the affected suite was re-run clean. The primary working
+directory was never used for a stack and nothing was written there.
