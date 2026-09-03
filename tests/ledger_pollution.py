@@ -80,6 +80,23 @@ DELIBERATE_VIOLATIONS = (
              "that record's transaction id."),
     ),
     DeliberateViolation(
+        key_fragment="p3c3c-zero-",
+        module="test_reconciliation.py",
+        breaks=(HISTORY_SCORE_IS_ITS_TRANSACTION,),
+        why=("proves the reconciler survives a row scored at exactly zero. "
+             "protobuf's JSON mapping omits a zero-valued field, so such a row "
+             "arrives with no `score` key at all and "
+             "`float(rows[-1]['score'])` raised KeyError out of the whole "
+             "pass, which run_forever swallowed into one log line per "
+             "interval: a detector turned off rather than made wrong. The "
+             "score has to BE zero, which is inside the reserve and is not "
+             "that record's transaction id. **Registered in Phase 3c-3f, and "
+             "the registration is the finding:** the row goes into the INTENT "
+             "view, and until P3c3f-10 no ledger-wide invariant was enforced "
+             "there, so this violation existed for two phases with nothing "
+             "able to see it."),
+    ),
+    DeliberateViolation(
         key_fragment="p3c3c-pad",
         module="test_backfill_index.py",
         breaks=(HISTORY_SCORE_IS_ITS_TRANSACTION,),
