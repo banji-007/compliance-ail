@@ -1048,3 +1048,72 @@ longer exists.
 
 The primary working directory was never used for a stack. Nothing was written
 there by this run.
+
+---
+
+## Erratum, 2026-09-04 (added by Phase 3c-3f, `p3c3f-fix`)
+
+**Section 16 item 2's second alternative had a named path handed over with
+it. That path is refuted. The observation is unexplained again, and it is now
+unexplained-and-established rather than unexplained-and-assumed.**
+
+Item 2 offered two alternatives for the intermittent failure of
+`tests/test_committed_is_a_fact.py::test_a_write_that_committed_is_reported_as_committed_when_the_state_call_fails`:
+the assertion may be too strong for the cut it runs under, or "the anchor may
+be advancing for a reason nobody has named." The Phase 3c-3f instruction
+handed the second one over with a candidate mechanism:
+`control_plane/main.py::_has_tombstone` calls `POST /verify` on every
+`POST /content`, and `POST /verify` advanced the persisted trust anchor. An
+ordinary content write would therefore move the anchor as a side effect of a
+check, and the test reads the anchor immediately after its own write.
+
+**Measured, and it does not.** `_has_tombstone` asks about
+`content_erasure:{call_id}` for a call_id that has no tombstone. ImmuDB
+answers "key not found", and `POST /verify` returns from its
+`except grpc.RpcError` handler - **before** the line that reads the head. The
+anchor is never touched. Driven on a build with the pre-D47 route deliberately
+restored, so this is not an artefact of the fix:
+
+```
+1. what _has_tombstone's own call answers for a fresh call_id
+    200 {'verified': False, 'error_class': 'not_found', 'state_id': None}
+
+   anchor before                : 442
+   anchor after 6 direct writes : 442   (unchanged)
+   POST /content -> 204
+   anchor after one POST /content: 442
+
+2. the same route for a key that EXISTS, on the same build
+    wrote at tx 485
+    anchor before the read      : 485
+    POST /verify -> 200 {'verified': True, 'tx_id': 485, 'state_id': 491}
+    anchor after the read       : 491
+    moved: True
+```
+
+Section 2 is the control: the mechanism is real, and it is narrower than the
+handover said. Only a `POST /verify` **that finds its key** moved the anchor.
+`_has_tombstone` reaches that only when a tombstone actually exists for the
+call_id, which is after an erasure; `GET /audit`'s per-entry verification and
+`GET /audit/bundle` reach it on every ordinary page.
+
+Four runs per arm with about 300 content writes in flight throughout each run,
+with and without the pre-D47 route, produced no failure in either arm, so that
+experiment has no discriminating power on its own and is recorded as a
+negative. The flake did not appear in twenty-two runs of any kind during Phase
+3c-3f.
+
+**What this changes about item 2.** The first alternative - the assertion may
+be too strong for the cut it runs under - is untouched and remains open. The
+second alternative is unchanged in substance and changed in standing: "the
+anchor may be advancing for a reason nobody has named" was a possibility
+nobody had tested, and it is now a possibility whose only named candidate has
+been tested and eliminated. Whoever takes it next should not re-derive the
+`_has_tombstone` path; it is closed.
+
+D47 (Phase 3c-3f) removes the anchor mutation from every caller of
+`POST /verify` regardless of this result, so the item stands on its own
+argument and not on this one. Full measurement in `docs/reports/phase-3c3f.md`
+section 12.
+
+Nothing in the body of this report above is edited. This erratum is additive.
