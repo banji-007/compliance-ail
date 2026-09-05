@@ -547,3 +547,8 @@ Probe scripts are outside the repository, in
 `C:\Users\banji\AppData\Local\Temp\claude\probe-p3c3f-red\`.
 
 Two records written by R4 are in the ledger of a volume that no longer exists.
+
+**2026-09-05, after this report was committed:** clone removed after commit,
+keys and `env.sh` destroyed with it. The probe scripts under
+`AppData\Local\Temp` were removed in the same pass. Nothing this run generated
+remains on the machine.
