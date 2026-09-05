@@ -234,6 +234,11 @@ pre-existing and is not touched by this work.
 | 33963186825 | `6f5f51b` | failure, one test: the verification object's shape split in two (fixed in `81efc24`) |
 | 33963691732 | `81efc24` | failure, one test: `test_committed_is_a_fact::test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` |
 | 33963691732 (job 101300749397, re-run) | `81efc24` | success |
+| 33964316812 | `6107969` | success |
+
+`33964316812` is the run that validated the tree this report describes. The
+docs-only commit that adds this row to the report is necessarily not covered
+by a run named inside itself.
 
 Base `f5385b6` was green (run 33960799305), so neither failure could be
 dismissed as inherited.
