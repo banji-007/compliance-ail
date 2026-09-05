@@ -361,7 +361,10 @@ def test_both_seeds_and_the_write_refuse_a_state_nothing_verified():
         "from immudb.rootService import State\n"
         "\n"
         "client = main._get_client()\n"
-        "good = main.head_state(client)\n"
+        # R6: head_state returns (state, checked) now, so a caller with no
+        # verifying key configured cannot mistake an unchecked head for a
+        # checked one. This script wants the state.
+        "good = main.head_state(client).state\n"
         "key = main._state_verifying_key()\n"
         "assert key is not None, 'no ImmuDB signing key is configured'\n"
         "\n"

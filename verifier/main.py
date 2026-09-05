@@ -91,6 +91,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import NamedTuple
 
 import grpc
 import uvicorn
@@ -385,7 +386,37 @@ class _VerifiedRootService:
             pickle.dump(states, handle)
 
 
-def head_state(client):
+class HeadRead(NamedTuple):
+    """The ledger's head, and whether anything checked that this ledger
+    published it.
+
+    **R6. The unconfigured-key rule is one rule.** `head_state` and
+    `_VerifiedRootService._checked` are the two places a state reaches this
+    service from `CurrentState`, and they disagreed about what to do when no
+    `IMMUDB_SIGNING_PUBKEY` is configured: `_checked` refused, `head_state`
+    returned the state with nothing marking it as unchecked, so a caller
+    could not tell a checked head from the server's unverified word for its
+    own head.
+
+    They cannot behave identically - one reports and one gates a persist, and
+    they have different return contracts. The rule they share is a behaviour:
+    **with no verifying key configured, neither presents an unchecked state
+    as a checked one.** `_checked` refuses the persist, because a state
+    nothing verified must not become the thing every later proof is measured
+    against. `head_state` has nothing to refuse - it reports - so it reports
+    the head and reports that the head was not checked. One rule, two correct
+    expressions.
+
+    `checked` is returned rather than left to be re-derived from `client._vk`
+    at each call site. A caller that forgets to ask is the asymmetry coming
+    back at a third site.
+    """
+
+    state: object
+    checked: bool
+
+
+def head_state(client) -> HeadRead:
     """The ledger's head, reported without moving this service's anchor.
 
     D47. `client.currentState()` reaches `currentRoot.call`, which ends in an
@@ -400,15 +431,19 @@ def head_state(client):
     holding a second copy of it.
 
     The signature is checked, so what a caller is told the head is, is a head
-    this ledger published.
+    this ledger published - and when no key is configured to check it with,
+    the returned `HeadRead.checked` says so rather than leaving the caller to
+    assume it was checked. See HeadRead.
     """
     from google.protobuf import empty_pb2
     from immudb.rootService import State
 
     state = State.FromGrpc(client._stub.CurrentState(empty_pb2.Empty()))
-    if client._vk is not None:
-        state.Verify(client._vk)      # BadSignatureError on failure
-    return state
+    if client._vk is None:
+        # R6: not silently the same as a checked head. See HeadRead.
+        return HeadRead(state, False)
+    state.Verify(client._vk)          # BadSignatureError on failure
+    return HeadRead(state, True)
 
 
 def _get_client():
@@ -706,6 +741,51 @@ class ProofMaterial(BaseModel):
     signing_key_fingerprint: str | None
 
 
+# R6. The vocabulary of the state read that reports `state_id`. Deliberately
+# not the word "failed": `/audit` renders D2's four verification states and
+# one of them is "failed", a positive tamper claim about a record. A state
+# read that could not run is not a claim about the record at all, and giving
+# the two the same word is how they get conflated.
+STATE_READ_OK = "ok"
+STATE_READ_UNCHECKED = "unchecked"
+STATE_READ_UNAVAILABLE = "unavailable"
+
+
+class StateRead(BaseModel):
+    """How `state_id` was read, and whether anything checked what it reports.
+
+    **R6-2. A failed state read is reported, not swallowed.** Before R6 this
+    read sat inside the proof's own `try`, so its failure was reported as the
+    record's failure. Taking it out of that `try` fixes the tamper claim and
+    would, on its own, introduce the opposite defect: `state_id` silently
+    null, with nothing saying why. This field is where the read's own outcome
+    goes, so the null is never bare.
+
+    `source` names which read produced `state_id`, because the two paths read
+    different things and `state_id`'s meaning is unchanged on both:
+      * "head"   - the unanchored path, the ledger's head.
+      * "anchor" - the anchored path, the anchor this service persists.
+    The state the proof actually ran against is not this field and never was:
+    it is on the response as `proof_material.source_state.tx_id` and
+    `prove_since_tx`.
+
+    `status`:
+      * "ok"          - the read succeeded and nothing about it was refused.
+      * "unchecked"   - the read succeeded, and no IMMUDB_SIGNING_PUBKEY is
+                        configured, so no signature over the state was
+                        checked. Reported rather than presented as "ok"; see
+                        HeadRead for the rule this expresses.
+      * "unavailable" - the read did not produce a state. `state_id` is null
+                        and `detail` says why. **Not a statement about the
+                        record**, whose proof had already succeeded before
+                        this read was attempted.
+    """
+
+    source: str
+    status: str
+    detail: str | None = None
+
+
 class VerifyResponse(BaseModel):
     verified: bool
     tx_id: int | None = None
@@ -743,6 +823,11 @@ class VerifyResponse(BaseModel):
     # inputs of a rejected proof would invite treating a bundle as evidence
     # of something that did not verify.
     proof_material: ProofMaterial | None = None
+    # R6: the sibling of state_id, carrying the outcome of the read that
+    # produced it. Null on the failure paths above, which return before any
+    # state is read - the field describes a read that was attempted, and
+    # absence of the field means none was.
+    state_read: StateRead | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1439,8 +1524,9 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
     # overwrites the anchor `verifiedSet` had just set under a proof with an
     # unproven one, on the write key.
     try:
-        state = head_state(client)
-        logger.info("Verified write: tx=%d state_id=%d", resp.id, state.txId)
+        head = head_state(client)
+        logger.info("Verified write: tx=%d state_id=%d checked=%s",
+                    resp.id, head.state.txId, head.checked)
     except Exception as exc:
         logger.warning(
             "Verified write: tx=%d; the state read after it failed (%s). The "
@@ -2269,7 +2355,10 @@ def current_state(_: None = Depends(_require_read_key)):
             ),
         )
     try:
-        state = head_state(client)
+        # `.state` only: this route already refused above when `_vk` is None,
+        # so `checked` is True here by construction. R6's rule is met by the
+        # refusal, which is the stronger of the two expressions.
+        state = head_state(client).state
     except BadSignatureError as exc:
         logger.error("CurrentState signature did not verify: %s", exc)
         raise HTTPException(
@@ -2286,6 +2375,121 @@ def current_state(_: None = Depends(_require_read_key)):
         tx_hash=base64.b64encode(state.txHash).decode(),
         signature=base64.b64encode(state.signature).decode(),
         signing_key_fingerprint=signing_key_fingerprint(),
+    )
+
+
+def _state_read(client, anchor) -> tuple[int | None, StateRead]:
+    """`state_id`, and the account of how it was read. Never raises.
+
+    `state_id` keeps the meaning it has always had and is not redefined here:
+    on the unanchored path it is the ledger's head, on the anchored path it is
+    the anchor this service persists. The state the proof ran against is
+    already on the response twice, as `proof_material.source_state.tx_id` and
+    as `prove_since_tx`; a third copy of a reported number is not what this
+    is.
+
+    What is new is that this read may fail without that failing the record.
+    Before R6 it could not fail visibly at all: it ran inside the proof's own
+    `try`, so its failure was reported as the record's. Moving it out without
+    reporting it would be the opposite defect - `state_id` silently null with
+    nothing saying why - so its outcome is returned alongside it and reaches
+    the caller in `VerifyResponse.state_read`.
+
+    Not raising is the point rather than an incidental property. Every caller
+    of this function has already established that a proof succeeded, and has
+    no failure branch left that would be honest to take.
+    """
+    source = "head" if anchor is None else "anchor"
+    try:
+        if anchor is None:
+            head = head_state(client)
+            if not head.checked:
+                # R6-3, the reporting half of the one rule. See HeadRead.
+                return head.state.txId, StateRead(
+                    source=source,
+                    status=STATE_READ_UNCHECKED,
+                    detail=(
+                        "no ImmuDB signing key is configured "
+                        "(IMMUDB_SIGNING_PUBKEY), so nothing checked that this "
+                        "is a state this ledger published; it is the server's "
+                        "word for its own head"
+                    ),
+                )
+            return head.state.txId, StateRead(source=source, status=STATE_READ_OK)
+
+        state = client._rs.get()
+        if getattr(client, "_vk", None) is None:
+            # Same rule, the other path. `_rs.get()` can answer from the state
+            # file, which D47 reads unchecked on purpose (it is the ADR-0006
+            # tamper vector), so with no key configured this number is not one
+            # this service checked either.
+            return state.txId, StateRead(
+                source=source,
+                status=STATE_READ_UNCHECKED,
+                detail=(
+                    "no ImmuDB signing key is configured "
+                    "(IMMUDB_SIGNING_PUBKEY), so nothing checked the anchor "
+                    "this reports"
+                ),
+            )
+        return state.txId, StateRead(source=source, status=STATE_READ_OK)
+    except Exception as exc:                                      # noqa: BLE001
+        logger.warning(
+            "The %s read that reports state_id failed: %s: %s. The record's "
+            "own proof is unaffected and is not described by this.",
+            source, type(exc).__name__, exc,
+        )
+        return None, StateRead(
+            source=source,
+            status=STATE_READ_UNAVAILABLE,
+            detail=(
+                f"the {source} read that reports state_id failed "
+                f"({type(exc).__name__}: {exc}); this says nothing about the "
+                "record, whose proof had already succeeded"
+            ),
+        )
+
+
+def _verified_response(source_state, ventry, resp,
+                       state_id, state_read) -> VerifyResponse:
+    """The response for a record whose proof has already succeeded.
+
+    Split out of `verify()` and called from outside that function's `try` so
+    that the code running after the verdict is a region with its own name,
+    rather than the tail of a block whose every handler answers
+    `verified=False`. See the R6 comment at the call site for why.
+    """
+    logger.info(
+        "Verified read: tx=%d anchor=%d state_id=%s verified=%s (%s: %s)",
+        resp.id,
+        source_state.txId,
+        state_id,
+        resp.verified,
+        state_read.source,
+        state_read.status,
+    )
+    return VerifyResponse(
+        verified=True,
+        tx_id=resp.id,
+        value=base64.b64encode(resp.value).decode(),
+        timestamp=resp.timestamp,
+        state_id=state_id,
+        state_read=state_read,
+        proof_material=ProofMaterial(
+            source_state=SourceState(
+                db=source_state.db,
+                tx_id=source_state.txId,
+                tx_hash=base64.b64encode(source_state.txHash).decode(),
+                signature=(
+                    base64.b64encode(source_state.signature).decode()
+                    if source_state.signature else None
+                ),
+            ),
+            verifiable_entry=base64.b64encode(ventry.SerializeToString()).decode(),
+            prove_since_tx=source_state.txId,
+            entry_tx_id=resp.id,
+            signing_key_fingerprint=signing_key_fingerprint(),
+        ),
     )
 
 
@@ -2407,51 +2611,8 @@ def verify(payload: VerifyRequest, _: None = Depends(_require_read_key)):
                 error_class="anchor_precedes_record",
             )
 
-        # D47 (Phase 3c-3f): `head_state`, not `client.currentState()`.
-        #
-        # This line reports the head in `state_id`, and it did so by calling
-        # the SDK method that advances the persisted anchor to it on the way
-        # out. That made this read-gated route a route that mutates durable
-        # state: driven by the Phase 3c-3e red team, four writes made
-        # straight to ImmuDB moved the head from 11 to 15, the anchor stayed
-        # at 11 because nothing had asked the verifier anything, and one
-        # `POST /verify` on the READ key moved it to 15. What was intended in
-        # Phase 1.3 was reporting the head; overwriting a verified anchor
-        # with an unverified one was a consequence of how the SDK reports it.
-        #
-        # `GET /state` reached the opposite conclusion about the same
-        # mutation in the same credential tier and wrote the argument down.
-        # The anchored path is unchanged and was already correct.
-        state = head_state(client) if payload.anchor is None else client._rs.get()
-        logger.info(
-            "Verified read: tx=%d anchor=%d state_id=%d verified=%s",
-            resp.id,
-            source_state.txId,
-            state.txId,
-            resp.verified,
-        )
-        return VerifyResponse(
-            verified=True,
-            tx_id=resp.id,
-            value=base64.b64encode(resp.value).decode(),
-            timestamp=resp.timestamp,
-            state_id=state.txId,
-            proof_material=ProofMaterial(
-                source_state=SourceState(
-                    db=source_state.db,
-                    tx_id=source_state.txId,
-                    tx_hash=base64.b64encode(source_state.txHash).decode(),
-                    signature=(
-                        base64.b64encode(source_state.signature).decode()
-                        if source_state.signature else None
-                    ),
-                ),
-                verifiable_entry=base64.b64encode(ventry.SerializeToString()).decode(),
-                prove_since_tx=source_state.txId,
-                entry_tx_id=resp.id,
-                signing_key_fingerprint=signing_key_fingerprint(),
-            ),
-        )
+        # The proof has succeeded. Everything that reports it now happens
+        # below, outside this `try` - see the R6 block after the handlers.
     except ErrCorruptedData:
         logger.warning("verifiedGet: proof failed for key %.32s...", payload.key)
         return VerifyResponse(
@@ -2496,6 +2657,52 @@ def verify(payload: VerifyRequest, _: None = Depends(_require_read_key)):
     except Exception as exc:
         logger.error("verifiedGet error: %s", exc)
         return VerifyResponse(verified=False, detail=str(exc), error_class="unknown")
+
+    # ---- R6: past this point the proof has already succeeded -------------
+    #
+    # Nothing below may turn `verified=True` into a failure response. Six
+    # things used to run inside the `try` above after `sdk_verified_get.call`
+    # had returned a verified entry - the head read, the anchored path's
+    # `_rs.get()`, four base64 encodes, `ventry.SerializeToString()` and
+    # `signing_key_fingerprint()` - none of which has any bearing on whether
+    # the proof ran, and all of which shared that block's handlers. A
+    # `BadSignatureError` out of any of them was reported as
+    # `error_class="signature_failure"`, which `/audit` renders as
+    # `state: "failed"`: a positive tamper claim, on every record of a sound
+    # page, on the read path an auditor uses. A system asserting tampering it
+    # has not detected is worse than one failing to detect tampering.
+    #
+    # This is D40's argument applied to the read path. D40 moved the state
+    # read out of `POST /write`'s proof `try` in Phase 3c-3d for exactly this
+    # reason and left this route alone.
+    #
+    # **The guarantee is structural, not a list of six.** The region below
+    # cannot reach a handler that answers `verified=False`, because there is
+    # no such handler in scope: the one `except` here has a single possible
+    # verdict. A seventh thing added to this region inherits that rather than
+    # needing its own guard, which is the difference between fixing the
+    # property and fixing the line the red team happened to name.
+    state_id, state_read = _state_read(client, payload.anchor)
+    try:
+        return _verified_response(source_state, ventry, resp,
+                                  state_id, state_read)
+    except Exception as exc:                                      # noqa: BLE001
+        logger.error(
+            "verifiedGet: tx=%s proved, and assembling the response raised "
+            "%s: %s. The record verified; this response describes the "
+            "reporting, not the record.",
+            getattr(resp, "id", None), type(exc).__name__, exc,
+        )
+        return VerifyResponse(
+            verified=True,
+            tx_id=getattr(resp, "id", None),
+            state_id=state_id,
+            state_read=state_read,
+            detail=(
+                f"the record's proof succeeded; assembling the response "
+                f"around it did not ({type(exc).__name__}: {exc})"
+            ),
+        )
 
 
 if __name__ == "__main__":

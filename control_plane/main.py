@@ -721,11 +721,28 @@ def _verification_from_200(vdata: dict) -> dict:
     wording (verifier/main.py's error_class="unknown" fallback) turned a
     never-written key into a tamper alarm - with no source diff and no build
     to fail.
+
+    R6: `state_read` is carried through in all four branches. It is an
+    **/audit contract change**: rows now carry a fifth key. The verifier
+    populates it on verified responses only - it describes a read that is
+    attempted after a proof has succeeded - and it is None everywhere else,
+    including for a verifier too old to send it. Carried rather than dropped
+    because `state_id` can now be null on an otherwise sound row, and without
+    this an operator would see that null with the explanation stranded at the
+    verifier. It is **not** a verification state and must never be read as
+    one: a state read that could not run is not tamper evidence, which is why
+    its vocabulary does not contain the word "failed".
+
+    dashboard/ deliberately does not render this field in this phase. It does
+    not render ledger_fault either, and growing the dashboard is not this
+    item's job. Stated so a later reader does not read the omission as an
+    oversight.
     """
     if vdata.get("verified"):
         return {
             "state": "verified",
             "state_id": vdata.get("state_id"),
+            "state_read": vdata.get("state_read"),
             "detail": None,
             "error_class": None,
         }
@@ -739,6 +756,7 @@ def _verification_from_200(vdata: dict) -> dict:
         return {
             "state": "not_found",
             "state_id": vdata.get("state_id"),
+            "state_read": vdata.get("state_read"),
             "detail": vdata.get("detail"),
             "error_class": error_class,
         }
@@ -746,12 +764,14 @@ def _verification_from_200(vdata: dict) -> dict:
         return {
             "state": "failed",
             "state_id": vdata.get("state_id"),
+            "state_read": vdata.get("state_read"),
             "detail": vdata.get("detail"),
             "error_class": error_class,
         }
     return {
         "state": "unverifiable",
         "state_id": vdata.get("state_id"),
+        "state_read": vdata.get("state_read"),
         "detail": vdata.get("detail"),
         "error_class": error_class,
     }
