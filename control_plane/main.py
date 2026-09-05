@@ -814,6 +814,7 @@ def _verify_one_key(encoded_key: str) -> tuple[dict, bool]:
         return {
             "state": "unverifiable",
             "state_id": None,
+            "state_read": None,
             "detail": str(vexc),
             "error_class": None,
         }, False
@@ -825,6 +826,7 @@ def _verify_one_key(encoded_key: str) -> tuple[dict, bool]:
     return {
         "state": "unverifiable",
         "state_id": None,
+        "state_read": None,
         "detail": f"verifier returned HTTP {vr.status_code}",
         "error_class": None,
     }, True
@@ -839,8 +841,14 @@ def _deferred_verification() -> dict:
     verifiedGet was attempted, so there is no state_id to report, no detail to
     explain, and no error_class - a deferred row must not carry anything a
     reader could mistake for a diagnosis.
+
+    R6: state_read is null here for the same reason and not by omission. No
+    verifiedGet was attempted, so no state was read, so there is no outcome to
+    report. The key is present because every row carries the same shape; a row
+    where the field is absent rather than null would be a second shape.
     """
-    return {"state": "asserted", "state_id": None, "detail": None, "error_class": None}
+    return {"state": "asserted", "state_id": None, "state_read": None,
+            "detail": None, "error_class": None}
 
 
 def _probe_verifier_reachable() -> bool:

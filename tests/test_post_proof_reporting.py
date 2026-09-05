@@ -397,6 +397,74 @@ def test_the_sibling_field_is_carried_by_every_audit_branch(control_plane):
             f"{rendered}")
 
 
+def test_every_constructor_of_a_verification_object_agrees_on_its_shape(
+        control_plane):
+    """R6-2. One shape, from all five constructors.
+
+    `/audit` builds this object in five places: the four branches of
+    `_verification_from_200`, the two literals in `_verify_one_key` (the
+    verifier unreachable, and the verifier answering non-200), and
+    `_deferred_verification`. Adding a field to one of them splits the shape
+    in two, and a row where the key is absent rather than null is a second
+    shape that a reader has to know about.
+
+    CI caught exactly this: `tests/test_deferred_verification.py` asserts the
+    key set of a verified row exactly, and it failed when only
+    `_verification_from_200` carried the new field. That assertion sees one
+    row from one constructor, on a live stack. This one compares all five, in
+    process, so the next field added is caught before CI rather than by it.
+    """
+    shape = set(control_plane._verification_from_200({"verified": True}))
+
+    built = {
+        "not_found": control_plane._verification_from_200(
+            {"verified": False, "error_class": "not_found"}),
+        "failed": control_plane._verification_from_200(
+            {"verified": False, "error_class": "consistency_failure"}),
+        "unverifiable": control_plane._verification_from_200(
+            {"verified": False, "error_class": "unknown"}),
+        "deferred": control_plane._deferred_verification(),
+    }
+
+    class _Unreachable:
+        def __enter__(self):
+            raise RuntimeError("verifier unreachable")
+
+        def __exit__(self, *exc):
+            return False
+
+    class _NonHttp200:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, *args, **kwargs):
+            class _R:
+                status_code = 503
+            return _R()
+
+    original = control_plane.httpx.Client
+    try:
+        control_plane.httpx.Client = lambda *a, **k: _Unreachable()
+        built["verifier_unreachable"], _ = control_plane._verify_one_key("a2V5")
+        control_plane.httpx.Client = lambda *a, **k: _NonHttp200()
+        built["verifier_non_200"], _ = control_plane._verify_one_key("a2V5")
+    finally:
+        control_plane.httpx.Client = original
+
+    for name, verification in built.items():
+        assert set(verification) == shape, (
+            f"the {name!r} constructor builds a different shape from the "
+            f"verified branch. /audit would carry two row shapes, and a "
+            f"reader would have to know which rows can be missing a key. "
+            f"Expected {sorted(shape)}, got {sorted(verification)}")
+
+    assert "state_read" in shape, (
+        f"the sibling field is not part of the shape at all: {sorted(shape)}")
+
+
 def test_a_failed_head_read_is_not_a_verification_state(verifier):
     """R6-2. The sibling's vocabulary cannot be mistaken for D2's.
 

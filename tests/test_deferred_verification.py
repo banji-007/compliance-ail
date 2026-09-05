@@ -208,7 +208,15 @@ def test_per_record_route_verifies_a_written_record():
     assert verification["state"] == "verified", verification
     # Same object shape /audit puts on every row - not a different one that
     # happens to carry a state.
-    assert set(verification) == {"state", "state_id", "detail", "error_class"}, verification
+    #
+    # R6 added state_read, the sibling of state_id carrying the outcome of the
+    # read that produced it. It is in this set rather than excluded from it:
+    # every constructor of this object carries the key, null where no state
+    # was read, so that a row whose state_id is null is never bare. This
+    # assertion caught the shape splitting in two when only
+    # _verification_from_200 had been updated.
+    assert set(verification) == {"state", "state_id", "state_read", "detail",
+                                 "error_class"}, verification
     assert verification["state_id"] is not None, verification
 
 

@@ -105,6 +105,22 @@ explanation stranded at the verifier.
 
 `state_read` is not a verification state and must never be read as one.
 
+**The shape is uniform across all five constructors.** `/audit` builds this
+object in five places: the four branches of `_verification_from_200`, the two
+literals in `_verify_one_key` (verifier unreachable, verifier answering
+non-200), and `_deferred_verification`. All of them carry `state_read`, null
+where no state was read. A row where the key is absent rather than null would
+be a second row shape that a reader has to know about.
+
+The first push got this wrong and CI caught it. Only
+`_verification_from_200` had been updated, and
+`tests/test_deferred_verification.py:211` asserts the key set of a verified
+row **exactly** - which is the assertion doing its job, on a live stack this
+host cannot run. Its expected set now names `state_read` and is still an exact
+set equality, not a relaxed one. The property it caught is now enforced in
+process as well, over all five constructors, so the next field added to this
+object is caught before CI rather than by it.
+
 ### `dashboard/`, stated
 
 `dashboard/` deliberately does **not** render `state_read` in this phase. It
@@ -172,7 +188,7 @@ the verifier route driven in process, its body fed to
 
 ### After
 
-    11 passed
+    12 passed
 
 ### Mutations, one at a time
 
@@ -182,8 +198,9 @@ the verifier route driven in process, its body fed to
 | R6-1 | make `signing_key_fingerprint` raise inside the `try` | 1 failed, 10 passed: `[signing_key_fingerprint]` |
 | R6-2 | drop the sibling field | 2 failed, 9 passed: `test_a_failed_head_read_is_reported_rather_than_swallowed`, `test_an_unchecked_head_is_reported_as_unchecked_on_the_response` |
 | R6-3 | restore the asymmetry, so `head_state` reports an unchecked state as checked | 2 failed, 9 passed: `test_with_no_verifying_key_neither_function_presents_unchecked_as_checked`, `test_an_unchecked_head_is_reported_as_unchecked_on_the_response` |
+| R6-2 | drop `state_read` from one of the five constructors (the deferred one) | 1 failed, 11 passed: `test_every_constructor_of_a_verification_object_agrees_on_its_shape` |
 
-Each reverted before the next; `11 passed` after every revert.
+Each reverted before the next; `12 passed` after every revert.
 
 The two R6-1 mutations are the point of the pair. The first is the line the red
 team named. The second is a different site entirely, and the same test file
