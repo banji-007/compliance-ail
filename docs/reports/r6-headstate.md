@@ -227,6 +227,40 @@ One of the 24 is
 confirmed failing on unmodified `f5385b6` before any change here. It is
 pre-existing and is not touched by this work.
 
+### CI
+
+| run | commit | result |
+| --- | --- | --- |
+| 33963186825 | `6f5f51b` | failure, one test: the verification object's shape split in two (fixed in `81efc24`) |
+| 33963691732 | `81efc24` | failure, one test: `test_committed_is_a_fact::test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` |
+| 33963691732 (job 101300749397, re-run) | `81efc24` | success |
+
+Base `f5385b6` was green (run 33960799305), so neither failure could be
+dismissed as inherited.
+
+**The second failure is not this work's, and a passing re-run does not clear
+it.** It is recorded here as an observation for the next red team rather than
+closed. The evidence that it is not this change:
+
+  * It drives `POST /write-ordered` (`verifier/main.py:2141-2318`). The diff
+    of this work against `f5385b6` has no hunk in that range; its hunks are at
+    91, 386, 431, 741, 823, 1524, 2355, 2378, 2611 and 2658. The one inside
+    `POST /write` is a log line.
+  * It **passed** in run 33963186825, on identical write-path code. It first
+    failed on `81efc24`, whose diff is three constructors in
+    `control_plane/main.py`, two test files and this report.
+  * It passed on re-run of the same commit with no change at all.
+
+**What it actually showed.** The relay dropped the response, the key landed in
+the ledger, and the caller was told `committed: false` with
+`StatusCode.UNAVAILABLE` in `detail`. That is the lie D45 exists to keep out -
+a read that could not run reported as a read that found nothing - on a branch
+D45's four states do not cover. The test's own comment already records that
+this case is timing-dependent across environments ("CI produced the `null`
+case here where this host produced `true`"), which is why it surfaces
+intermittently rather than never. One green re-run says the timing did not
+land there the second time; it says nothing about the branch.
+
 ## Residual limits
 
 1. **`POST_PROOF_SITES` is a hand-list.** Nothing derives it, and a seventh
@@ -258,7 +292,13 @@ pre-existing and is not touched by this work.
    verified branch to carry `detail` is an `/audit` contract change beyond what
    this item authorises, so it is recorded rather than taken.
 
-4. **`head_state`'s `checked` is reported, not enforced, on the read path.** An
+4. **An intermittent `committed: false` on `POST /write-ordered`,** seen once
+   in CI during this session and described under CI above. Out of scope here
+   and not investigated: it is a different route, a different design decision
+   (D45), and this is an out-of-band regression fix. Left as a finding rather
+   than folded into this work.
+
+5. **`head_state`'s `checked` is reported, not enforced, on the read path.** An
    unchecked head still populates `state_id`, marked `"unchecked"`. That is the
    instruction's decision - `_checked` gates, `head_state` reports - and is
    noted so the asymmetry is not rediscovered as a defect.
