@@ -367,3 +367,43 @@ The rows are not corrected here. They are entered in
 
 See `docs/adr/0013-mapping-table-self-check.md` and
 `docs/reports/phase-3c1.md`.
+
+---
+
+## Erratum (2026-08-30, Phase 3c-3b)
+
+**Row 14 left the mapping-check baseline without being fixed.**
+
+That row (`§3.1, SPIFFE/SPIRE bullets`) was quarantined in
+`docs/reports/mapping-check-baseline.json` with the reason "readME.md section
+4.1 contains none of the claim's distinctive terms (sequence)". Phase 3c-3b
+deleted the entry, because the row had stopped failing. **Nothing about the
+row, its claim, or README section 4.1 changed.** Section 4.1 still does not
+contain the word.
+
+What changed is the corpus. Class (b) selects a claim's distinctive terms by
+document frequency across all checked documents, so prose added anywhere can
+change which terms are selected for an unrelated row. Phase 3c-3b introduced
+the word "sequence" into `docs/adr/0014-ordered-audit-view-index.md`,
+`docs/reports/phase-3c3b.md` and `readME.md`, which was enough for "sequence"
+to stop being distinctive; a different term was then selected for row 14's
+claim, and that one does appear in section 4.1.
+
+This is the coupling `TODO.md` already records, running in the direction it
+warns is easier to trip. It is written here rather than only in Phase 3c-3b's
+report so that a reader of this report's errata sees the retirement without
+having to know which later phase caused it.
+
+The entry was deleted rather than reworded around because the row now passes
+outright, so there was no failure left to quarantine, and
+`tests/test_mapping_tables.py` requires a baseline entry that no longer fails
+to be removed. If the corpus shifts back, the row reappears as a **new**
+failure and fails the build, which is what makes the deletion safe rather than
+a silent loss of coverage.
+
+The row's underlying weakness is unchanged: it names a section whose prose does
+not contain a load-bearing term from its own claim, and class (b) can decide
+nothing about it either way.
+
+See `docs/reports/phase-3c3b.md` section 12 and
+`docs/adr/0013-mapping-table-self-check.md`.

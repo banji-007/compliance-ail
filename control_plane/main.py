@@ -51,7 +51,9 @@ for _provenance_parent in (
             sys.path.insert(0, _provenance_parent)
         break
 
-from provenance.record_signature import load_signing_key, sign_record  # noqa: E402
+from provenance.record_signature import (  # noqa: E402
+    load_signing_key, load_verifying_key, sign_record, verify_record,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -444,9 +446,23 @@ def _write_tombstone(call_id: str) -> None:
     write-scoped API key (ADR-0007), not a per-caller credential, so no
     finer-grained identity exists at this layer to record.
 
-    Raises on any failure (non-2xx, transport error, or verified: false) -
-    the caller (erase_content) treats this as fail-closed: the erasure is
-    refused and the row survives.
+    Raises when the tombstone did not reach the ledger (non-2xx, transport
+    error, or a `verified: false` that is also `committed: false`) - the
+    caller treats that as fail-closed: the erasure is refused and the row
+    survives.
+
+    P3c3c-12 (Phase 3c-3c): a `verified: false` that is `committed: true` is
+    a different thing and returns rather than raising. `verifiedSet` commits
+    at service.VerifiableSet and every proof failure is raised after that
+    line, so such a tombstone is in the ledger; refusing the erasure on the
+    strength of a proof failure about a write we can see happened leaves the
+    ledger saying erased and the content store saying present, which is the
+    `erasure_conflict` face of _payload_state - P13-4's own finding,
+    manufactured by the refusal. Reproduced live on b9f6a1d in
+    docs/reports/phase-3c3c.md: DELETE answered 503 while the tombstone was
+    committed at tx 6.
+
+    The return value is that distinction, and the caller acts on it.
     """
     tombstone = {
         "record_type": "content_erasure",
@@ -474,8 +490,158 @@ def _write_tombstone(call_id: str) -> None:
         resp.raise_for_status()
 
     result = resp.json()
-    if not result.get("verified"):
+    if result.get("verified"):
+        return {"committed": True, "verified": True, "tx_id": result.get("tx_id"),
+                "fault_record": None}
+
+    if result.get("committed") is None:
+        # D45 (Phase 3c-3e): the verifier could not establish whether the
+        # tombstone committed, so it says so instead of guessing. Guessing
+        # `false` here is what produced the red team's A4.2 transcript: DELETE
+        # 503, the tombstone committed at transaction 121, 772 bytes of
+        # payload still in `call_content`, and content writes for that
+        # call_id frozen at 409 - the subject's data unerasable through the
+        # documented route and unwritable.
+        #
+        # This service has its own path to the ledger and asks it directly.
+        # Without a transaction to confirm against, the question it can
+        # answer is narrower and is asked as such: is there a
+        # content_erasure record for this call_id at all. Both answers are
+        # safe. If there is one, the ledger already says this call_id is
+        # erased and completing the erasure is what removes the divergence.
+        # If there is not, nothing says erased, no write is frozen, and the
+        # refusal below leaves the row intact with no conflict to resolve.
+        if not _tombstone_present_in_ledger(call_id, result.get("tx_id"),
+                                            require_transaction=False):
+            raise RuntimeError(
+                "Tombstone write outcome not established and no content_erasure "
+                f"record is present under content_erasure:{call_id}; refusing "
+                f"the erasure: {result.get('detail', 'no detail')}"
+            )
+        logger.error(
+            "Tombstone for call_id=%s: the verifier could not establish whether "
+            "the write committed (%s), and a content_erasure record for this "
+            "call_id is in the ledger. The erasure completes, because the "
+            "ledger already says this call_id is erased.",
+            call_id, result.get("detail"),
+        )
+        return {"committed": True, "verified": False, "tx_id": result.get("tx_id"),
+                "fault_record": result.get("fault_record"),
+                "error_class": "commit_not_established"}
+
+    if not result.get("committed"):
         raise RuntimeError(f"Tombstone write not verified: {result.get('detail', 'no detail')}")
+
+    # Committed, unverified. Confirm it from the ledger rather than from the
+    # response that just told us a proof failed - one exact read, on a path
+    # that has already failed once, and it separates a stale trust anchor
+    # (the record is there) from a record that genuinely is not in the tree.
+    # A compromised server defeats both, which is why this is stated as
+    # confirming presence rather than as re-verifying anything.
+    if not _tombstone_present_in_ledger(call_id, result.get("tx_id")):
+        raise RuntimeError(
+            "Tombstone write reported committed but no record is present under "
+            f"content_erasure:{call_id}; refusing the erasure"
+        )
+    logger.error(
+        "Tombstone for call_id=%s committed at tx=%s and failed verification "
+        "(%s); the erasure completes and the fault record at %s qualifies it",
+        call_id, result.get("tx_id"), result.get("error_class"),
+        result.get("fault_record"),
+    )
+    return {"committed": True, "verified": False, "tx_id": result.get("tx_id"),
+            "fault_record": result.get("fault_record"),
+            "error_class": result.get("error_class")}
+
+
+def _tombstone_present_in_ledger(call_id: str, expected_tx: int | None,
+                                 *, require_transaction: bool = True) -> bool:
+    """Is THIS call's content_erasure record under this call_id's exact key.
+
+    An exact `getall` against ImmuDB's own REST route, not a verified read:
+    this is called precisely when a proof has failed, so a verified read
+    would fail the same way and answer a different question than the one
+    being asked. What it establishes is narrow and is used narrowly - a
+    record exists under this key, at this transaction.
+
+    **P3c3d-7 (Phase 3c-3d): at this transaction.** It used to ask only
+    whether a tombstone existed, so a tombstone written by some earlier
+    erasure satisfied a later call's confirmation - the confirmation would
+    pass for a write that never landed. `expected_tx` is the transaction the
+    write response named, and the entry the ledger holds has to be at it.
+    Narrow, and it is a correctness question on the GDPR path: this
+    confirmation is the only thing standing between a refused-looking write
+    and a deleted row.
+
+    No transaction to check against is not a confirmation. It fails closed,
+    the same rule the exception handler below applies.
+
+    **`require_transaction=False` is one caller and one condition** (D45,
+    Phase 3c-3e): the verifier answered `committed: null`, so there is no
+    transaction to confirm against and there never will be for this call. The
+    weaker question - is there a content_erasure record for this call_id at
+    all - is asked explicitly through this parameter rather than by passing
+    `None` and having the check quietly answer something else, because the
+    exact-transaction rule above is a correctness rule on the GDPR path and a
+    silent exemption from it is how such rules stop applying. A tombstone
+    found this way was written by some erasure of THIS call_id, which is the
+    only claim the caller makes of it.
+    """
+    if require_transaction and not expected_tx:
+        logger.error(
+            "Could not confirm the tombstone for call_id=%s: the write response "
+            "named no transaction, so there is nothing to confirm it against",
+            call_id,
+        )
+        return False
+    try:
+        with httpx.Client(timeout=15) as client:
+            login = client.post(f"{IMMUDB_URL}/api/v2/login", json={
+                "user": base64.b64encode(IMMUDB_USER.encode()).decode(),
+                "password": base64.b64encode(IMMUDB_PASSWORD.encode()).decode(),
+                "database": base64.b64encode(b"defaultdb").decode(),
+            })
+            login.raise_for_status()
+            token = login.json()["token"]
+            resp = client.post(
+                f"{IMMUDB_URL}/api/v2/db/getall",
+                json={"keys": [base64.b64encode(
+                    f"content_erasure:{call_id}".encode()).decode()]},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+    except Exception as exc:
+        # Fail closed: an erasure must never complete because the check that
+        # would have caught a missing tombstone could not run. Same rule
+        # _has_tombstone applies in the other direction.
+        logger.error("Could not confirm the tombstone for call_id=%s: %s", call_id, exc)
+        return False
+    for raw in resp.json().get("entries", []):
+        try:
+            value = json.loads(base64.b64decode(raw["value"]).decode())
+        except Exception:
+            continue
+        if value.get("record_type") != "content_erasure" or value.get("call_id") != call_id:
+            continue
+        if not require_transaction:
+            logger.error(
+                "Accepting a content_erasure record for call_id=%s at transaction "
+                "%s as confirmation without a transaction to match it against. "
+                "The write's own outcome was not established, so this is the "
+                "narrower claim: some erasure of this call_id reached the ledger.",
+                call_id, raw.get("tx"),
+            )
+            return True
+        if int(raw.get("tx", 0)) != int(expected_tx):
+            logger.error(
+                "A content_erasure record exists for call_id=%s at transaction %s, "
+                "and this call's write reported transaction %s. That is a different "
+                "tombstone; refusing to treat it as confirmation of this one.",
+                call_id, raw.get("tx"), expected_tx,
+            )
+            continue
+        return True
+    return False
 
 
 @app.delete("/content/{call_id}", status_code=204)
@@ -498,13 +664,22 @@ def erase_content(
     deletes a row without a durable record of having done so. A call_id
     with no row (already erased, or never had one) is a no-op: nothing to
     erase, so no tombstone is written for it.
+
+    P3c3c-12 (Phase 3c-3c): "if it fails" now means the tombstone did not
+    reach the ledger, which is the question D11 was always asking. A
+    tombstone that committed and whose proof did not check out is confirmed
+    by an exact read and the erasure completes - the durable record of
+    having erased exists, a ledger_fault qualifies its standing, and
+    refusing instead would leave the ledger saying erased while the content
+    it names is still in the store. The one thing that must never happen
+    here is a row deleted with no tombstone behind it, and that is unchanged.
     """
     existing = db.query(CallContent).filter_by(call_id=call_id).first()
     if existing is None:
         return
 
     try:
-        _write_tombstone(call_id)
+        outcome = _write_tombstone(call_id)
     except Exception as exc:
         logger.error("Tombstone write failed for call_id=%s: %s", call_id, exc)
         raise HTTPException(
@@ -514,6 +689,12 @@ def erase_content(
 
     db.delete(existing)
     db.commit()
+    if not outcome.get("verified"):
+        logger.warning(
+            "Erasure for call_id=%s completed against a committed-unverified "
+            "tombstone (tx=%s, fault=%s)",
+            call_id, outcome.get("tx_id"), outcome.get("fault_record"),
+        )
 
 
 _TAMPER_ERROR_CLASSES = frozenset({"consistency_failure", "signature_failure"})
@@ -540,11 +721,28 @@ def _verification_from_200(vdata: dict) -> dict:
     wording (verifier/main.py's error_class="unknown" fallback) turned a
     never-written key into a tamper alarm - with no source diff and no build
     to fail.
+
+    R6: `state_read` is carried through in all four branches. It is an
+    **/audit contract change**: rows now carry a fifth key. The verifier
+    populates it on verified responses only - it describes a read that is
+    attempted after a proof has succeeded - and it is None everywhere else,
+    including for a verifier too old to send it. Carried rather than dropped
+    because `state_id` can now be null on an otherwise sound row, and without
+    this an operator would see that null with the explanation stranded at the
+    verifier. It is **not** a verification state and must never be read as
+    one: a state read that could not run is not tamper evidence, which is why
+    its vocabulary does not contain the word "failed".
+
+    dashboard/ deliberately does not render this field in this phase. It does
+    not render ledger_fault either, and growing the dashboard is not this
+    item's job. Stated so a later reader does not read the omission as an
+    oversight.
     """
     if vdata.get("verified"):
         return {
             "state": "verified",
             "state_id": vdata.get("state_id"),
+            "state_read": vdata.get("state_read"),
             "detail": None,
             "error_class": None,
         }
@@ -558,6 +756,7 @@ def _verification_from_200(vdata: dict) -> dict:
         return {
             "state": "not_found",
             "state_id": vdata.get("state_id"),
+            "state_read": vdata.get("state_read"),
             "detail": vdata.get("detail"),
             "error_class": error_class,
         }
@@ -565,12 +764,14 @@ def _verification_from_200(vdata: dict) -> dict:
         return {
             "state": "failed",
             "state_id": vdata.get("state_id"),
+            "state_read": vdata.get("state_read"),
             "detail": vdata.get("detail"),
             "error_class": error_class,
         }
     return {
         "state": "unverifiable",
         "state_id": vdata.get("state_id"),
+        "state_read": vdata.get("state_read"),
         "detail": vdata.get("detail"),
         "error_class": error_class,
     }
@@ -613,6 +814,7 @@ def _verify_one_key(encoded_key: str) -> tuple[dict, bool]:
         return {
             "state": "unverifiable",
             "state_id": None,
+            "state_read": None,
             "detail": str(vexc),
             "error_class": None,
         }, False
@@ -624,6 +826,7 @@ def _verify_one_key(encoded_key: str) -> tuple[dict, bool]:
     return {
         "state": "unverifiable",
         "state_id": None,
+        "state_read": None,
         "detail": f"verifier returned HTTP {vr.status_code}",
         "error_class": None,
     }, True
@@ -638,8 +841,14 @@ def _deferred_verification() -> dict:
     verifiedGet was attempted, so there is no state_id to report, no detail to
     explain, and no error_class - a deferred row must not carry anything a
     reader could mistake for a diagnosis.
+
+    R6: state_read is null here for the same reason and not by omission. No
+    verifiedGet was attempted, so no state was read, so there is no outcome to
+    report. The key is present because every row carries the same shape; a row
+    where the field is absent rather than null would be a second shape.
     """
-    return {"state": "asserted", "state_id": None, "detail": None, "error_class": None}
+    return {"state": "asserted", "state_id": None, "state_read": None,
+            "detail": None, "error_class": None}
 
 
 def _probe_verifier_reachable() -> bool:
@@ -753,6 +962,363 @@ _TOOL_CALL_PREFIX = b"tool_call:"
 # P3c3a-3's tombstone join is a getall rather than a scan.
 _MAX_SCAN_LIMIT = 2500
 
+# D32 (Phase 3c-3b): the view indexes the ordered page selects through, and
+# the shared counter that scores them. Named to match
+# verifier/main.py::_VIEW_SETS - one counter, one position per commit, one
+# zset per view, so a later view is a new zset over the same numbers rather
+# than a second backfill.
+#
+# zscan carries the same 2500 ceiling scan does (verified live), so the
+# limit+1 handling P3c3a-2 established applies here unchanged.
+_VIEW_DECISION = b"ail_view:decision:v1"
+_VIEW_INTENT   = b"ail_view:intent:v1"
+
+# D35 (Phase 3c-3c). Named rather than spelled inline at the two places that
+# use it, so tests/test_ledger_vocabulary.py can compare this copy against
+# verifier/main.py's - these two modules never import each other and both
+# have to mean the same key.
+_FAULT_KEY_PREFIX  = "ledger_fault:"
+_FAULT_RECORD_TYPE = "ledger_fault"
+
+# D38 (Phase 3c-3d). The verifier's copy is verifier/main.py's
+# FAULT_KEY_TX_PAD and fault_key_tx_bound, and what has to agree between the
+# two modules is the whole key format and not just the prefix: the writer
+# builds `ledger_fault:{tx:020d}:{identity}:{nonce}` and this module builds
+# the window bounds `[ledger_fault:{lo:020d}, ledger_fault:{hi+1:020d})` from
+# the same rule. A pad that disagreed would produce a window that silently
+# excludes the faults it was asked for.
+# tests/test_ledger_vocabulary.py compares what the two produce.
+_FAULT_KEY_TX_PAD = 20
+
+
+def _fault_key_tx_bound(tx_id: int) -> str:
+    """`ledger_fault:{tx_id:020d}` - a bound for the page's range read."""
+    return f"{_FAULT_KEY_PREFIX}{tx_id:0{_FAULT_KEY_TX_PAD}d}"
+
+
+def _fault_key_transaction(encoded_key: str) -> int | None:
+    """The transaction a fault key names, or None if it names none.
+
+    P3c3e-7 (Phase 3c-3e). The inverse of `_fault_key_tx_bound`, so the same
+    format rule that builds the page's range bounds is what reads a key back.
+    `tests/test_ledger_vocabulary.py` compares this against the verifier's own
+    `fault_key_tx_bound` for the same transaction, which is what stops the two
+    drifting - a reader that parsed a different number of digits than the
+    writer padded would silently place every fault at the wrong transaction.
+    """
+    try:
+        key = base64.b64decode(encoded_key).decode("utf-8", "replace")
+    except Exception:
+        return None
+    if not key.startswith(_FAULT_KEY_PREFIX):
+        return None
+    digits = key[len(_FAULT_KEY_PREFIX):len(_FAULT_KEY_PREFIX) + _FAULT_KEY_TX_PAD]
+    if len(digits) != _FAULT_KEY_TX_PAD or not digits.isdigit():
+        return None
+    # The component has to be exactly the padded width and be followed by the
+    # separator, so a key whose transaction ran wider than the pad - which is
+    # what a shortened pad looks like from here - is refused rather than read
+    # as its first twenty digits.
+    remainder = key[len(_FAULT_KEY_PREFIX) + _FAULT_KEY_TX_PAD:]
+    if not remainder.startswith(":"):
+        return None
+    return int(digits)
+
+
+# D41 (Phase 3c-3d): the key a fault record has to be signed by before this
+# service renders it as another record's standing. Path, not key material -
+# the public half, mounted read-only like every other file this service
+# reads from /keys.
+_FAULT_WRITER_PUBLIC_KEY = os.getenv("AIL_FAULT_WRITER_PUBLIC_KEY",
+                                     "/keys/writer-verifier.pub")
+
+
+class BoundedReadFault(Exception):
+    """D42 (Phase 3c-3d): a bounded read returned something outside its bound.
+
+    ImmuDB's REST route drops an unrecognised field without comment, so a
+    bounded read whose bound is misspelled becomes an unbounded read at HTTP
+    200 and nothing in the response distinguishes the two - `endkey` for
+    `endKey` is the whole distance between a correct read and a wrong one
+    (docs/reports/phase-3c3d-keyprobe.md section 2). The assertion that bites
+    is therefore on what came back, not on what was sent: a dropped bound
+    only reveals itself when something out-of-window arrives.
+
+    Raised rather than logged. A page whose fault join silently widened is a
+    page that could name the wrong record's standing, and this project's rule
+    for a check that cannot be trusted is to refuse rather than serve with a
+    caveat.
+    """
+
+
+class OrderingFault(Exception):
+    """D33 (Phase 3c-3b): the index and the ledger disagree about order.
+
+    zscan returns the caller's score and the resolved `entry.tx` in the same
+    response, so checking that they agree costs no extra call. Under D32's
+    CAS this is no longer a defence against a writer that can misorder - the
+    ledger refuses to commit an out-of-order position at all. It is a cheap
+    assertion that the enforcement is still in place, and it is what would
+    catch the precondition having been dropped.
+
+    **A disagreement is a fault, not a sort order.** Reordering the page to
+    match the transaction ids would hide exactly the condition worth
+    reporting: an index that no longer describes the ledger it indexes. So
+    this raises, `/audit` answers 500, and nobody is shown a page that looks
+    fine.
+
+    It carries the pair it disagreed about, so the response can name it
+    rather than hand a reader a sentence to parse. See
+    _ordering_fault_body.
+    """
+
+    def __init__(self, message: str, *, view: str,
+                 higher: tuple[float, int], lower: tuple[float, int]):
+        super().__init__(message)
+        self.view = view
+        # (position, transaction) for the two adjacent rows that disagreed,
+        # `higher` being the one the index placed later in commit order.
+        self.higher = higher
+        self.lower = lower
+
+
+# The condition is deliberately a 500 and deliberately not a 503. It is a
+# server-side integrity failure rather than a bad request, so it is not 4xx;
+# and it is not the "try again shortly" that 503 promises either, because the
+# ledger is append-only and a score that has been written cannot be
+# withdrawn.
+#
+# P3c3c-7 (Phase 3c-3c): what it must not say is `transient: false`. The
+# corruption is not transient; this fault is. The check's window is the
+# top-of-index page, so newer traffic pushes a disagreement below the window
+# and every limit returns 200 again with the corruption still indexed -
+# measured, in docs/reports/phase-3c3b-redteam.md C5 and C10 and reproduced
+# in docs/reports/phase-3c3c.md. A field asserting durability the code does
+# not have is worse than no field: it tells an operator the fault will be
+# there tomorrow, so its absence tomorrow reads as repair.
+#
+# What replaces it is the scope this check actually has, and a pointer to
+# the check that does have the durable answer (D37, the reconciliation).
+ORDERING_FAULT_ERROR = "audit_ordering_fault"
+
+
+def _ordering_fault_body(exc: "OrderingFault") -> dict:
+    """The response body for a disagreement between the index and the ledger.
+
+    Factored out of the handler so the shape a caller sees is testable
+    without fabricating a live disagreement: ImmuDB zsets are append-only, so
+    a test that wrote a bad score into a real view would leave every
+    subsequent page in the session faulted.
+    """
+    return {
+        "error": ORDERING_FAULT_ERROR,
+        "message": str(exc),
+        "view": exc.view,
+        "disagreement": {
+            "higher_position": {"position": exc.higher[0], "transaction": exc.higher[1]},
+            "lower_position": {"position": exc.lower[0], "transaction": exc.lower[1]},
+        },
+        # Stated rather than implied: no page was served, so a caller must
+        # not read this as an empty ledger.
+        "page_served": False,
+        # P3c3c-7: the scope of the check that raised, said plainly, because
+        # it is narrower than a reader would assume from a 500 about the
+        # ledger's integrity.
+        "scope": (
+            "this page only: the adjacent rows at the top of the view index at "
+            "this limit, and only positions the compare-and-set allocated"
+        ),
+        # And what that scope implies about repeating the request, without
+        # claiming a persistence this check cannot observe. Both directions
+        # are named because both mislead on their own.
+        "on_retry": (
+            "an identical request returns this same fault while the disagreement "
+            "is inside the window; a later request can succeed without anything "
+            "having been repaired, because newer commits push the disagreement "
+            "below the window while it stays in the index. A page that succeeds "
+            "is therefore not evidence the index was corrected"
+        ),
+        "authoritative_check": (
+            "the sequence reconciliation in anchor_service walks every position "
+            "in every view, so it has no window and its findings persist"
+        ),
+        "remediation": (
+            "The view index does not describe the order the ledger committed in. "
+            "Do not reorder or ignore it. Run the sequence reconciliation in "
+            "anchor_service to find what else is affected - including "
+            "disagreements this page can no longer reach - and see "
+            "docs/adr/0014-ordered-audit-view-index.md."
+        ),
+    }
+
+
+# The seam. Positions 1 through _RESERVED_POSITIONS belong to backfilled
+# history, scored at each record's own transaction id
+# (tools/ail_backfill_index.py); the CAS allocates from _RESERVED_POSITIONS + 1
+# upward.
+#
+# D36 (Phase 3c-3c): no longer "must match verifier/main.py" by convention.
+# The reserve is bound into the ledger under KeyMustNotExist at first
+# allocation, and this reader refuses to serve a page if its own value
+# disagrees with the bound one - paging against a different seam than the
+# writer allocated against would put live positions inside the reserve,
+# where D33 does not check them and reconciliation does not count them.
+# P3c3d-9 (Phase 3c-3d): the first integer a float64 cannot follow.
+# zscan scores are float64, so no position at or above this is distinct
+# from its neighbour. Same constant and same rule as
+# verifier/main.py::MAX_POSITION.
+MAX_POSITION = 2 ** 53
+
+
+def _validate_reserve(raw, source: str = "AIL_RESERVED_POSITIONS") -> int:
+    """A reserve is a positive integer below 2**53. Anything else refuses at load.
+
+    Same rule and same words as verifier/main.py::validate_reserve. Three
+    copies because three images do not import each other; the value bound
+    into the ledger is what actually keeps them honest.
+
+    P3c3d-9 (Phase 3c-3d) added the upper bound: a reserve at or above 2**53
+    makes allocated positions unrepresentable as distinct float64 scores.
+    Measured, six writes produced four scores and /audit was dead at every
+    limit from the sixth write on a virgin ledger.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{source} must be an integer; got {raw!r}.")
+    if value < 1:
+        raise RuntimeError(
+            f"{source} must be a positive integer; got {value}. At or below zero "
+            "every allocated position would be at or below zero too, and zscan "
+            "under desc omits negatively-scored members and reports a zero score "
+            "as no score at all."
+        )
+    if value >= MAX_POSITION:
+        raise RuntimeError(
+            f"{source} must be below 2**53 ({MAX_POSITION}); got {value}. A position is a "
+            "float64 score in a zset, and above 2**53 consecutive integers are "
+            "not distinct scores: allocated positions collapse onto each other, "
+            "the write response names a position the index does not hold, and "
+            "the order check reads the collapse as a disagreement at every limit."
+        )
+    return value
+
+
+_RESERVED_POSITIONS = _validate_reserve(os.getenv("AIL_RESERVED_POSITIONS", "1000000000"))
+_FIRST_ALLOCATED_POSITION = float(_RESERVED_POSITIONS + 1)
+_RESERVE_KEY = b"ail_seq:reserve"
+
+# Cached so the check costs no round trip per page. Re-read at cold start and
+# after a refusal, the same two moments the verifier refreshes its own copy.
+_bound_reserve_cache: int | None = None
+
+
+class ReserveMismatch(Exception):
+    """The ledger's bound reserve is not this service's configured reserve."""
+
+
+def _assert_reserve_agrees(client: httpx.Client, token: str) -> None:
+    """Refuse to serve a page against a seam this deployment does not share.
+
+    A ledger with no bound reserve is one that has never allocated, or one
+    written before D36. Neither is a disagreement, so neither refuses: there
+    is no bound value to disagree with, and inventing a refusal for the
+    absence would make every pre-D36 ledger unreadable.
+    """
+    global _bound_reserve_cache
+    if _bound_reserve_cache is None:
+        resp = client.post(
+            f"{IMMUDB_URL}/api/v2/db/getall",
+            json={"keys": [base64.b64encode(_RESERVE_KEY).decode()]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        entries = resp.json().get("entries", [])
+        if not entries:
+            return
+        _bound_reserve_cache = _validate_reserve(
+            base64.b64decode(entries[0]["value"]).decode(), source="the bound reserve")
+    if _bound_reserve_cache != _RESERVED_POSITIONS:
+        bound = _bound_reserve_cache
+        _bound_reserve_cache = None      # re-read on the next attempt
+        raise ReserveMismatch(
+            f"this service is configured with AIL_RESERVED_POSITIONS="
+            f"{_RESERVED_POSITIONS} and the ledger has {bound} bound into it. Every "
+            "position in this ledger was allocated against the bound value, so "
+            "paging against a different one would put live positions inside the "
+            f"reserve, where they are not order-checked. Set this service to {bound}. "
+            "A reserve that is genuinely too small is a re-index into a new view, "
+            "not a moved boundary."
+        )
+
+
+def _assert_score_order_matches_commit_order(
+    rows: list[tuple[float, int]], view: str = "unknown"
+) -> None:
+    """D33. `rows` is [(score, tx_id)] in the order zscan returned them, which
+    is score-descending.
+
+    A position is allocated under the CAS in the same transaction that commits
+    the record, so a higher position must name a higher transaction id. An
+    inversion between adjacent rows is the fault.
+
+    **What this covers, stated precisely.** Only positions the CAS allocated,
+    which are the integers above the reserve. Backfilled history occupies the
+    reserve, scored at each record's own transaction id by an offline pass,
+    and those records were never ordered by the CAS - a record written before
+    the index existed can carry a higher transaction id than a record indexed
+    after it, so comparing the two would report a fault about a rule that
+    never applied to either. D33 is an assertion that the CAS enforcement is
+    in place; it is scoped to the rows the CAS produced, and it is not
+    weakened for them.
+
+    Within the reserve the same relation does hold - a historical score *is*
+    its transaction id, so score order and commit order are the same order by
+    construction there - but it is not asserted here, because it would be
+    asserting that a number equals itself.
+    """
+    allocated = [(s, tx) for s, tx in rows if s >= _FIRST_ALLOCATED_POSITION]
+    for (score_a, tx_a), (score_b, tx_b) in zip(allocated, allocated[1:]):
+        if not (score_a > score_b and tx_a > tx_b):
+            raise OrderingFault(
+                f"the view index and the ledger disagree: position {score_a} resolves to "
+                f"transaction {tx_a} and position {score_b} resolves to transaction {tx_b}, "
+                "so the index no longer describes the order the ledger committed in",
+                view=view,
+                higher=(score_a, tx_a),
+                lower=(score_b, tx_b),
+            )
+
+
+def _zscan_view(client, token: str, view_set: bytes, limit: int) -> list[dict]:
+    """Newest-first rows from a view index.
+
+    Each row carries the score, the resolved entry's key, its transaction id
+    and its value, so the ordered page needs no second lookup to build a row
+    and D33's comparison is free.
+
+    One measured constraint on what may be used as a position: `desc: True`
+    silently omits negatively-scored members, and a score of exactly zero
+    arrives with no `score` field at all because protobuf's JSON mapping
+    omits a zero-valued field. A backfill that placed history at or below
+    zero would produce records that exist, are indexed, and are still absent
+    from every page - the defect this index exists to remove, reintroduced
+    by the migration meant to fix it. History is scored at each record's own
+    transaction id (tools/ail_backfill_index.py), and transaction ids start
+    at 1, so both are avoided by construction.
+    """
+    resp = client.post(
+        f"{IMMUDB_URL}/api/v2/db/zscan",
+        json={
+            "set": base64.b64encode(view_set).decode(),
+            "desc": True,          # newest first: highest score is the latest commit
+            "limit": limit,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+    return resp.json().get("entries", [])
+
 
 def _ledger_decision_count(client: httpx.Client, token: str) -> int:
     """
@@ -791,7 +1357,319 @@ def _ledger_decision_count(client: httpx.Client, token: str) -> int:
     return int(resp.json().get("count", 0))
 
 
-def _tombstoned_call_ids(client: httpx.Client, token: str, call_ids: set[str]) -> set[str]:
+# --- Phase 3c-3d: the page-side fault read ---------------------------------
+#
+# Three things happen below and they are separate on purpose.
+#
+#   _fault_writer_key      D41: the one key a fault must be signed by before
+#                          this page presents it as another record's standing.
+#   _rendered_fault        D41 + D11: decode, classify, check the signature.
+#   _faults_in_tx_window   D38 + D42: one paginated, half-open range scan over
+#                          the page's own transaction window.
+#
+# P3c3e-8 (Phase 3c-3e) deleted the legacy exact `getall` that used to sit
+# beside the range read. Its keys were `ledger_fault:{call_id}` built from
+# caller-authored call_ids, which is how one fault in the ledger produced
+# `count: 2` on a page row belonging to a different record. The page's fault
+# read is now one call, and its bound is derived from the page.
+
+_fault_writer_key_cache = None
+_fault_writer_key_loaded = False
+
+
+def _fault_writer_key():
+    """The verifier's writer public key, or None if it could not be loaded.
+
+    Cached, including the failure: the path comes from this process's own
+    environment and does not change under it, and retrying a missing file on
+    every page would be a per-request stat for a condition an operator has to
+    fix anyway. Logged once, at error, because the consequence is that no
+    fault renders.
+    """
+    global _fault_writer_key_cache, _fault_writer_key_loaded
+    if _fault_writer_key_loaded:
+        return _fault_writer_key_cache
+    _fault_writer_key_loaded = True
+    try:
+        _fault_writer_key_cache = load_verifying_key(_FAULT_WRITER_PUBLIC_KEY)
+    except Exception as exc:
+        logger.error(
+            "Could not load the fault writer's public key from %s (%s: %s). No "
+            "ledger fault will be rendered on any audit page until this is "
+            "fixed: a fault is presented as authoritative metadata about "
+            "another record, and an unchecked one is an assertion by whoever "
+            "wrote it.",
+            _FAULT_WRITER_PUBLIC_KEY, type(exc).__name__, exc,
+        )
+        _fault_writer_key_cache = None
+    return _fault_writer_key_cache
+
+
+def _rendered_fault(raw: dict) -> tuple[str, dict] | None:
+    """One ledger entry to (committed_key, the object a page row carries).
+
+    None if the entry is not a fault record, or is a fault this service will
+    not present.
+
+    **D41: a fault is verified before it is rendered as a record's standing,
+    and this is deliberately not what happens to a decision record.** That
+    asymmetry is a considered boundary, not an oversight, and is stated here
+    rather than left to be inferred. `/audit` renders a decision record
+    without checking its writer signature, and at the default `verify=false`
+    without checking its inclusion proof either - but a record's own state is
+    explicitly reported as `asserted` and is never self-certified (D2,
+    ADR-0006), whereas a fault is presented as authoritative metadata about
+    *another* record. Extending this check to every row on the default page
+    would be the per-record round trip D29 removed, and it must not be
+    extended.
+
+    The ceiling, stated with it: every service mounts `./keys:/keys:ro`, so a
+    fingerprint names a key and not a component (ADR-0012, corrected in Phase
+    3c-3c). This establishes that a fault was signed by the writer key the
+    verifier signs faults with, and the D22 mount split is what would make
+    that a statement about which process wrote it. Worth having and bounded.
+    """
+    try:
+        value = json.loads(base64.b64decode(raw["value"]).decode())
+    except Exception as exc:
+        logger.warning("Skipping an unreadable page-side fault entry: %s", exc)
+        return None
+    if not isinstance(value, dict) or value.get("record_type") != _FAULT_RECORD_TYPE:
+        return None
+
+    committed_key = value.get("committed_key")
+    if not committed_key or not isinstance(committed_key, str):
+        logger.warning(
+            "Skipping a fault record that does not name the record it qualifies"
+        )
+        return None
+
+    # P3c3e-7 (Phase 3c-3e): the transaction in the key and the transaction
+    # in the body have to be the same number.
+    #
+    # The key's leading component is what puts a fault inside a page's
+    # transaction window, and the body carries `committed_tx_id` too. Nothing
+    # compared them. The verifier now derives the key's transaction from the
+    # committed record so it cannot write a pair that disagrees, and this is
+    # the reading half of the same rule: a fault that arrives here with two
+    # different numbers is not rendered, and says so at error level.
+    #
+    # What this can and cannot catch, stated plainly. A fault keyed at a
+    # transaction far from its record's is invisible here because it falls
+    # outside the window and is never fetched - that direction is closed at
+    # the writer, and only there. What this catches is a fault that lands in
+    # some page's window carrying a body about a record at another
+    # transaction, which would otherwise be attributed to a row by
+    # `committed_key` while its own key says something else.
+    key_tx = _fault_key_transaction(raw.get("key", ""))
+    body_tx = value.get("committed_tx_id")
+    if key_tx is None:
+        logger.error(
+            "Refusing to render a ledger fault for %s: its key carries no "
+            "readable transaction component, so nothing places it against the "
+            "record it claims to qualify.",
+            committed_key,
+        )
+        return None
+    if not isinstance(body_tx, int) or key_tx != body_tx:
+        logger.error(
+            "Refusing to render a ledger fault for %s: its key names "
+            "transaction %s and its body names %r. A fault key names the "
+            "transaction its record occupies; two different numbers is not a "
+            "fault this page can place.",
+            committed_key, key_tx, body_tx,
+        )
+        return None
+
+    verifying_key = _fault_writer_key()
+    if verifying_key is None or not verify_record(value, verifying_key):
+        logger.error(
+            "Refusing to render a ledger fault for %s: its writer signature is "
+            "absent or does not check out against %s. It is in the ledger and "
+            "readable there; what it is not is this page's account of that "
+            "record's standing.",
+            committed_key, _FAULT_WRITER_PUBLIC_KEY,
+        )
+        return None
+
+    return committed_key, {
+        "fault_class": value.get("fault_class"),
+        "error_class": value.get("error_class"),
+        "committed_tx_id": value.get("committed_tx_id"),
+        "committed_position": value.get("committed_position"),
+        "timestamp": value.get("timestamp"),
+        "ledger_key": raw.get("key", ""),
+    }
+
+
+def _merge_fault(faults: dict, committed_key: str, rendered: dict,
+                 entry_tx: int, count: int) -> None:
+    """Fold one fault into the page's map, newest-first and counted.
+
+    **The `/audit` contract this settles (P3c3d-11).** With more than one
+    fault per record now possible, `ledger_fault` could be a list or stay one
+    object. It stays one object - the most recent fault, by the ledger's own
+    transaction for the fault record itself - with `count` reporting how many
+    faults exist for that record. Reasons: the field answers "what is this
+    record's standing", which the most recent fault is; a list would put an
+    unbounded structure on every row of a 2500-row page for a field that is
+    null on almost all of them; and no consumer changes, which was checked
+    rather than assumed (`ledger_fault` appears nowhere in `dashboard/` and no
+    test asserts `count`). What is lost is naming the older faults from the
+    page; they are readable in the ledger under their own keys, and the write
+    response that produced each one names it in `fault_record`.
+
+    Ordering between two faults about one record comes from the entry's own
+    `tx`, which the read that already ran returns. No timestamp component is
+    needed for it and none was added (D38).
+
+    **P3c3e-8 (Phase 3c-3e): `count` is always 1 now, and the parameter
+    stays.** It used to be the legacy `getall` entry's `revision`, because
+    under the pre-D38 key shape a second fault about one record was a second
+    version of one key. That read is gone, every fault is its own key written
+    once, and one entry is one fault. The parameter is kept rather than
+    removed because it is what makes `count` a count rather than a length,
+    and folding it away would leave the field with nothing stating what it
+    means.
+    """
+    existing = faults.get(committed_key)
+    if existing is None:
+        faults[committed_key] = {**rendered, "count": count, "_tx": entry_tx}
+        return
+    existing["count"] += count
+    if entry_tx > existing["_tx"]:
+        existing.update(rendered)
+        existing["_tx"] = entry_tx
+
+
+def _faults_in_tx_window(client: httpx.Client, token: str,
+                         min_tx: int, max_tx: int) -> list[dict]:
+    """Every `ledger_fault:` entry whose qualified record committed in
+    [min_tx, max_tx], in one paginated range scan.
+
+    D38 + P3c3d-3. The fault key leads with the qualified record's own
+    transaction, zero-padded to 20, so the page's own transaction window is a
+    key range and the read is bounded by the page rather than by the ledger.
+    Filtering back to the page's rows is client-side membership; the range is
+    a superset and never a subset.
+
+    **Half-open, and it has to be.** A composite key is longer than its
+    transaction component, so an `endKey` of the bare padded `hi` with
+    `inclusiveEnd=True` sorts before that transaction's own faults and
+    silently drops them - which surfaces only when `hi` is a transaction that
+    has a fault, that is, on the last row of the page. Measured: the bare
+    inclusive form returned nothing for a single-transaction window that had a
+    fault; `hi + 1` exclusive returned it (keyprobe report section 5).
+
+    **D42: the read asserts on what came back.** An unrecognised or misspelled
+    parameter is dropped by the REST route without comment, so a bounded read
+    degrades to an unbounded one at HTTP 200 with nothing in the response
+    saying so. Every returned key is checked against the bound that was
+    actually requested for that page.
+
+    Paginated on `seekKey`, the key analogue of the reconciler's `minScore`
+    cursor, because `scan` caps a result at 2500 silently: omitting `limit`
+    and passing `limit=0` both return 2500 rows with a 200 and no truncation
+    flag (keyprobe report section 3).
+    """
+    seek = _fault_key_tx_bound(min_tx).encode()
+    end = _fault_key_tx_bound(max_tx + 1).encode()
+    inclusive_seek = True
+    entries: list[dict] = []
+
+    while True:
+        resp = client.post(
+            f"{IMMUDB_URL}/api/v2/db/scan",
+            json={
+                "seekKey": base64.b64encode(seek).decode(),
+                "inclusiveSeek": inclusive_seek,
+                "endKey": base64.b64encode(end).decode(),
+                "inclusiveEnd": False,
+                "limit": _MAX_SCAN_LIMIT,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("entries", [])
+
+        for row in rows:
+            key = base64.b64decode(row.get("key", ""))
+            in_window = (key >= seek if inclusive_seek else key > seek) and key < end
+            if not in_window:
+                raise BoundedReadFault(
+                    "a bounded read returned a key outside the range it asked "
+                    f"for: {key.decode('utf-8', 'replace')!r} is not in "
+                    f"[{seek.decode()!r}, {end.decode()!r}) with "
+                    f"inclusiveSeek={inclusive_seek}. The bound was not applied, "
+                    "which is what a dropped or misspelled parameter looks like "
+                    "on this route: an unbounded read at HTTP 200."
+                )
+
+        entries.extend(rows)
+        if len(rows) < _MAX_SCAN_LIMIT:
+            return entries
+        seek = base64.b64decode(rows[-1]["key"])
+        inclusive_seek = False
+
+
+def _fault_for_row(page_faults: dict, encoded_key: str) -> dict | None:
+    """The fault qualifying the record this row renders, or None.
+
+    The row's `ledger_key` is the base64 raw ImmuDB key; a fault names the
+    record it qualifies in `committed_key`, written by the verifier as
+    `record_key.decode("utf-8", "replace")`. Decoded the same way here so the
+    two are the same string for the same bytes.
+
+    `_tx` is the bookkeeping `_merge_fault` orders on and is not part of the
+    response contract, so it is dropped here rather than rendered.
+    """
+    try:
+        record_key = base64.b64decode(encoded_key).decode("utf-8", "replace")
+    except Exception:
+        return None
+    fault = page_faults.get(record_key)
+    if fault is None:
+        return None
+    return {k: v for k, v in fault.items() if k != "_tx"}
+
+
+def _page_faults(client: httpx.Client, token: str, page_txs: list[int]) -> dict:
+    """This page's faults, keyed by the record key each one qualifies.
+
+    One read: a range scan over the transaction window of the rows this
+    response will render. P3c3e-8 removed the exact `getall` that used to sit
+    beside it under the pre-D38 `ledger_fault:{call_id}` shape - its keys came
+    from caller-authored call_ids, and it is what made one fault count twice.
+
+    **An empty page has no window.** Zero rows means min and max are
+    undefined, and the range read is skipped rather than run with an invented
+    bound. A page with rows and no faults is a different case and runs the
+    read normally, returning nothing.
+
+    The window comes from the rows the response will render, after the
+    `limit + 1` truncation, and not from the fetched set. Both are safe - a
+    window taken from the wider set is a superset, and a superset cannot
+    exclude a page row - and the rendered set is chosen anyway, because
+    "bounded by the page" is the property, and a reader must not have to work
+    out which set was meant.
+    """
+    faults: dict = {}
+    if not page_txs:
+        return faults
+
+    for raw in _faults_in_tx_window(client, token, min(page_txs), max(page_txs)):
+        placed = _rendered_fault(raw)
+        if placed is None:
+            continue
+        committed_key, rendered = placed
+        # Each new-shape key is written once, so one entry is one fault.
+        _merge_fault(faults, committed_key, rendered, int(raw.get("tx", 0)), 1)
+    return faults
+
+
+def _tombstoned_call_ids(
+    client: httpx.Client, token: str, call_ids: set[str]
+) -> set[str]:
     """
     Which of exactly these call_ids have a content_erasure tombstone.
 
@@ -819,18 +1697,46 @@ def _tombstoned_call_ids(client: httpx.Client, token: str, call_ids: set[str]) -
 
     There is no orphan-tombstone direction to lose: nothing reads this set
     for tombstones whose call_id is not on the page.
+
+    **P3c3e-8 (Phase 3c-3e): the legacy `ledger_fault:{call_id}` half of this
+    request is gone, and the tombstone half is all that is left.**
+
+    P3c3d-4 kept it so that faults committed under the pre-D38 key shape would
+    still render. It was also the source of red-team A7: the legacy key is
+    derived from `call_id`, which is a caller-authored string, so a record
+    whose `call_id` is spelled `{tx:020d}:{identity}:{nonce}` made this
+    request fetch a fault that `_faults_in_tx_window` also returns, and
+    `_merge_fault` counted it twice. One fault in the ledger, `count: 2` on
+    the page, on a row belonging to a different record than the one the
+    attacker wrote, from the write credential alone.
+
+    The condition it protected against does not exist. Every ledger that has
+    ever held a fault record in this project is a CI stack or a scratch stack
+    destroyed by `docker compose down -v`, and no volume in either compose
+    file survives that - which
+    `tests/test_ledger_state_does_not_survive_teardown.py` asserts. There is
+    no deployment carrying pre-D38 faults to migrate, so the migration is
+    that there is nothing to migrate.
+
+    What went with it: this request's bound is now derived from the page in
+    both halves rather than in one. A tombstone key is
+    `content_erasure:{call_id}` for exactly the call_ids this page renders,
+    which is a membership test and not a search; the legacy fault key was
+    also built from a page call_id, but which `ledger_fault:` key that
+    reached was a caller's choice.
     """
     if not call_ids:
         return set()
 
+    ordered = sorted(call_ids)
     resp = client.post(
         f"{IMMUDB_URL}/api/v2/db/getall",
         json={
             "keys": [
-                base64.b64encode(f"content_erasure:{call_id}".encode()).decode()
                 # sorted() only so the request is reproducible between
                 # identical calls; getall imposes no ordering requirement.
-                for call_id in sorted(call_ids)
+                base64.b64encode(f"content_erasure:{call_id}".encode()).decode()
+                for call_id in ordered
             ]
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -841,10 +1747,12 @@ def _tombstoned_call_ids(client: httpx.Client, token: str, call_ids: set[str]) -
     for raw in resp.json().get("entries", []):
         try:
             value = json.loads(base64.b64decode(raw["value"]).decode())
-            if value.get("record_type") == "content_erasure" and value.get("call_id"):
+            if value.get("record_type") != "content_erasure":
+                continue
+            if value.get("call_id"):
                 tombstoned.add(value["call_id"])
         except Exception as exc:
-            logger.warning("Skipping malformed tombstone entry: %s", exc)
+            logger.warning("Skipping malformed page-side entry: %s", exc)
             continue
     return tombstoned
 
@@ -1027,39 +1935,72 @@ def get_audit(
             if not token:
                 raise ValueError("No auth token in ImmuDB login response")
 
-            scan_resp = client.post(
-                f"{IMMUDB_URL}/api/v2/db/scan",
-                json={
-                    "prefix": base64.b64encode(_TOOL_CALL_PREFIX).decode(),
-                    "desc": True,
-                    "limit": scan_limit,
-                },
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            scan_resp.raise_for_status()
-            raw_entries = scan_resp.json().get("entries", [])
+            # D36: before anything is selected. A page drawn against a
+            # different seam than the writer allocated against is not a
+            # degraded page, it is a page whose ordering guarantees do not
+            # apply, so it is refused rather than served with a caveat.
+            _assert_reserve_agrees(client, token)
 
-            # D16 (Phase 2 completion pass): a second scan, over
-            # tool_call_intent: keys - the write a mediated tool's execution
-            # is gated behind (ledger/immudb_ledger.py::log_tool_intent),
-            # never tool_call:. Joined against the decision entries below by
-            # call_id, so an intent with no matching completion record can
-            # be surfaced instead of silently missing from this response.
+            # P3c3b-3 (Phase 3c-3b): the page is selected through the view
+            # index, not by walking keys.
             #
-            # P3c3a-3 removed what used to be the second of three scans
-            # here, over content_erasure:. The tombstone join is no longer a
-            # search at all - see _tombstoned_call_ids above.
-            intent_scan_resp = client.post(
-                f"{IMMUDB_URL}/api/v2/db/scan",
-                json={
-                    "prefix": base64.b64encode(b"tool_call_intent:").decode(),
-                    "desc": True,
-                    "limit": scan_limit,
-                },
-                headers={"Authorization": f"Bearer {token}"},
+            # What it replaces and why. This was `scan` over the `tool_call:`
+            # prefix under `desc: True`, which walks keys - and a
+            # `tool_call:` key leads with agent_id, so the page returned the
+            # lexicographically-largest agent ids and called them recent. A
+            # record written seconds ago was absent once the ledger exceeded
+            # `limit` (observed at 211 entries during p3c2-defer: the newest
+            # transaction was 573 and the page's first row was not it).
+            # `scan` has no ordering parameter and `TxScan` is not routed
+            # over REST, so no parameter fixes this - the ordering has to
+            # come from somewhere the ledger enforces, which is D32's
+            # CAS-allocated sequence.
+            #
+            # `desc: True` here means highest score first, and the score is
+            # the commit position, so this is newest first in the ledger's
+            # own commit order rather than in an accident of key layout.
+            raw_entries = _zscan_view(client, token, _VIEW_DECISION, scan_limit)
+
+            # D16 (Phase 2 completion pass), now through the intent view
+            # (P3c3b-7). The write a mediated tool's execution is gated
+            # behind (ledger/immudb_ledger.py::log_tool_intent) lands in its
+            # own view index, scored from the same shared counter. Joined
+            # against the decision entries below by call_id, so an intent
+            # with no matching completion record is surfaced instead of
+            # silently missing from this response.
+            #
+            # Why a view and not a bounded walk of `tool_call_intent:`. The
+            # join needs a bound either way, because the intent key's uuid is
+            # generated fresh at immudb_ledger.py and exists nowhere but in
+            # the key, so no per-row lookup can construct it and the orphan
+            # direction has to enumerate. Bounding a key walk would bound it
+            # by lexicographic agent id, which is the very defect this phase
+            # exists to remove - the stated bound would not mean recency. Over
+            # the view it does: this is the newest `scan_limit` intents.
+            #
+            # P3c3a-3 removed what used to be a third scan here, over
+            # content_erasure:. The tombstone join is not a search at all -
+            # see _tombstoned_call_ids above.
+            raw_intents = _zscan_view(client, token, _VIEW_INTENT, scan_limit)
+
+            # D33: the index selects, the record proves. Checked before the
+            # page is built, on both views, so a disagreement never reaches a
+            # reader as a quietly reordered page.
+            # `.get("score", 0.0)`, and float rather than int, both for
+            # reasons measured on the wire: protobuf's JSON mapping omits a
+            # zero-valued field entirely, so a score of exactly 0 arrives
+            # with no "score" key at all, and a position is a float on the
+            # wire, so int() would truncate rather than compare - a
+            # difference that matters for any score the backfill or an
+            # operator placed between two integers.
+            _assert_score_order_matches_commit_order(
+                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_entries],
+                view="decision",
             )
-            intent_scan_resp.raise_for_status()
-            raw_intents = intent_scan_resp.json().get("entries", [])
+            _assert_score_order_matches_commit_order(
+                [(float(r.get("score", 0.0)), int(r["entry"]["tx"])) for r in raw_intents],
+                view="intent",
+            )
 
             # P3c3a-2: truncation is a measured fact about this response,
             # not an inference the caller is left to make from a row count
@@ -1096,13 +2037,17 @@ def get_audit(
             intent_by_call_id: dict[str, dict] = {}
             for raw in raw_intents:
                 try:
-                    value = json.loads(base64.b64decode(raw["value"]).decode())
+                    # P3c3b-3: a zscan row nests the resolved record under
+                    # "entry" and carries its score alongside. The key, value
+                    # and tx all come from there.
+                    entry = raw["entry"]
+                    value = json.loads(base64.b64decode(entry["value"]).decode())
                     if value.get("record_type") != "decision_intent" or not value.get("call_id"):
                         continue
                     intent_by_call_id[value["call_id"]] = {
                         **value,
-                        "tx_id": int(raw.get("tx", 0)),
-                        "encoded_key": raw.get("key", ""),
+                        "tx_id": int(entry.get("tx", 0)),
+                        "encoded_key": entry.get("key", ""),
                     }
                 except Exception as exc:
                     logger.warning("Skipping malformed intent entry: %s", exc)
@@ -1115,10 +2060,15 @@ def get_audit(
             decoded_entries: list[tuple[str, dict, int]] = []
             for raw in raw_entries:
                 try:
+                    # P3c3b-3: same shape as the intent rows above. The list
+                    # order is zscan's, which is the commit order, and it is
+                    # preserved all the way to the response - nothing below
+                    # re-sorts.
+                    entry = raw["entry"]
                     decoded_entries.append((
-                        raw.get("key", ""),
-                        json.loads(base64.b64decode(raw["value"]).decode()),
-                        int(raw.get("tx", 0)),
+                        entry.get("key", ""),
+                        json.loads(base64.b64decode(entry["value"]).decode()),
+                        int(entry.get("tx", 0)),
                     ))
                 except Exception as exc:
                     logger.warning(
@@ -1136,8 +2086,61 @@ def get_audit(
                 if log_entry.get("call_id")
             }
             page_call_ids |= set(intent_by_call_id)
-            tombstoned_call_ids = _tombstoned_call_ids(client, token, page_call_ids)
+            tombstoned_call_ids = _tombstoned_call_ids(
+                client, token, page_call_ids)
 
+            # P3c3d-3 (Phase 3c-3d): the page read is bounded by the page.
+            #
+            # The window is over BOTH zscans, decision and intent, and not
+            # over the decision page alone: a synthesized orphaned-intent row
+            # carries its own transaction, and a window that excluded it would
+            # exclude that row's fault. It is taken after the `limit + 1`
+            # truncation above, so it describes the rows this response will
+            # render rather than the rows that were fetched.
+            page_txs = [int(row["entry"].get("tx", 0))
+                        for row in (*raw_entries, *raw_intents)
+                        if isinstance(row.get("entry"), dict)]
+            page_faults = _page_faults(client, token, page_txs)
+
+    except ReserveMismatch as exc:
+        # D36: fail closed, and name the value rather than the symptom. This
+        # is a configuration disagreement with the ledger, not an outage, so
+        # a caller must not retry into it.
+        logger.error("Audit refused: %s", exc)
+        raise HTTPException(status_code=503, detail={
+            "error": "audit_reserve_mismatch",
+            "message": str(exc),
+            "page_served": False,
+        })
+    except BoundedReadFault as exc:
+        # D42: a bounded read that came back with something outside its bound
+        # did not apply the bound, and this project does not serve a page
+        # whose join it cannot trust. Structured like the ordering fault
+        # below, and for the same reason: naming the condition beats an
+        # "ImmuDB unavailable" that would send an operator to the wrong
+        # place.
+        logger.error("Audit refused: %s", exc)
+        raise HTTPException(status_code=500, detail={
+            "error": "bounded_read_fault",
+            "message": str(exc),
+            "page_served": False,
+        })
+    except OrderingFault as exc:
+        # D33: surfaced, never smoothed over. Reordering to match the
+        # transaction ids would hide the one condition this check exists to
+        # find, so the page is refused instead of quietly corrected.
+        #
+        # A chosen response, not an escaping exception: a structured body
+        # naming the error, the view, the two positions that disagreed and
+        # the transactions they resolve to, saying plainly that no page was
+        # served, and stating the scope of the check that raised. P3c3c-7:
+        # it does not claim the condition persists, because this check
+        # cannot observe that - see _ordering_fault_body.
+        logger.error(
+            "Audit ordering fault in view %s: position %s -> tx %s, position %s -> tx %s",
+            exc.view, exc.higher[0], exc.higher[1], exc.lower[0], exc.lower[1],
+        )
+        raise HTTPException(status_code=500, detail=_ordering_fault_body(exc))
     except httpx.HTTPStatusError as exc:
         logger.error("ImmuDB HTTP error during audit scan: %s", exc)
         raise HTTPException(status_code=502, detail=f"ImmuDB returned {exc.response.status_code}")
@@ -1209,6 +2212,22 @@ def get_audit(
                 "payload":         payload,
                 "payload_state":   payload_state,
                 "verification":    verification,
+                # D35 (Phase 3c-3c): the record's durable standing, as
+                # opposed to `verification`, which is recomputed on every
+                # read and goes back to "verified" the moment a corrupt
+                # trust anchor is repaired. A non-null value here says this
+                # record's write-time proof did not check out, whatever the
+                # verification state beside it now says. Null is the
+                # ordinary case and means no fault was ever recorded for
+                # this call_id - never "not checked", because the join that
+                # produces it is exact.
+                # P3c3d-3/P3c3d-8: joined on the record key this fault
+                # names, not on call_id. Exact for every row, including a
+                # record that carries no call_id at all - such a record does
+                # reach a page (measured, keyprobe report section 7) and its
+                # fault was never joined onto it under any key shape,
+                # including the old one.
+                "ledger_fault":    _fault_for_row(page_faults, encoded_key),
                 # R3 (Phase 1.3 completion pass, red-team V5): a record with
                 # no "profile" key at all must render as explicitly unknown,
                 # not as a definite, valid-looking value. The previous
@@ -1289,6 +2308,12 @@ def get_audit(
                 "payload":         payload,
                 "payload_state":   payload_state,
                 "verification":    verification,
+                # D35: same field on a synthesized intent row. An intent
+                # write can fault exactly the way a decision write can - and
+                # since D38 an intent fault and a decision fault for one
+                # call_id are two records rather than one, so this row gets
+                # the intent's own fault and not the decision's.
+                "ledger_fault":    _fault_for_row(page_faults, encoded_key),
                 "profile":         intent.get("profile", "unknown"),
                 "exclusivity":     None,
                 "execution_state": "unknown",

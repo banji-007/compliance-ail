@@ -24,6 +24,9 @@ import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "interceptor"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bounded_read_checks import assert_under_prefix  # noqa: E402
 
 os.environ.setdefault("SPIRE_DISABLED", "true")
 os.environ.setdefault("OPA_URL", "http://localhost:8181/v1/data/ail/main/allow")
@@ -58,7 +61,14 @@ def _raw_scan(limit: int = 500) -> list[dict]:
             headers={"Authorization": f"Bearer {token}"},
         )
         scan.raise_for_status()
-        return scan.json().get("entries", [])
+        entries = scan.json().get("entries", [])
+        # P3c3f-3 (D46): the bound, asserted on what came back. Every caller
+        # below reads `value` as a decision record, so a row from outside
+        # `tool_call:` is a record of some other shape being read as one.
+        assert_under_prefix(
+            [base64.b64decode(e["key"]).decode("utf-8", "replace")
+             for e in entries], "tool_call:", "_raw_scan")
+        return entries
 
 
 def _find_raw_entry_by_agent_id(agent_id: str) -> dict:

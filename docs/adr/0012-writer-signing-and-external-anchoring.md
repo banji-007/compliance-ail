@@ -88,10 +88,37 @@ property intact, so the finding re-runs itself on a clock.
 
 **Two writer keys, not one.** `decision-service` signs decision and intent
 records; `ail-control-plane` signs the erasure tombstone it writes directly.
-They hold separate pairs, so a bundle's `writer_key_fingerprint` names which
-service wrote the record, and so one writer can be revoked without revoking
-the other. A single shared key would verify every record identically and
-attribute nothing.
+Each is *configured* with its own pair, so a bundle's
+`writer_key_fingerprint` names which key signed the record, and one writer
+can be revoked without revoking the other. A single shared key would verify
+every record identically and attribute nothing.
+
+**Correction (Phase 3c-3c completion pass): "they hold separate pairs" was
+false, and the sentence it supported claimed too much.** The paragraph above
+said the fingerprint "names which service wrote the record". It does not.
+Every service mounts the whole key directory read-only - `./keys:/keys:ro`
+appears on `ail-control-plane`, `verifier`, `decision-service`,
+`anchor-service` and `immudb` in `docker-compose.yml` - so each of them holds
+every writer's private key and is separated from the others only by which
+path its own `AIL_WRITER_SIGNING_KEY` points at. That is a configuration
+convention, not a boundary: any of those services can read
+`/keys/writer-decision.key` and produce a signature indistinguishable from
+the decision service's own.
+
+So the fingerprint names **a key**, and the key does not name a service. What
+survives unchanged is per-key revocation, which is what the deny-list
+mechanism actually operates on, and the refusal of an unsigned record. What
+does not survive is reading a fingerprint as evidence of *which component*
+wrote a record, which matters exactly when it would be relied on: after a
+compromise of one of them.
+
+Segregating the mounts so each service mounts only its own key is a D22 item
+and is recorded in `TODO.md`; it is not done here, because it is a change to
+the deployment topology rather than to this phase's subject. One constraint
+on that split is already decided and recorded with it: `immudb` gets its own
+directory holding only the signing key. It mounts this one for
+`--signingKey` and has no writer key of its own, so a per-service split that
+left it reading `keys/` would move this defect rather than close it.
 
 #### Where the key is generated and stored, and how it reaches the service
 
@@ -329,7 +356,8 @@ separately.
 point in a public log. It does not prove the policy was correct, and it does
 not prove the writer was honest - only which key signed. A compromised
 writer signs whatever it records, and the signature makes that forgery
-attributable, not false. `readME.md` §3.4 keeps that distinction and §5
+attributable to a key, not false, and not attributable to a service - see
+the correction above. `readME.md` §3.4 keeps that distinction and §5
 states this one.
 
 **The checker gained an optional dependency.** The base check still needs

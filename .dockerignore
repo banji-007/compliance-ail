@@ -34,3 +34,29 @@ __pycache__/
 # SPIRE key material — never baked into an image
 spire/server/data/
 spire/agent/data/
+
+# Key material and secrets: never baked into an image, and since Phase 3c-3c
+# never even sent to the daemon as build context.
+#
+# Why this rule appeared late. Until D35 only control_plane/ and
+# decision_service/ built from the repository root; the verifier built from
+# ./verifier, three files, so keys/ could not reach it however it was
+# written. D35 moved the verifier to a root context so its image can carry
+# provenance/, which put every private key in a third build context.
+#
+# No Dockerfile copies keys/, and an inspection of the built verifier image
+# found nothing under /app but main.py, provenance/ and requirements.txt
+# (docs/reports/phase-3c3c-complete.md). But "no COPY names it" is one edit
+# away from being false, and decision_service/Dockerfile's
+# `COPY decision_service/ ./` already made the second rule below load-bearing
+# rather than precautionary: on a machine where `make keygen` has run, that
+# line baked decision_service/secrets/vault_api_token.txt into the image.
+# Verified by writing a probe token and rebuilding: the token was readable at
+# /app/secrets/vault_api_token.txt. The token is delivered as a Compose
+# secret at /run/secrets/vault_api_token and is never read from the image, so
+# excluding it changes nothing at runtime.
+#
+# tests/test_image_contents.py is the check, and it inspects the built images
+# rather than this file.
+keys/
+decision_service/secrets/*.txt

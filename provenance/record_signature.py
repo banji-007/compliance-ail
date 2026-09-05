@@ -112,3 +112,64 @@ def load_signing_key(path):
     with open(path, "r", encoding="utf-8") as f:
         sk = ecdsa.SigningKey.from_pem(f.read())
     return sk, sk.get_verifying_key()
+
+
+def load_verifying_key(path):
+    """Load a writer's public key from a PEM file on disk.
+
+    The read-path counterpart of load_signing_key, and the only place a
+    checker in this package constructs a verifying key.
+    """
+    import ecdsa
+
+    with open(path, "r", encoding="utf-8") as f:
+        return ecdsa.VerifyingKey.from_pem(f.read())
+
+
+def verify_record(record: dict, verifying_key) -> bool:
+    """Does this record carry a writer signature that checks out under this key.
+
+    D41 (Phase 3c-3d). The checker half of sign_record, here rather than in
+    the reader, so the writer and the checker agree by definition rather than
+    by two implementations of one canonicalization rule in two files. Same
+    reason FINGERPRINT_FIELD and FORMAT_FIELD are constants.
+
+    Four conditions, all of them refusing:
+
+    - the signature field is present and is a string. A record with none is
+      refused rather than treated as unsigned-and-fine, the same rule
+      tools/ail_verify_bundle.py applies (`writer_signature_missing`).
+    - the format field is exactly RECORD_SIGNATURE_FORMAT, so a record signed
+      under a future canonicalization rule is refused rather than checked
+      under this one and reported as a forgery.
+    - the fingerprint field names this key. It is inside the signed bytes, so
+      it cannot be rewritten without breaking the signature; checking it here
+      is what makes "signed by this writer" the question rather than "signed
+      by somebody".
+    - the ECDSA verification itself, over the canonical bytes, with SHA-256
+      named explicitly rather than left to a library default.
+
+    Returns a boolean rather than raising: every caller's next move is the
+    same either way, which is to not present the record as authoritative.
+    """
+    from ecdsa.util import sigdecode_der
+
+    signature_b64 = record.get(SIGNATURE_FIELD)
+    if not isinstance(signature_b64, str) or not signature_b64:
+        return False
+    if record.get(FORMAT_FIELD) != RECORD_SIGNATURE_FORMAT:
+        return False
+    if record.get(FINGERPRINT_FIELD) != key_fingerprint(verifying_key):
+        return False
+    try:
+        signature = base64.b64decode(signature_b64)
+    except Exception:
+        return False
+    try:
+        verifying_key.verify(
+            signature, canonical_record_bytes(record),
+            hashfunc=hashlib.sha256, sigdecode=sigdecode_der,
+        )
+    except Exception:
+        return False
+    return True

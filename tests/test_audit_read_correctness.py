@@ -66,6 +66,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from bounded_read_checks import assert_at_or_above_min_score  # noqa: E402
+
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8002")
 READ_API_KEY = os.getenv("CONTROL_PLANE_READ_KEY", "test-read-key")
 WRITE_API_KEY = os.getenv("CONTROL_PLANE_WRITE_KEY", "test-write-key")
@@ -95,27 +100,40 @@ def _b64(value) -> str:
 _WRITE_CLIENT = httpx.Client(timeout=30.0)
 
 
-def _verifier_write(key: str, value: dict) -> None:
-    """One verified ledger write, through the verifier's own /write - the
-    same route tests/test_content_states.py::_write_tombstone_directly uses,
-    with the same write-scoped credential D21 requires."""
+def _verifier_write(key: str, value: dict, view: str | None = None) -> None:
+    """One verified ledger write, through the verifier, with the
+    write-scoped credential D21 requires.
+
+     D32 (Phase 3c-3b): /write-ordered, because a decision or intent
+     record now takes a commit position in the same transaction that
+     commits it, and a record with no position is absent from every
+     ordered page. `view` picks which view index it lands in; a
+     tombstone is neither and keeps the plain /write route.
+    """
+    body = {"key": _b64(key), "value": _b64(json.dumps(value, separators=(",", ":")))}
+    route = "/write"
+    if view is not None:
+        route = "/write-ordered"
+        body["view"] = view
     resp = _WRITE_CLIENT.post(
-        f"{VERIFIER_URL}/write",
-        json={
-            "key": _b64(key),
-            "value": _b64(json.dumps(value, separators=(",", ":"))),
-        },
+        f"{VERIFIER_URL}{route}",
+        json=body,
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
     )
     resp.raise_for_status()
     assert resp.json().get("verified"), f"write not verified: {resp.json()}"
 
 
+def _verifier_write_decision(key: str, value: dict) -> None:
+    """A decision record, which since D32 means the ordered write path."""
+    _verifier_write(key, value, view="decision")
+
+
 def _write_decision_record(call_id: str, *, agent_id: str, content_state: str = "present") -> str:
     """A well-formed `tool_call:` decision record, keyed exactly the way
     ledger/immudb_ledger.py::log_tool_call keys one."""
     key = f"tool_call:{agent_id}:{uuid.uuid4().hex}:query_database"
-    _verifier_write(key, {
+    _verifier_write_decision(key, {
         "record_type": "decision",
         "call_id": call_id,
         "agent_id": agent_id,
@@ -354,18 +372,86 @@ def test_has_more_is_true_when_records_exist_behind_the_page():
     )
 
 
+VIEW_DECISION = "ail_view:decision:v1"
+VIEW_INTENT = "ail_view:intent:v1"
+
+
+def _view_row_count(view_set: str) -> int:
+    """How many rows a view holds, paged past zscan's 2500-row ceiling.
+
+    P3c3e-10. `/audit` selects through these views, so what decides whether a
+    page is truncated is their size and not the `tool_call:` key count the
+    old form of the test below used - those differ whenever anything that is
+    not a `tool_call:` key is in the decision view, and the intent view is not
+    counted by that prefix at all.
+    """
+    seen: set[tuple[str, float]] = set()
+    with httpx.Client(timeout=120.0) as client:
+        login = client.post(f"{IMMUDB_URL}/api/v2/login", json={
+            "user": _b64(IMMUDB_USER), "password": _b64(IMMUDB_PASSWORD),
+            "database": _b64("defaultdb"),
+        })
+        login.raise_for_status()
+        headers = {"Authorization": f"Bearer {login.json()['token']}"}
+        min_score = None
+        while True:
+            body = {"set": _b64(view_set), "desc": False, "limit": 2500}
+            if min_score is not None:
+                body["minScore"] = {"score": min_score}
+            resp = client.post(f"{IMMUDB_URL}/api/v2/db/zscan", json=body,
+                               headers=headers)
+            resp.raise_for_status()
+            rows = resp.json().get("entries", [])
+            if not rows:
+                break
+            before = len(seen)
+            page = [(row["entry"]["key"], float(row.get("score", 0.0)))
+                    for row in rows]
+            # P3c3f-3 (D46): the bound, asserted on what came back. This
+            # number is compared against what /audit reports as its total.
+            assert_at_or_above_min_score(
+                page, min_score, f"_view_row_count({view_set})")
+            seen.update(page)
+            min_score = float(rows[-1].get("score", 0.0))
+            if len(rows) < 2500 or len(seen) == before:
+                break
+    return len(seen)
+
+
 @requires_stack
-def test_has_more_is_false_when_the_page_covers_everything_behind_it():
-    """The other half. A flag that is always true states nothing either."""
+def test_has_more_agrees_with_whether_the_page_was_actually_truncated():
+    """The other half. A flag that is always true states nothing either.
+
+    D44 (Phase 3c-3e). This asked for `total + 100` rows and asserted
+    `has_more is False`, which is a claim about the size of the ledger and not
+    about this page: `/audit` serves at most `min(limit + 1, 2500) - 1` rows,
+    so once the view passes 2499 rows the flag can never read false and the
+    test failed permanently. `tests/test_backfill_index.py` takes it past 2600
+    on purpose, which is why this was one of the four order-dependent tests
+    the sweep found.
+
+    What replaced it is stronger rather than narrower, and holds at every
+    ledger size: `has_more` reports truncation, so it has to agree with
+    whether truncation actually happened. Both directions, against the view
+    the page is selected from.
+    """
     _seed_decisions(3, agent_id=f"p3c3a-nomore-{uuid.uuid4().hex[:8]}")
 
-    total = _immudb_prefix_count("tool_call:")
-    page = _audit(limit=total + 100)
+    requested = 2500
+    page_limit = min(requested + 1, 2500) - 1
+    page = _audit(limit=requested)
 
-    assert page["has_more"] is False, (
-        f"the page asked for {total + 100} and the ledger holds {total}, so "
-        "nothing is behind this page, yet has_more reads true"
+    indexed = max(_view_row_count(VIEW_DECISION), _view_row_count(VIEW_INTENT))
+    truncated = indexed > page_limit
+
+    assert page["has_more"] is truncated, (
+        f"has_more reads {page['has_more']} and the page served "
+        f"{len(page['entries'])} of at most {page_limit} rows out of an index "
+        f"holding {indexed}, so truncation {'did' if truncated else 'did not'} "
+        "happen"
     )
+    if not truncated:
+        assert len(page["entries"]) <= page_limit, page["has_more"]
 
 
 @requires_stack

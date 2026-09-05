@@ -32,7 +32,9 @@ finalized in `intercept_tool_call`):
 | `fault` | The call could not be evaluated | one of four below | `null` |
 
 `fault_class` is one of: `opa_unreachable`, `revision_unavailable`,
-`verifier_unreachable`, `malformed_policy_response` (Phase 1.1, P11-3),
+`verifier_unreachable` (which since D35 does *not* imply the absence of a
+ledger entry - see the Documented Boundary amendment below),
+`malformed_policy_response` (Phase 1.1, P11-3),
 `content_store_unreachable` (Phase 1.1, D7), `tool_execution_failed`
 (Phase 2, D14 - `spiffe_unavailable` occupied this slot before Phase 2
 moved the mTLS handshake to the agent's own client leg, where it produces
@@ -231,6 +233,41 @@ no ledger entry to point to, in either case. This is a structural limit, not
 an oversight: nothing can write a durable record of "the durable-record
 writer is down," or of "the store this record's content_state would name is
 itself down."
+
+**Amendment, D35 (Phase 3c-3c): `verifier_unreachable` no longer implies
+that no ledger entry exists.** The paragraph above was true when the ledger
+write was a single `verifiedSet` whose proof ran before the commit. It is
+not true now. Both write routes commit before their proof runs - the ordered
+route's `ExecAll` commits the record, the counter advance and the index entry
+and then runs `verifiedGet`, and `verifiedSet` commits at
+`service.VerifiableSet(rawRequest)` with every `ErrCorruptedData` raise after
+that line - so a proof failure cannot prevent the write. Measured: a call
+that returned `fault_class: verifier_unreachable` had its record in the
+ledger at transaction 7, holding position 1000000005, indexed, with the
+counter advanced (`docs/reports/phase-3c3c.md` section 4.1).
+
+So this class now covers two materially different outcomes:
+
+| What happened | Ledger entry | Response |
+| :--- | :--- | :--- |
+| The verifier could not be reached, or the write did not commit | none | `committed: false` |
+| The write committed and its proof did not check out | **exists**, and a `ledger_fault:{committed_tx_id:020d}:{identity}:{nonce}` record qualifies it (D38, Phase 3c-3d; it was `ledger_fault:{call_id}`, which lost every fault after the first about one record and collided across the three record kinds that share a `call_id`) | `committed: true` with the real transaction and position |
+
+The structural limit the paragraph above describes is real and unchanged for
+the first row: nothing can write a durable record of "the durable-record
+writer is down". What was wrong was applying it to the second row, which is
+not a recording-path failure at all - the recording succeeded and the proof
+about it did not.
+
+**One closed-set `fault_class` doing two jobs is a collapse of exactly the
+kind D1 exists to prevent, one level down**, and it is deliberately not
+resolved here: splitting it touches this ADR's closed set, the Prometheus
+label collection (`tests/test_outcome_types.py::
+test_metric_label_set_matches_closed_collection`), the dashboard, and every
+consumer that switches on the class. It is recorded as an open taxonomy
+question rather than changed inside a remediation phase. The distinction is
+available to a caller today in the write response's `committed` field and on
+the `/audit` row's `ledger_fault`; what is collapsed is the class name.
 
 `intent_write_failed` (D16, Phase 2 completion pass) is a different case
 again, and deliberately not grouped with `verifier_unreachable` above even
