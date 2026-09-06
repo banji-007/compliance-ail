@@ -552,3 +552,86 @@ Two records written by R4 are in the ledger of a volume that no longer exists.
 keys and `env.sh` destroyed with it. The probe scripts under
 `AppData\Local\Temp` were removed in the same pass. Nothing this run generated
 remains on the machine.
+
+---
+
+## Erratum, 2026-09-06 (added by Phase 3c-3g, `p3c3g-fix`)
+
+**R1's finding stands and reproduces at `2cdcec3`. One mechanism this report
+states for it is wrong as measured, and it made the fix look more expensive
+than it is.**
+
+The finding itself is untouched: a write route whose handler is defined in
+another module and arrives via `app.include_router` is invisible to
+`_service_routes`, and the suite reads its baseline with one present.
+
+**Two claims in the R1 section are affirmed rather than corrected.** "It
+cannot fail in this direction by construction" holds exactly as written: the
+stand-in sets its `__name__` to the handler's own module, so the discriminator
+under test always agrees, and the falsifier cannot see the `__module__` clause
+being wrong in the permissive direction. That is mutation B below, described
+in prose a phase before it was measured.
+
+**The correction: the discriminator does not buy the exclusion of the four
+framework paths.** This report states that it "buys the exclusion of four
+framework paths and pays for it with every route this service might ever mount
+from a router", and that the four "would land in the `ungated` list". Neither
+holds. The four framework routes are `starlette.routing.Route`, not
+`fastapi.routing.APIRoute`:
+
+```
+  Route     /openapi.json          fastapi.applications
+  Route     /docs                  fastapi.applications
+  Route     /docs/oauth2-redirect  fastapi.applications
+  Route     /redoc                 fastapi.applications
+  APIRoute  /health                parity_verifier_<uuid>
+  APIRoute  /write                 parity_verifier_<uuid>
+  APIRoute  /write-ordered         parity_verifier_<uuid>
+  APIRoute  /state                 parity_verifier_<uuid>
+  APIRoute  /verify                parity_verifier_<uuid>
+```
+
+The `isinstance(route, APIRoute)` conjunct excludes all four on its own, so
+the `__module__` comparison excludes nothing on this app and the four could
+never reach the `ungated` list under any spelling of the discriminator. The
+trade was not four framework paths for every included router. It was nothing
+for every included router.
+
+**Measured, each mutation applied alone to `_service_routes`**, baseline
+`13 passed`:
+
+| mutation | the falsifier | whole file |
+|---|---|---|
+| A. `return []` | failed | 2 failed, 5 passed, 1 skipped |
+| B. drop the `__module__` conjunct, keep `isinstance(APIRoute)` | passed | **13 passed**, identical to baseline |
+| C. invert the discriminator to `!=` | failed | 2 failed, 5 passed, 1 skipped |
+
+B leaves the selector's output on this app identical, five routes to five
+routes, which is the measurement that makes the conjunct dead. The `13 passed`
+is corroboration of that, not the definition of it.
+
+Two things in row A are worth carrying forward, because they are about how a
+selector break is detected at all. The whole-file total under A is eight
+outcomes against a baseline of thirteen: five parametrised cases were never
+generated, because they parametrise over `write_routes()` and it is empty. And
+one of A's two failures is
+`test_the_write_routes_are_selected_by_their_gate_and_not_by_their_path`
+failing on its `assert gates`, which is not a falsifier. A check phrased as
+"break the selector, require a failure" is therefore satisfiable by a test
+that is not a falsifier, while the falsifiers that would have caught it are
+deleted rather than failed.
+
+**What follows.** Phase 3c-3g closes R1 by deleting the conjunct rather than by
+building a falsifier around it, and corrects the docstring at
+`tests/test_route_parity.py:185-190`, which carried this same justification, in
+the same commit. The deletion is justified by the dead measurement together
+with the cost this report identified correctly, not by deadness alone.
+
+**Not this report's error, recorded here because a reader of R1 will meet it.**
+The Phase 3c-3g instruction states that the falsifier "never calls the real
+selector" and that gutting `_service_routes` does not fail it. It does call the
+real one, through `write_routes()` at `tests/test_route_parity.py:218`, and row
+A above is that mutation failing it. That correction belongs to the instruction
+and is recorded in `phase-3c3g.md`. This report does not make the claim.
+
+Nothing in the body of this report above is edited. This erratum is additive.
