@@ -30,6 +30,54 @@ each for a reason its own module states; a test has no caller to report to.
 
 from __future__ import annotations
 
+import contextlib
+
+# ---------------------------------------------------------------------------
+# P3c3g-2 (red-team R3): whether these checks ever compare a row.
+#
+# R3 measured 16 calls to `assert_at_or_above_min_score` in a fully green run,
+# 16 early returns on `min_score is None`, and zero rows compared. Every one
+# of the five sites is a page walk that opens with `min_score = None` and
+# terminates on the first short page, so page one is the only page and page
+# one carries no bound. The assertions were correct, enumerated, and never
+# executed against anything.
+#
+# The tally is how a walk says whether the check ran. It is opt-in: a normal
+# run installs nothing and pays nothing.
+#
+# **The rule this feeds is over a walk's whole life, not per call.** One
+# vacuous call is not a defect. `min_score` is None on the first iteration of
+# every walk, forever, and that is correct, because page one carries no
+# bound. A walk with no non-vacuous call in its entire life is the defect.
+# ---------------------------------------------------------------------------
+
+
+class Tally:
+    """Calls, early returns, and rows actually compared."""
+
+    def __init__(self):
+        self.calls = 0
+        self.vacuous = 0
+        self.rows_compared = 0
+
+    def __repr__(self):
+        return (f"Tally(calls={self.calls}, vacuous={self.vacuous}, "
+                f"rows_compared={self.rows_compared})")
+
+
+_TALLY = None
+
+
+@contextlib.contextmanager
+def recording():
+    """Count what the checks below do, for the duration of the block."""
+    global _TALLY
+    previous, _TALLY = _TALLY, Tally()
+    try:
+        yield _TALLY
+    finally:
+        _TALLY = previous
+
 
 def assert_at_or_above_min_score(rows, min_score, where: str) -> None:
     """Every row is at or above the `minScore` this page asked for.
@@ -41,8 +89,15 @@ def assert_at_or_above_min_score(rows, min_score, where: str) -> None:
         correct  minScore : the page starts where it was asked to
         misspelt minscore : the page starts at the beginning again
     """
+    if _TALLY is not None:
+        _TALLY.calls += 1
     if min_score is None:
+        if _TALLY is not None:
+            _TALLY.vacuous += 1
         return
+    rows = list(rows)
+    if _TALLY is not None:
+        _TALLY.rows_compared += len(rows)
     below = [(key, score) for key, score in rows if score < min_score]
     assert not below, (
         f"{where}: a read bounded to minScore={min_score} returned "
