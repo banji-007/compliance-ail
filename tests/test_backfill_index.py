@@ -46,6 +46,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from bounded_read_checks import assert_at_or_above_min_score  # noqa: E402
+from ledger_pollution import MARKER_FIELD  # noqa: E402
 
 IMMUDB_URL        = os.getenv("IMMUDB_URL",        "http://localhost:8080")
 IMMUDB_USER       = os.getenv("IMMUDB_USER",       "immudb")
@@ -76,15 +77,27 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {resp.json()['token']}"}
 
 
-def _decision_value(agent_id: str) -> str:
-    return json.dumps({
+def _decision_value(agent_id: str, marker: str = "") -> str:
+    """A decision record value.
+
+    `marker` is P3c3g-3: the padding rows below break
+    HISTORY_SCORE_IS_ITS_TRANSACTION on purpose and claim their exemption by
+    writing the exact marker their `tests/ledger_pollution.py` entry names
+    into the value. Until this phase the exemption was claimed by the
+    substring `p3c3c-pad` appearing anywhere in the key, so an ordinary record
+    whose agent id merely contained it inherited the exemption (red-team R4).
+    """
+    body = {
         "record_type": "decision", "call_id": uuid.uuid4().hex, "agent_id": agent_id,
         "timestamp": "2026-08-31T00:00:00", "tool_name": "query_database",
         "outcome_type": "policy_allow", "fault_class": None,
         "policy_revision": "p3c3c-test", "reasons": [],
         "input_sha256": uuid.uuid4().hex, "content_state": "unavailable",
         "profile": "observed",
-    }, separators=(",", ":"))
+    }
+    if marker:
+        body[MARKER_FIELD] = marker
+    return json.dumps(body, separators=(",", ":"))
 
 
 def _backfill_module():
@@ -146,7 +159,7 @@ def _pad_view_past_the_ceiling(headers: dict, target: int = 2600) -> int:
     for i in range(needed):
         score += 1
         key = f"tool_call:p3c3c-pad{i:05d}-{uuid.uuid4().hex[:6]}:{uuid.uuid4().hex}:query_database"
-        batch.append({"kv": {"key": _b64(key), "value": _b64(_decision_value(f"pad{i}"))}})
+        batch.append({"kv": {"key": _b64(key), "value": _b64(_decision_value(f"pad{i}", marker="p3c3c-pad"))}})
         batch.append({"zAdd": {"set": _b64(VIEW_DECISION), "score": float(score),
                                "key": _b64(key), "boundRef": False}})
         if len(batch) >= 200:

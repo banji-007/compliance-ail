@@ -22,10 +22,25 @@ view and requires every violating row to be explained by an entry here.
 that enumerations are derived.** What has to be enumerated is not a set of
 code sites - it is a set of intentions, and an intention is not in the code.
 The registry is checked in both directions instead: every entry must name a
-key fragment that some test module in this directory actually produces
+marker that some test module in this directory actually writes
 (`test_every_entry_is_produced_by_a_test` below), and every violating row in
 the ledger must match an entry. An entry that stops being created fails; a
 violation nobody registered fails.
+
+**P3c3g-3, closing red-team R4 and R5, which are one fix.** Entries were
+matched by `key_fragment in key`, and the key's agent-id segment is supplied
+by whoever writes the record. A real decision record through
+`POST /write-ordered` with agent id `p3c3c-padded-batch-7` contains the
+registered fragment `p3c3c-pad`, so it inherited that exemption and a genuine
+invariant violation on it went unreported; the control, the same record and
+the same injection under an ordinary agent id, was reported. Entries are now
+matched on an exact marker the polluting test writes into the record value,
+and each entry names the view its violation lives in. The second half is R5:
+`p3c3c-zero`'s violation is a zero score in the intent view, while the
+backfill indexes the same record into the decision view at its own
+transaction id, which is an ordinary row. A check that looked for every
+entry's violation in the decision view passed or failed on whether the
+backfill had run yet, which is collection order.
 """
 
 from __future__ import annotations
@@ -42,25 +57,38 @@ ONE_POSITION_PER_KEY = "a record holds exactly one position"
 HISTORY_SCORE_IS_ITS_TRANSACTION = (
     "a position inside the reserve is its record's own transaction id")
 
+# The field a polluting test writes into the record value to claim its own
+# exemption. A record arriving through the production write path does not
+# carry it unless someone put it there deliberately, which is a weaker claim
+# than "unforgeable" and the right one: this registry describes intentions
+# inside this suite, and its job is to stop an ordinary record from drifting
+# into an exemption by looking like one.
+MARKER_FIELD = "ail_deliberate_violation"
+
 
 @dataclass(frozen=True)
 class DeliberateViolation:
     """One violation this suite creates on purpose.
 
-    `key_fragment` is what identifies the rows it produces, and it has to
-    appear literally in the module that writes them - that is what
-    `test_every_entry_is_produced_by_a_test` checks, and it is why the
-    fragment is the agent-id segment rather than a whole key.
+    `marker` is the exact value the polluting module writes into the record's
+    `MARKER_FIELD`, and it has to appear literally in that module, which is
+    what `test_every_entry_is_produced_by_a_test` checks. Exact, not a
+    substring: a substring match over anything a caller supplies is what R4
+    exploited.
+
+    `view` is where the violation this entry describes actually lives. An
+    entry is only expected to explain rows in that view.
     """
-    key_fragment: str
+    marker: str
     module: str
     breaks: tuple[str, ...]
     why: str
+    view: str = "decision"
 
 
 DELIBERATE_VIOLATIONS = (
     DeliberateViolation(
-        key_fragment="p3c3c-surplus-",
+        marker="p3c3c-surplus",
         module="test_reconciliation.py",
         breaks=(INTEGER_POSITION,),
         why=("proves the reconciler reports a position the counter never "
@@ -69,7 +97,7 @@ DELIBERATE_VIOLATIONS = (
              "fractional. ImmuDB's zset has no remove, so it stays."),
     ),
     DeliberateViolation(
-        key_fragment="p3c3d-dup-",
+        marker="p3c3d-dup",
         module="test_reconciliation.py",
         breaks=(ONE_POSITION_PER_KEY, HISTORY_SCORE_IS_ITS_TRANSACTION),
         why=("proves the reconciler reports a record holding two positions "
@@ -80,7 +108,8 @@ DELIBERATE_VIOLATIONS = (
              "that record's transaction id."),
     ),
     DeliberateViolation(
-        key_fragment="p3c3c-zero-",
+        marker="p3c3c-zero",
+        view="intent",
         module="test_reconciliation.py",
         breaks=(HISTORY_SCORE_IS_ITS_TRANSACTION,),
         why=("proves the reconciler survives a row scored at exactly zero. "
@@ -97,7 +126,7 @@ DELIBERATE_VIOLATIONS = (
              "able to see it."),
     ),
     DeliberateViolation(
-        key_fragment="p3c3c-pad",
+        marker="p3c3c-pad",
         module="test_backfill_index.py",
         breaks=(HISTORY_SCORE_IS_ITS_TRANSACTION,),
         why=("takes the decision view past zscan's 2500-row ceiling so the "
@@ -110,15 +139,45 @@ DELIBERATE_VIOLATIONS = (
 )
 
 
-def explains(key: str) -> DeliberateViolation | None:
-    """The registered violation that accounts for this key, or None."""
+def marker_of(value) -> str | None:
+    """The deliberate-violation marker in a decoded record value, if any.
+
+    Anything that is not a mapping carrying a string marker is None, so a
+    record whose value failed to decode cannot be read as an exemption.
+    """
+    if not isinstance(value, dict):
+        return None
+    marker = value.get(MARKER_FIELD)
+    return marker if isinstance(marker, str) else None
+
+
+def explains(marker: str | None) -> DeliberateViolation | None:
+    """The registered violation with this exact marker, or None.
+
+    **Exact equality, not containment (P3c3g-3).** The previous spelling
+    matched `entry.key_fragment in key` over a key whose agent-id segment the
+    caller supplies. `p3c3c-padded-batch-7` contains `p3c3c-pad`, so a real
+    record written through the ordered route inherited that exemption and a
+    genuine violation on it was never reported.
+    """
+    if marker is None:
+        return None
     for entry in DELIBERATE_VIOLATIONS:
-        if entry.key_fragment in key:
+        if entry.marker == marker:
             return entry
     return None
 
 
-def registered_for(key: str, invariant: str) -> bool:
-    """Is this key's violation of `invariant` one the suite created on purpose."""
-    entry = explains(key)
-    return entry is not None and invariant in entry.breaks
+def registered_for(marker: str | None, invariant: str,
+                   view: str = "decision") -> bool:
+    """Is this violation of `invariant`, in this view, one the suite made.
+
+    The view is part of the question. A record can carry a marker and sit in
+    a view its entry says nothing about, which is exactly the `p3c3c-zero`
+    record the backfill indexes into the decision view at its own transaction
+    id: an ordinary row that happens to be marked.
+    """
+    entry = explains(marker)
+    return (entry is not None
+            and invariant in entry.breaks
+            and entry.view == view)

@@ -75,7 +75,8 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from ledger_pollution import (  # noqa: E402
     DELIBERATE_VIOLATIONS, HISTORY_SCORE_IS_ITS_TRANSACTION, INTEGER_POSITION,
-    ONE_POSITION_PER_KEY, TESTS_DIR, explains, registered_for,
+    MARKER_FIELD, ONE_POSITION_PER_KEY, TESTS_DIR, explains, marker_of,
+    registered_for,
 )
 from bounded_read_checks import assert_at_or_above_min_score  # noqa: E402
 
@@ -120,6 +121,45 @@ _CLIENT = httpx.Client(timeout=120.0)
 
 def _b64(value) -> str:
     return base64.b64encode(value if isinstance(value, bytes) else value.encode()).decode()
+
+
+def _view_name(view_set: str) -> str:
+    """The short name `tests/ledger_pollution.py` entries use for a view."""
+    return "intent" if view_set == VIEW_INTENT else "decision"
+
+
+def _markers_for(keys, headers) -> dict:
+    """The deliberate-violation marker of each key, by one exact getAll.
+
+    **Where the marker is read, and at what cost (P3c3g-3).** The invariant
+    walk keeps `(key, score, tx)` from zscan and never reads record values, so
+    a marker in the value is not free. It is read here only for rows that are
+    **already violating an invariant**, by an exact `getAll` over that handful
+    of keys, never per row over the view. A view of 2600 rows yields a
+    violating set in the single digits, so this is one bounded read per
+    assertion rather than a second walk.
+
+    A key that does not come back, or whose value does not decode to an object
+    carrying a string marker, is `None` here and therefore explains nothing.
+    Failing to read a marker exempts no row.
+    """
+    keys = sorted(set(keys))
+    if not keys:
+        return {}
+    resp = _CLIENT.post(f"{IMMUDB_URL}/api/v2/db/getall",
+                        json={"keys": [_b64(key) for key in keys]},
+                        headers=headers)
+    resp.raise_for_status()
+    markers = {}
+    for item in resp.json().get("entries", []):
+        key = base64.b64decode(item["key"]).decode("utf-8", "replace")
+        try:
+            value = json.loads(
+                base64.b64decode(item.get("value", "")).decode("utf-8"))
+        except Exception:
+            value = None
+        markers[key] = marker_of(value)
+    return markers
 
 
 def _headers() -> dict:
@@ -261,7 +301,7 @@ def _view_rows(headers: dict, view_set: str = VIEW_DECISION
 
 def test_every_entry_is_produced_by_a_test():
     """A registered exemption that nothing creates any more is an exemption
-    nothing can see, and the next row that happens to match its fragment
+    nothing can see, and the next row that happens to carry its marker
     inherits it.
 
     Checked against the source of the module each entry names, so an entry
@@ -271,11 +311,20 @@ def test_every_entry_is_produced_by_a_test():
     for entry in DELIBERATE_VIOLATIONS:
         module = TESTS_DIR / entry.module
         if not module.exists():
-            stale.append(f"{entry.key_fragment!r}: {entry.module} does not exist")
+            stale.append(f"{entry.marker!r}: {entry.module} does not exist")
             continue
-        if entry.key_fragment not in module.read_text(encoding="utf-8"):
+        source = module.read_text(encoding="utf-8")
+        # The call form, not a bare mention. `p3c3c-pad` appears in
+        # test_backfill_index.py in key literals and in a substring filter as
+        # well as in the write, so requiring the string alone would pass on a
+        # module that had stopped writing the marker entirely. What has to be
+        # there is the module passing it as one.
+        written_as = f'marker="{entry.marker}"'
+        if written_as not in source:
             stale.append(
-                f"{entry.key_fragment!r} does not appear in {entry.module}"
+                f"{entry.marker!r}: {entry.module} does not write "
+                f"{written_as}, so nothing produces a row this entry can "
+                "explain"
             )
     assert not stale, (
         f"the deliberate-violation registry has entries nothing produces: "
@@ -286,7 +335,7 @@ def test_every_entry_is_produced_by_a_test():
 
 def test_every_entry_says_what_it_breaks_and_why():
     """An entry with no reason is a suppression wearing a registry's clothes."""
-    thin = [entry.key_fragment for entry in DELIBERATE_VIOLATIONS
+    thin = [entry.marker for entry in DELIBERATE_VIOLATIONS
             if not entry.breaks or len(entry.why.strip()) < 80]
     assert not thin, f"registry entries with no argument behind them: {thin}"
 
@@ -347,9 +396,13 @@ def test_every_allocated_position_is_an_integer_or_a_registered_violation(view_s
         f"this test's own record is not in {view_set}, so the walk below is "
         "not reading what it thinks it is"
     )
-    offenders = [(key, score) for key, score, _tx in rows
-                 if score > RESERVED_POSITIONS and not float(score).is_integer()
-                 and not registered_for(key, INTEGER_POSITION)]
+    candidates = [(key, score) for key, score, _tx in rows
+                  if score > RESERVED_POSITIONS
+                  and not float(score).is_integer()]
+    markers = _markers_for([key for key, _score in candidates], _headers())
+    offenders = [(key, score) for key, score in candidates
+                 if not registered_for(markers.get(key), INTEGER_POSITION,
+                                       _view_name(view_set))]
     assert not offenders, (
         f"position(s) in {view_set} above the reserve that are not integers "
         f"and are not registered in tests/ledger_pollution.py: "
@@ -378,8 +431,12 @@ def test_every_record_holds_one_position_or_is_a_registered_violation(view_set):
     positions: dict[str, set[float]] = {}
     for key, score, _tx in rows:
         positions.setdefault(key, set()).add(score)
-    offenders = {key: sorted(scores) for key, scores in positions.items()
-                 if len(scores) > 1 and not registered_for(key, ONE_POSITION_PER_KEY)}
+    candidates = {key: sorted(scores) for key, scores in positions.items()
+                  if len(scores) > 1}
+    markers = _markers_for(candidates, _headers())
+    offenders = {key: scores for key, scores in candidates.items()
+                 if not registered_for(markers.get(key), ONE_POSITION_PER_KEY,
+                                       _view_name(view_set))}
     assert not offenders, (
         f"record(s) in {view_set} at more than one position that are not "
         f"registered in tests/ledger_pollution.py: "
@@ -502,9 +559,13 @@ def test_a_historical_position_is_its_transaction_or_a_registered_violation(view
         f"this test's own record is not in {view_set}, so the walk below is "
         "not reading what it thinks it is"
     )
-    offenders = [(key, score, tx) for key, score, tx in rows
-                 if score <= RESERVED_POSITIONS and score != float(tx)
-                 and not registered_for(key, HISTORY_SCORE_IS_ITS_TRANSACTION)]
+    candidates = [(key, score, tx) for key, score, tx in rows
+                  if score <= RESERVED_POSITIONS and score != float(tx)]
+    markers = _markers_for([key for key, _s, _t in candidates], _headers())
+    offenders = [(key, score, tx) for key, score, tx in candidates
+                 if not registered_for(markers.get(key),
+                                       HISTORY_SCORE_IS_ITS_TRANSACTION,
+                                       _view_name(view_set))]
     assert not offenders, (
         f"backfilled position(s) in {view_set} that are not their record's "
         f"transaction id and are not registered in "
@@ -512,51 +573,129 @@ def test_a_historical_position_is_its_transaction_or_a_registered_violation(view
     )
 
 
+def _violating_rows(rows) -> list:
+    """Every row breaking an invariant, with the invariant it breaks.
+
+    The same three conditions the three assertions above use, in one place, so
+    the registry check below looks at exactly the rows those assertions would
+    report and no others. This is what keeps the marker read bounded: markers
+    are fetched for this set, which is single digits in a view of thousands.
+    """
+    positions: dict = {}
+    for key, score, _tx in rows:
+        positions.setdefault(key, set()).add(score)
+    out = []
+    for key, score, tx in rows:
+        if score > RESERVED_POSITIONS and not float(score).is_integer():
+            out.append((key, score, tx, INTEGER_POSITION))
+        if len(positions[key]) > 1:
+            out.append((key, score, tx, ONE_POSITION_PER_KEY))
+        if score <= RESERVED_POSITIONS and score != float(tx):
+            out.append((key, score, tx, HISTORY_SCORE_IS_ITS_TRANSACTION))
+    return out
+
+
 @requires_stack
 def test_the_registered_violations_are_the_only_exemptions_in_use():
     """What this suite is actually exempting, made visible.
 
-    Not an assertion about correctness - an assertion that the registry is
-    being used for what it says. A row matching a registered fragment must be
-    breaking one of the invariants that entry names; a fragment that matches
-    perfectly ordinary rows is an exemption with a blast radius nobody
-    intended.
+    Not an assertion about correctness. An assertion that the registry is
+    being used for what it says: a row carrying a registered marker and
+    breaking an invariant must be breaking one the entry names, in the view
+    the entry names.
+
+    **P3c3g-3, closing red-team R5.** This test used to walk the decision view
+    and require every entry to match a row there that breaks something. The
+    `p3c3c-zero` entry's violation is a zero score in the INTENT view, and the
+    backfill also indexes that same record into the decision view at its own
+    transaction id, which is a completely ordinary row. So the test passed
+    when `test_backfill_index.py` had already run and failed when it had not:
+    alphabetically `b` sorts before `r`, CI collects alphabetically, and both
+    green runs the phase cited were green for that reason. On a fresh ledger
+    with `test_reconciliation.py` first it read `1 failed`. That is D44's own
+    class, in a test D44's phase added.
+
+    Two changes. Each entry is checked against the view it names, so the
+    decision-view copy of a marked record is not evidence about an intent-view
+    violation. And rows are matched on an exact marker in the record value
+    rather than on a substring of a caller-supplied key segment, which is R4.
+
+    **What this no longer claims, stated rather than quietly dropped.** The
+    old spelling could say "this entry matches only ordinary rows", because a
+    key fragment is free to test against every row in the view. A marker lives
+    in the record value, and reading values for a whole view is the read the
+    design constraint for this item forbids. So the check is scoped to rows
+    that are already violating an invariant: an entry whose marked rows have
+    all stopped violating anything is skipped here, and
+    `test_every_entry_is_produced_by_a_test` is what keeps it honest. That is
+    a real reduction in what this test sees and it is recorded in the phase
+    report's Residual Limits.
     """
     _seed_one()
-    rows = _view_rows(_headers())
-    for entry in DELIBERATE_VIOLATIONS:
-        matched = [(key, score, tx) for key, score, tx in rows
-                   if entry.key_fragment in key]
-        if not matched:
-            # The module that writes them has not run in this session. That is
-            # not a failure: test_every_entry_is_produced_by_a_test is what
-            # keeps the entry honest.
-            continue
-        keys = {key for key, _score, _tx in matched}
-        positions: dict[str, set[float]] = {}
-        for key, score, _tx in matched:
-            positions.setdefault(key, set()).add(score)
-        breaks_something = (
-            any(score > RESERVED_POSITIONS and not float(score).is_integer()
-                for _key, score, _tx in matched)
-            or any(len(scores) > 1 for scores in positions.values())
-            or any(score <= RESERVED_POSITIONS and score != float(tx)
-                   for _key, score, tx in matched)
-        )
-        assert breaks_something, (
-            f"the registry entry {entry.key_fragment!r} matches "
-            f"{len(keys)} row(s) in the view and none of them breaks any of "
-            "the invariants it claims to exempt. An exemption that covers "
-            "ordinary rows exempts whatever lands on that name next."
-        )
+    wrong = []
+    for view_set in VIEWS:
+        view = _view_name(view_set)
+        rows = _view_rows(_headers(), view_set)
+        violating = _violating_rows(rows)
+        markers = _markers_for([key for key, _s, _t, _i in violating],
+                               _headers())
+        for key, score, tx, invariant in violating:
+            marker = markers.get(key)
+            if marker is None:
+                continue
+            entry = explains(marker)
+            if entry is None:
+                continue
+            if not registered_for(marker, invariant, view):
+                wrong.append(
+                    f"{view}: {key} at {score} (tx {tx}) carries marker "
+                    f"{marker!r} and breaks {invariant!r}, which entry "
+                    f"{entry.marker!r} does not claim in this view "
+                    f"(it claims {entry.breaks} in {entry.view!r})"
+                )
+    assert not wrong, (
+        "row(s) carrying a registered marker break an invariant the entry "
+        f"does not name: {wrong[:5]}. A marker that travels with a record "
+        "into a violation nobody registered is an exemption widening by "
+        "itself."
+    )
 
 
 def test_a_key_with_no_registered_violation_is_not_explained_by_one():
     """The matcher itself, so the exemption cannot be accidentally universal."""
-    assert explains("tool_call:ordinary:abcdef:query_database") is None
-    assert explains("tool_call:p3c3c-surplus-deadbeef:x:query_database") is not None
-    assert not registered_for("tool_call:p3c3c-surplus-deadbeef:x:query_database",
-                              ONE_POSITION_PER_KEY), (
+    assert explains(None) is None
+    assert explains("p3c3c-surplus") is not None
+    assert not registered_for("p3c3c-surplus", ONE_POSITION_PER_KEY), (
         "the surplus injection is registered for an invariant it does not "
         "break, so it exempts more than it should"
+    )
+
+    # R4, as a permanent test rather than a probe. The attack was a real
+    # decision record through POST /write-ordered whose agent id was
+    # `p3c3c-padded-batch-7`, which contains the registered fragment
+    # `p3c3c-pad`. Under the old substring match it inherited that exemption
+    # and a genuine HISTORY_SCORE_IS_ITS_TRANSACTION violation on it was never
+    # reported; the control, the same record and injection under an ordinary
+    # agent id, was reported.
+    assert explains("p3c3c-padded-batch-7") is None, (
+        "a marker that merely contains a registered one is treated as that "
+        "registration. This is red-team R4: nine characters in a field the "
+        "caller chooses buy an exemption from a ledger-wide invariant."
+    )
+    assert not registered_for("p3c3c-padded-batch-7",
+                              HISTORY_SCORE_IS_ITS_TRANSACTION), (
+        "the padded-batch agent id inherits the padding exemption"
+    )
+
+    # R5's half: a marker is only registered for the view its entry names.
+    assert registered_for("p3c3c-zero", HISTORY_SCORE_IS_ITS_TRANSACTION,
+                          "intent"), (
+        "the zero-score entry does not cover its own violation, which is in "
+        "the intent view"
+    )
+    assert not registered_for("p3c3c-zero", HISTORY_SCORE_IS_ITS_TRANSACTION,
+                              "decision"), (
+        "the zero-score entry exempts the decision view, where the backfill "
+        "indexes the same record at its own transaction id as an ordinary "
+        "row. That is what made this suite order dependent."
     )

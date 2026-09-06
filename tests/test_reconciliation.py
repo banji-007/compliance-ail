@@ -48,6 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from bounded_read_checks import assert_at_or_above_min_score  # noqa: E402
+from ledger_pollution import MARKER_FIELD  # noqa: E402
 
 CONTROL_PLANE_URL  = os.getenv("CONTROL_PLANE_URL",       "http://localhost:8002")
 READ_API_KEY       = os.getenv("CONTROL_PLANE_READ_KEY",  "test-read-key")
@@ -88,15 +89,26 @@ def _immudb_headers() -> dict:
     return {"Authorization": f"Bearer {resp.json()['token']}"}
 
 
-def _decision_value(call_id: str, agent_id: str) -> str:
-    return json.dumps({
+def _decision_value(call_id: str, agent_id: str, marker: str = "") -> str:
+    """A decision record value.
+
+    `marker` is P3c3g-3: a record this module breaks on purpose writes the
+    exact marker its `tests/ledger_pollution.py` entry names into the value,
+    and that is what claims the exemption. Until this phase the exemption was
+    claimed by a substring of the key's agent-id segment, which any caller can
+    choose, and red-team R4 drove exactly that.
+    """
+    body = {
         "record_type": "decision", "call_id": call_id, "agent_id": agent_id,
         "timestamp": "2026-08-31T00:00:00", "tool_name": "query_database",
         "outcome_type": "policy_allow", "fault_class": None,
         "policy_revision": "p3c3c-test", "reasons": [],
         "input_sha256": uuid.uuid4().hex, "content_state": "unavailable",
         "profile": "observed",
-    }, separators=(",", ":"))
+    }
+    if marker:
+        body[MARKER_FIELD] = marker
+    return json.dumps(body, separators=(",", ":"))
 
 
 def _write_ordered(key: str, value: str, view: str = "decision") -> dict:
@@ -332,7 +344,8 @@ def test_positions_the_counter_never_handed_out_are_a_finding():
     # being tested here is the coverage check, not the order check.
     surplus = _counter() + 0.5
     key = f"tool_call:p3c3c-surplus-{uuid.uuid4().hex[:8]}:{uuid.uuid4().hex}:query_database"
-    _write_historical(key, _decision_value(uuid.uuid4().hex, "p3c3c-surplus"))
+    _write_historical(key, _decision_value(uuid.uuid4().hex, "p3c3c-surplus",
+                                       marker="p3c3c-surplus"))
     _zadd(VIEW_DECISION, surplus, key)
 
     reconciler = _load_reconciler()
@@ -364,7 +377,8 @@ def test_a_row_with_no_score_is_reported_and_does_not_stop_the_pass():
     produces a verdict for everything else.
     """
     key = f"tool_call:p3c3c-zero-{uuid.uuid4().hex[:8]}:{uuid.uuid4().hex}:query_database"
-    _write_historical(key, _decision_value(uuid.uuid4().hex, "p3c3c-zero"))
+    _write_historical(key, _decision_value(uuid.uuid4().hex, "p3c3c-zero",
+                                       marker="p3c3c-zero"))
     _zadd(VIEW_INTENT, 0, key)
 
     reconciler = _load_reconciler()
@@ -461,7 +475,7 @@ def test_a_second_position_below_the_reserve_for_an_indexed_record_is_a_finding(
     """
     call_id = uuid.uuid4().hex
     key = f"tool_call:p3c3d-dup-{uuid.uuid4().hex[:8]}:{uuid.uuid4().hex}:query_database"
-    written = _write_ordered(key, _decision_value(call_id, "p3c3d-dup"))
+    written = _write_ordered(key, _decision_value(call_id, "p3c3d-dup", marker="p3c3d-dup"))
 
     # Below the reserve, which is the range that was assumed to be history.
     _zadd(VIEW_DECISION, 42.0, key)
