@@ -167,9 +167,23 @@ REST_BOUNDS = ("prefix", "seekKey", "endKey", "minScore", "maxScore")
 GRPC_BOUNDS = ("prefix", "seekKey", "seekScore", "minscore", "maxscore")
 SELECTIVE_BOUNDS = tuple(sorted(set(REST_BOUNDS) | set(GRPC_BOUNDS)))
 
-# The routes a bounded read goes to over REST. Both cap at 2500 rows and both
-# answer 200 for a parameter they did not recognise.
-BOUNDED_ROUTES = ("/api/v2/db/scan", "/api/v2/db/zscan")
+# The routes a bounded read goes to over REST. The two scan routes cap at
+# 2500 rows and both answer 200 for a parameter they did not recognise.
+#
+# The third is P3c3g-4, closing red-team R2. `/api/v2/db/count/{prefix}`
+# carries its bound as a URL path segment rather than in a JSON body, and
+# `control_plane/main.py::_ledger_decision_count` uses it to decide the
+# `total` every `/audit` page reports. It was invisible to this derivation
+# three times over: the route was not listed here, the bound is not in a
+# request body, and the call is `client.get` where the body walk looks at
+# `json=`. Dropping the prefix answers HTTP 200 with a larger number and
+# nothing said so, which is `BOUNDED_READ_PROPERTY` word for word.
+_COUNT_ROUTE = "/api/v2/db/count"
+BOUNDED_ROUTES = ("/api/v2/db/scan", "/api/v2/db/zscan", _COUNT_ROUTE)
+
+# The call shapes an HTTP read is issued through. Only the count route is
+# matched against this, and the reason is in `_sites_in_source` below.
+_HTTP_READ_CALLS = ("get", "post", "request")
 
 # And the SDK methods that are the same reads over gRPC. Matched on the
 # attribute name, because the object they are called on is a client this
@@ -280,6 +294,65 @@ def _bound_keys(call: ast.Call, names: dict[str, str]) -> set[str]:
             for key in keyword.value.keys:
                 keys.add(_string_of(key, names))
     return keys & set(REST_BOUNDS)
+
+
+def _string_parts(node) -> list:
+    """One string expression flattened into literal and substituted parts.
+
+    `("lit", text)` for anything whose text is known here, `("sub", node)` for
+    a hole. Written for `_path_bound_keys` below, which has to know not just
+    what the URL says but whether anything was substituted into it and where.
+    `_string_of` cannot answer that: it renders a hole as `""`, so
+    `.../count/{prefix}` and `.../count/` are the same string to it.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [("lit", node.value)]
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for piece in node.values:
+            parts.extend(_string_parts(piece))
+        return parts
+    if isinstance(node, ast.FormattedValue):
+        return [("sub", node.value)]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _string_parts(node.left) + _string_parts(node.right)
+    return [("sub", node)]
+
+
+def _path_bound_keys(call: ast.Call, names: dict[str, str]) -> set[str]:
+    """Which selective bound this call carries in its URL path.
+
+    `/api/v2/db/count/{base64(prefix)}` is a prefix bound in a path segment.
+    The bound is present when something follows the route in the URL, whether
+    substituted or written literally, and absent when the URL stops at the
+    route. That is the shape the named mutation takes: deleting the segment
+    turns a prefix-bounded count into a ledger-wide one, at HTTP 200, and this
+    is what notices.
+
+    Only `prefix` is recognised here, because a path segment on this route is
+    a prefix and nothing else. A bound carried in a query string is not seen,
+    and that is in the stated limits below.
+    """
+    node = None
+    if call.args:
+        node = call.args[0]
+    if node is None:
+        for keyword in call.keywords:
+            if keyword.arg == "url":
+                node = keyword.value
+                break
+    if node is None:
+        return set()
+
+    parts = _string_parts(node)
+    for index, (kind, value) in enumerate(parts):
+        if kind != "lit" or _COUNT_ROUTE not in value:
+            continue
+        trailing = value.split(_COUNT_ROUTE, 1)[1].lstrip("/")
+        if trailing:
+            return {"prefix"}
+        return {"prefix"} if index + 1 < len(parts) else set()
+    return set()
 
 
 def _grpc_bound_keys(call: ast.Call) -> set[str]:
@@ -395,6 +468,25 @@ def _sites_in_source(source: str, relative: str) -> list[Site]:
         target = _rest_target(node, names)
         if not any(route in target for route in BOUNDED_ROUTES):
             continue
+
+        # --- REST: the bound in a URL path segment (P3c3g-4) -----------
+        # Before the body walk, because this route carries no body and the
+        # body walk would find nothing and drop the site.
+        #
+        # The verb guard is not decoration. A scan route only ever appears in
+        # a `post(...)` in this tree, but the count route appears in the
+        # `BoundedReadFault` message `_ledger_decision_count` raises when its
+        # own bound is empty, and that is a `raise` whose first argument is an
+        # f-string naming the route. Without this, the derivation attributed
+        # the error message about a missing bound as a second bounded read,
+        # which is the enumeration inventing a site.
+        if _COUNT_ROUTE in target and attribute in _HTTP_READ_CALLS:
+            path_keys = _path_bound_keys(node, names)
+            if path_keys:
+                sites.append(Site(relative, function, node.lineno,
+                                  tuple(sorted(path_keys)), "rest"))
+            continue
+
         # The bounds may be set on a dict built earlier in the same
         # function, so the whole function is scanned for assignments into
         # the body as well as the call's own literal.
@@ -546,6 +638,59 @@ def _drive_faults_in_tx_window():
 
     with pytest.raises(control_plane.BoundedReadFault):
         control_plane._faults_in_tx_window(_AnswersOutsideTheWindow(), "token", 1, 2)
+
+
+def _drive_ledger_decision_count():
+    """P3c3g-4, closing red-team R2.
+
+    **This driver is not the same shape as the others and the difference is
+    the point.** Every other driver answers with a row outside the bound and
+    requires the function to complain about what came back, because that is
+    where a dropped bound shows. A count answers one integer: a
+    prefix-bounded count and a ledger-wide count are both plausible numbers
+    and the response cannot tell them apart. Measured on the wire by the
+    Phase 3c-3f red team: prefix `tool_call:` answered 200, the prefix
+    dropped answered 200 with a larger number, and nothing distinguished
+    them.
+
+    So the bound is driven where it is observable, at the request. The
+    client below answers any count with a number the function would happily
+    return; what is required is that the function refuses to issue the
+    request at all once its bound has gone. That is strictly narrower than
+    what the other sites get and it is recorded as such here, in the
+    function's own docstring, and in the phase report, rather than being
+    presented as the same guarantee.
+    """
+    control_plane = _load("bounded_control_plane_count", "control_plane/main.py")
+
+    class _AnswersAnyCount:
+        def get(self, url, headers=None):
+            return _Answer({"count": "999999"})
+
+    original = control_plane._TOOL_CALL_PREFIX
+    control_plane._TOOL_CALL_PREFIX = b""
+    try:
+        with pytest.raises(control_plane.BoundedReadFault) as refused:
+            control_plane._ledger_decision_count(_AnswersAnyCount(), "token")
+    finally:
+        control_plane._TOOL_CALL_PREFIX = original
+    message = str(refused.value)
+    assert "empty prefix segment" in message, (
+        "the refusal does not say the bound was not applied: " + message[:400])
+
+
+def _drive_audit_read_correctness_immudb_prefix_count():
+    """The test-side control that `/audit`'s total is compared against.
+
+    Same shape as `_drive_ledger_decision_count` and for the same reason. If
+    this helper's bound went missing it would answer a ledger-wide count, and
+    `test_audit_read_correctness.py` would compare `/audit`'s total against
+    it and agree, which is the comparison passing because both sides are
+    wrong in the same direction.
+    """
+    _drive_with("test_audit_read_correctness",
+                lambda m: m._immudb_prefix_count(b""),
+                _Answer({"count": "999999"}), attribute="httpx")
 
 
 def _drive_collect_positions():
@@ -905,6 +1050,17 @@ COVERAGE: dict[str, Coverage] = {
     "tests/test_committed_is_a_fact.py::_members_at_position":
         Coverage(drivers=((_drive_committed_is_a_fact_members_at_position,
                            ("minScore", "maxScore")),)),
+    # P3c3g-4, closing red-team R2. The count route, whose bound is a URL
+    # path segment. Both are driven at the request rather than at the
+    # response, which is a narrower guarantee than every other entry in this
+    # table gets, for the reason in each driver's docstring: a count answers
+    # one integer and cannot say whether its prefix survived.
+    "control_plane/main.py::_ledger_decision_count":
+        Coverage(drivers=((_drive_ledger_decision_count, ("prefix",)),)),
+    "tests/test_audit_read_correctness.py::_immudb_prefix_count":
+        Coverage(drivers=((_drive_audit_read_correctness_immudb_prefix_count,
+                           ("prefix",)),)),
+
     "tests/test_raw_ledger_fields.py::_raw_scan":
         Coverage(drivers=((_drive_raw_ledger_fields_raw_scan, ("prefix",)),)),
     "tests/test_record_profile.py::_raw_scan":
@@ -925,6 +1081,24 @@ COVERAGE: dict[str, Coverage] = {
             "raise_for_status()'es and discards. It exists to time the key "
             "walk `/audit` used to do against the ordered select that "
             "replaced it.")),
+    "tools/audit_read_cost_probe.py::count":
+        Coverage(does_not_apply=(
+            "the count half of the same read-cost probe, added to this table "
+            "by P3c3g-4 when the count route joined the derivation. The "
+            "lambda it returns raise_for_status()es and discards, exactly as "
+            "the scan half above does, so a bound that did not survive "
+            "changes what the call costs and nothing else. Timing a "
+            "ledger-wide count instead of a prefix count would misreport a "
+            "figure in a report; it decides nothing at runtime.")),
+    "tools/audit_read_cost_probe.py::seed":
+        Coverage(does_not_apply=(
+            "the same probe's fixture builder. It counts the prefix to work "
+            "out how many more decision records to write before timing "
+            "anything. A bound that did not survive makes it over-count and "
+            "therefore under-seed, so the probe times a smaller ledger than "
+            "it meant to and says so in its own output. Nothing reads this "
+            "number but the seeding loop, and no production path reaches "
+            "it.")),
     "tools/immudb_ordering_probe.py::<module>":
         Coverage(does_not_apply=(
             "a probe script that measures ImmuDB's own behaviour and prints "
@@ -966,7 +1140,12 @@ def test_the_derivation_finds_the_reads_it_is_supposed_to_find():
     for expected in ("control_plane/main.py::_faults_in_tx_window",
                      "anchor_service/main.py::collect_positions",
                      "tools/ail_backfill_index.py::indexed_keys",
-                     "tools/ail_backfill_index.py::scan_all"):
+                     "tools/ail_backfill_index.py::scan_all",
+                     # P3c3g-4: the count route. Named here rather than left
+                     # to the coverage table, so that dropping it from
+                     # BOUNDED_ROUTES fails a falsifier about the derivation
+                     # rather than only a staleness check about the table.
+                     "control_plane/main.py::_ledger_decision_count"):
         assert expected in found, (
             f"the derivation did not find {expected}, which is a bounded read. "
             f"It found: {sorted(found)}"
@@ -1019,6 +1198,47 @@ def test_the_derivation_finds_the_reads_no_route_literal_names():
             "is an ordinary bounded read spelled a way this repository does "
             f"not happen to use today. It found: {sorted(spellings)}"
         )
+
+
+def test_a_string_that_merely_names_a_route_is_not_a_read():
+    """D46 direction two for the count branch: a call the route match picks
+    up and that the property does not reach.
+
+    P3c3g-4 added `/api/v2/db/count` to `BOUNDED_ROUTES`, and the first thing
+    the widened derivation did was attribute a bounded read to
+    `raise BoundedReadFault(f"...{IMMUDB_URL}/api/v2/db/count/ ...")`, which is
+    the error message `_ledger_decision_count` raises when its own bound has
+    gone. A `raise` is an `ast.Call` and its first argument is a string
+    naming the route, so the route match alone cannot tell a read from a
+    sentence about a read. `tools/immudb_read_api_probe.py` does the same
+    thing twice in `print` headings.
+
+    The enumeration inventing sites is not harmless. Each one needs an entry
+    in `COVERAGE`, so the table fills with exemptions for calls that read
+    nothing, and an exemption is exactly what a real unbounded read would
+    want to be mistaken for.
+    """
+    invented = _derivation_over(
+        'def f(c):\n'
+        '    if not segment:\n'
+        '        raise BoundedReadFault(\n'
+        '            f"{IMMUDB_URL}/api/v2/db/count/ with an empty prefix")\n'
+        '    print("GET /api/v2/db/count/{prefix} routes, and its shape")\n'
+    )
+    assert invented == set(), (
+        "the derivation attributed a bounded read to a raise and a print "
+        f"whose text names the count route: {sorted(invented)}. A string "
+        "naming a route is not a read of it."
+    )
+
+    real = _derivation_over(
+        'def f(c):\n'
+        '    return c.get(f"{IMMUDB_URL}/api/v2/db/count/{seg}", headers=h)\n'
+    )
+    assert real == {"<probe>::f"}, (
+        "the guard that excludes a mention of the route also excludes the "
+        f"read itself, so it is narrower than the property: {sorted(real)}"
+    )
 
 
 def test_every_bounded_read_has_a_recorded_state():

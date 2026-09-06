@@ -183,7 +183,18 @@ def _audit(limit: int, verify: bool = False) -> dict:
 def _immudb_prefix_count(prefix: str) -> int:
     """The same question P3c3a-1 makes /audit ask, asked independently here
     so the test compares /audit's answer against the ledger rather than
-    against another copy of /audit's own arithmetic."""
+    against another copy of /audit's own arithmetic.
+
+    P3c3g-4: the bound is a URL path segment and the response is one integer,
+    so a bound that did not survive cannot be detected in what came back. It
+    is refused before the request instead. Without this, a missing prefix
+    answers a ledger-wide count, /audit's total is compared against it, and
+    the comparison agrees because both sides are wrong in the same direction.
+    """
+    assert prefix, (
+        "the ledger-side control was asked for a count with no prefix, so "
+        "the bound was not applied and this would count the whole ledger"
+    )
     with httpx.Client(timeout=30.0) as client:
         login = client.post(f"{IMMUDB_URL}/api/v2/login", json={
             "user": _b64(IMMUDB_USER),

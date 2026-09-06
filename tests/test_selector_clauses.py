@@ -116,6 +116,38 @@ def _select_write_routes_by_path(original):
     return broken
 
 
+# --- the clauses of the bounded-read derivation ----------------------------
+
+def _stop_walking_tests(original):
+    """The `skip` set in `_module_files` widened to exclude `tests/`."""
+
+    def broken():
+        return [path for path in original()
+                if "tests" not in path.relative_to(REPO_ROOT).parts]
+
+    return broken
+
+
+def _drop_the_count_route(original):
+    """`/api/v2/db/count` removed from `BOUNDED_ROUTES`."""
+    return tuple(route for route in original
+                 if route != "/api/v2/db/count")
+
+
+def _drop_the_grpc_reads(original):
+    """`GRPC_READS` emptied, so no gRPC read is a site."""
+    return ()
+
+
+def _stop_requiring_an_http_call(original):
+    """The verb guard on the count branch widened to match any call.
+
+    `attribute` is `None` for a `raise` or a `print`, so admitting `None` is
+    what removing the guard amounts to.
+    """
+    return tuple(original) + (None,)
+
+
 D48_CLAUSES = (
     Clause(
         id="route_parity:_service_routes:isinstance",
@@ -137,6 +169,51 @@ D48_CLAUSES = (
         falsifier=("tests/test_route_parity.py::"
                    "test_the_selector_is_the_gate_and_not_the_path"),
     ),
+
+    # tests/test_bounded_reads.py. The selector here is the derivation, and
+    # its discriminating clauses are spread across four module-level names
+    # rather than being conjuncts of one predicate. That is why the clause
+    # enumeration is hand-listed: there is no expression to take apart.
+    Clause(
+        id="bounded_reads:_module_files:skip",
+        module="test_bounded_reads",
+        attribute="_module_files",
+        selector="_module_files",
+        clause="the skip set, which does not exclude tests/",
+        broken=_stop_walking_tests,
+        falsifier=("tests/test_bounded_reads.py::"
+                   "test_the_derivation_finds_the_reads_no_route_literal_names"),
+    ),
+    Clause(
+        id="bounded_reads:BOUNDED_ROUTES:count",
+        module="test_bounded_reads",
+        attribute="BOUNDED_ROUTES",
+        selector="_sites_in_source",
+        clause="any(route in target for route in BOUNDED_ROUTES)",
+        broken=_drop_the_count_route,
+        falsifier=("tests/test_bounded_reads.py::"
+                   "test_the_derivation_finds_the_reads_it_is_supposed_to_find"),
+    ),
+    Clause(
+        id="bounded_reads:GRPC_READS:membership",
+        module="test_bounded_reads",
+        attribute="GRPC_READS",
+        selector="_sites_in_source",
+        clause="attribute in GRPC_READS",
+        broken=_drop_the_grpc_reads,
+        falsifier=("tests/test_bounded_reads.py::"
+                   "test_the_derivation_finds_the_reads_no_route_literal_names"),
+    ),
+    Clause(
+        id="bounded_reads:_HTTP_READ_CALLS:verb",
+        module="test_bounded_reads",
+        attribute="_HTTP_READ_CALLS",
+        selector="_sites_in_source",
+        clause="attribute in _HTTP_READ_CALLS, on the count branch",
+        broken=_stop_requiring_an_http_call,
+        falsifier=("tests/test_bounded_reads.py::"
+                   "test_a_string_that_merely_names_a_route_is_not_a_read"),
+    ),
 )
 
 
@@ -147,6 +224,13 @@ D48_CLAUSES = (
 CLAUSES_IN_THE_COVERED_SELECTORS = {
     "test_route_parity._service_routes": ("isinstance(route, APIRoute)",),
     "test_route_parity.write_routes": (_GATE_CLAUSE,),
+    "test_bounded_reads._module_files": (
+        "the skip set, which does not exclude tests/",),
+    "test_bounded_reads._sites_in_source": (
+        "any(route in target for route in BOUNDED_ROUTES)",
+        "attribute in GRPC_READS",
+        "attribute in _HTTP_READ_CALLS, on the count branch",
+    ),
 }
 
 

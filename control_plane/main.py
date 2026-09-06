@@ -1346,10 +1346,37 @@ def _ledger_decision_count(client: httpx.Client, token: str) -> int:
     README's Residual Limits for the standing statement. A maintained
     counter can replace this later without changing the response contract,
     because the contract is the number, not how it was obtained.
+
+    P3c3g-4, closing red-team R2. This is a bounded read and it was in none
+    of the three enumerations: the route is not one of the two scan routes,
+    the bound is a URL path segment rather than a JSON body field, and the
+    call is `client.get`. Dropping the prefix answers HTTP 200 with a larger
+    number, which is a ledger-wide count presented as the decision total on
+    every `/audit` page.
+
+    **The bound is checked before the request, not after it, and this is the
+    only bounded read in the tree where that is so.** D42's rule is that the
+    assertion bites on what came back, because ImmuDB drops an unrecognised
+    parameter without comment and a response is the only place the difference
+    shows. A count has no rows: the response is one number, and a
+    prefix-bounded count and a ledger-wide count are both plausible integers.
+    There is nothing in the answer to check. So what is enforced here is that
+    the request carried its bound, which is strictly narrower than what every
+    other site gets and is recorded as such in `tests/test_bounded_reads.py`
+    and in the phase report rather than presented as equivalent.
     """
     prefix_b64 = base64.b64encode(_TOOL_CALL_PREFIX).decode()
+    segment = urllib.parse.quote(prefix_b64, safe="")
+    if not segment:
+        raise BoundedReadFault(
+            "the decision count was about to ask "
+            f"{IMMUDB_URL}/api/v2/db/count/ with an empty prefix segment. "
+            "That is a ledger-wide count, it answers HTTP 200, and it would "
+            "be reported as the decision total on every /audit page. "
+            "Refusing rather than counting everything."
+        )
     resp = client.get(
-        f"{IMMUDB_URL}/api/v2/db/count/{urllib.parse.quote(prefix_b64, safe='')}",
+        f"{IMMUDB_URL}/api/v2/db/count/{segment}",
         headers={"Authorization": f"Bearer {token}"},
     )
     resp.raise_for_status()

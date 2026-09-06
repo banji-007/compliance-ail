@@ -39,6 +39,14 @@ def pytest_collection_modifyitems(session, config, items):
     original = getattr(module, clause.attribute)
     setattr(module, clause.attribute, clause.broken(original))
 
+    # `bounded_read_sites` is lru_cached. A break installed after something
+    # has already walked the tree would be invisible, and the falsifier would
+    # pass against a cached answer the unbroken selector produced, which is
+    # this check reporting a green it did not earn.
+    walk = getattr(module, "bounded_read_sites", None)
+    if walk is not None and hasattr(walk, "cache_clear"):
+        walk.cache_clear()
+
     # Printed so a subprocess transcript pasted into a report says what was
     # broken, rather than the reader taking the harness's word for it.
     print(f"D48: broke {clause.module}.{clause.attribute} ({clause.clause})")
