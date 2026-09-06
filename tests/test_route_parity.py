@@ -182,16 +182,50 @@ UNGATED_BY_DESIGN = {
 def _service_routes(verifier) -> list[APIRoute]:
     """Every route this service registers, under any verb.
 
-    FastAPI adds `/openapi.json`, `/docs`, `/docs/oauth2-redirect` and
-    `/redoc` to every application it builds. They are the framework's routes
-    and not this service's, and they are excluded by where their endpoint
-    function is defined rather than by a list of paths - a path list here
-    would be one more hand-maintained enumeration inside the file whose
-    subject is hand-maintained enumerations.
+    **One conjunct, and the second was deleted rather than given a falsifier
+    (P3c3g-1, Phase 3c-3g).** Until this phase the comprehension also required
+    `route.endpoint.__module__ == verifier.__name__`, on the stated ground
+    that FastAPI adds `/openapi.json`, `/docs`, `/docs/oauth2-redirect` and
+    `/redoc` to every application it builds, that they are the framework's
+    routes rather than this service's, and that excluding them by where their
+    endpoint function is defined beats a hand-maintained path list.
+
+    **That ground was false.** All four framework routes are
+    `starlette.routing.Route` and not `fastapi.routing.APIRoute`, so the
+    `isinstance` conjunct already excludes every one of them on its own:
+
+        Route     /openapi.json          fastapi.applications
+        Route     /docs                  fastapi.applications
+        Route     /docs/oauth2-redirect  fastapi.applications
+        Route     /redoc                 fastapi.applications
+        APIRoute  /health                the verifier module
+        APIRoute  /write                 the verifier module
+        APIRoute  /write-ordered         the verifier module
+        APIRoute  /state                 the verifier module
+        APIRoute  /verify                the verifier module
+
+    The module conjunct excluded nothing on this app, and it excluded every
+    route arriving from an `APIRouter` through `app.include_router`. That is
+    red-team R1: a write route holding none of the four properties below,
+    included from another module, left this file at `13 passed`, identical to
+    baseline, while the same handler under the same verb, path, gate and body
+    moved into the verifier module read `3 failed`.
+
+    **Why deleted rather than falsified.** Removing the conjunct leaves the
+    selector's output on this app identical, five routes to five routes, which
+    is what makes it dead. Deadness alone is not the argument for deleting it:
+    a clause that discriminates against nothing that exists while excluding
+    something that could is dead *and* costly, and both halves are the reason.
+    A dead clause is a deletion; a live clause that no falsifier can break is a
+    missing falsifier. The two read identically under a green suite and are
+    told apart only by the selector's output set, which is why the measurement
+    above is a set comparison rather than a test run.
+
+    Enforced by `test_a_route_from_an_included_router_is_selected` below, and
+    the surviving conjunct is paired to its falsifier in `D48_CLAUSES`.
     """
     return [route for route in verifier.app.routes
-            if isinstance(route, APIRoute)
-            and getattr(route.endpoint, "__module__", "") == verifier.__name__]
+            if isinstance(route, APIRoute)]
 
 
 def _gate_names(route: APIRoute) -> set[str]:
@@ -709,15 +743,142 @@ def test_a_write_route_is_selected_under_any_verb():
         def _handler(_: None = Depends(verifier._require_write_key)):
             return {}
 
-    # The same shape write_routes() takes from a module: an `app`, and a
-    # `__name__` the endpoint functions were defined under.
-    stand_in = SimpleNamespace(app=app, __name__=_handler.__module__)
+    # The shape write_routes() takes from a module: an `app`, and a `__name__`
+    # that is NOT the handlers' own module.
+    #
+    # Until P3c3g-1 this read `__name__=_handler.__module__`, which set the
+    # stand-in's module to whatever module the handler happened to be defined
+    # in. The `_service_routes` conjunct that compared the two therefore agreed
+    # with itself by construction, and this falsifier could not fail in that
+    # direction whatever the conjunct said. The conjunct is now deleted, so
+    # nothing reads this field today. It is set to a deliberately different
+    # value rather than dropped: that is the scenario, not decoration. A
+    # verifier module and the routes it mounts are two different modules
+    # whenever a router is involved, and a stand-in that cannot express the
+    # difference cannot fail when a future selector starts discriminating on
+    # it again. Dropping it made the mutation below fail with an
+    # AttributeError instead of this test's own assertion, which is a test
+    # failing for the wrong reason.
+    stand_in = SimpleNamespace(app=app, __name__="verifier.not_the_handlers_module")
     selected = sorted(write_routes(stand_in))
     assert selected == ["/write-amend", "/write-express", "/write-retract"], (
         "a route gated by _require_write_key is not in the site list because "
         f"of the verb it is registered under. Selected: {selected}. Every one "
         "of these writes on the caller's behalf and holds none of the "
         "properties below, and the enumeration cannot see it."
+    )
+
+
+def test_the_selector_is_the_gate_and_not_the_path():
+    """The gate conjunct in `write_routes()`, falsified in both directions.
+
+    **Found by D48's per-clause mutation, Phase 3c-3g.** Replacing
+    `"_require_write_key" in _gate_names(route)` with `"write" in route.path`
+    left `tests/test_route_parity.py` at `14 passed`. The two rules select the
+    identical set on the app as it stands: `/write` and `/write-ordered` are
+    both gated by the write key and both have "write" in the path, and
+    `/health`, `/state` and `/verify` are excluded by either rule. The gate
+    conjunct is not dead, because dropping it entirely sweeps in all five
+    routes, but it is indistinguishable from the wrong rule by anything that
+    was in this file.
+
+    `test_the_write_routes_are_selected_by_their_gate_and_not_by_their_path`
+    is named for this property and does not check it. Its body asserts that
+    every route declares a gate, that `UNGATED_BY_DESIGN` is neither stale nor
+    thin, that some route is selected, and that `/verify` is not selected.
+    `/verify` has no "write" in its path, so a path rule keeps it out too, and
+    every one of those assertions holds under the substitution. The name was
+    the claim; the body was a different, weaker one.
+
+    Nor did the other two falsifiers cover it:
+    `test_a_write_route_is_selected_under_any_verb` uses `/write-express`,
+    `/write-amend` and `/write-retract`, and
+    `test_a_route_from_an_included_router_is_selected` uses `/write-express`.
+    Every path in both carries the substring, so a path rule passes them.
+
+    Both directions, because either alone is satisfiable by the wrong rule.
+    """
+    from fastapi import APIRouter, Depends, FastAPI
+
+    verifier = _load_verifier()
+    app = FastAPI()
+
+    # Direction one: gated by the write key, and no "write" in the path.
+    # A path rule misses it; the gate rule must not.
+    @app.post("/records/append")
+    def _gated_without_the_substring(
+            _: None = Depends(verifier._require_write_key)):
+        return {}
+
+    # Direction two: "write" in the path, gated by the READ key. A path rule
+    # sweeps it in; the gate rule must not. This is the direction that
+    # matters, because every property in this file would then be asserted
+    # against a read.
+    @app.post("/write-preview")
+    def _read_gated_with_the_substring(
+            _: None = Depends(verifier._require_read_key)):
+        return {}
+
+    stand_in = SimpleNamespace(app=app, __name__="verifier.main")
+    selected = sorted(write_routes(stand_in))
+    assert selected == ["/records/append"], (
+        "write_routes() does not select on the gate. Selected: "
+        f"{selected}, expected ['/records/append']. '/records/append' is "
+        "gated by _require_write_key and carries no 'write' in its path; "
+        "'/write-preview' carries 'write' and is gated by _require_read_key, "
+        "so it is a read this file would assert four write properties "
+        "against. A selector that agrees with the path on the routes that "
+        "exist today is not thereby selecting on the gate."
+    )
+
+
+def test_a_route_from_an_included_router_is_selected():
+    """Direction one, second instance: a case satisfying WRITE_ROUTE_PROPERTY
+    and not the selector, if the selector discriminated on where the handler
+    was defined.
+
+    Red-team R1 (`docs/reports/phase-3c3f-redteam.md`). `_service_routes` used
+    to require `route.endpoint.__module__ == verifier.__name__`. A write route
+    assembled on an `APIRouter` in another module and mounted with
+    `app.include_router` reports that other module, so it was filtered out
+    before `write_routes()` ever saw it, and was then outside the site list,
+    the three-state matrix, the gate check and both falsifiers. Measured: such
+    a route, gated by `_require_write_key` and holding none of the four
+    properties, left this file at `13 passed`, byte-identical to baseline. The
+    same handler under the same verb, path, gate and body, defined in the
+    verifier module instead, read `3 failed`.
+
+    The handler's `__module__` is assigned rather than the handler living in a
+    committed module of its own. A real second module under `verifier/` would
+    ship an ungated unverified write route into the image to make a test
+    fail, which is a worse thing than the test is worth. Both halves R1 turns
+    on are present: the endpoint's module is not the verifier's, and the route
+    arrives through `include_router` rather than a decorator on `app`.
+    """
+    from fastapi import APIRouter, Depends, FastAPI
+
+    verifier = _load_verifier()
+    app = FastAPI()
+    router = APIRouter()
+
+    @router.post("/write-express")
+    def _handler(_: None = Depends(verifier._require_write_key)):
+        return {}
+
+    _handler.__module__ = "verifier.some_other_module"
+    app.include_router(router)
+
+    # `__name__` is the verifier module's, and the handler's is not: that
+    # difference is the whole scenario. See the note in
+    # `test_a_write_route_is_selected_under_any_verb` on why this field is
+    # supplied rather than dropped now that nothing reads it.
+    stand_in = SimpleNamespace(app=app, __name__="verifier.main")
+    selected = sorted(write_routes(stand_in))
+    assert selected == ["/write-express"], (
+        "a route gated by _require_write_key is not in the site list because "
+        f"its handler is defined in another module. Selected: {selected}. It "
+        "writes on the caller's behalf and holds none of the properties "
+        "below, and the enumeration cannot see it."
     )
 
 
