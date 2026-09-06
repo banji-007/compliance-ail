@@ -769,6 +769,48 @@ def test_a_write_route_is_selected_under_any_verb():
     )
 
 
+def test_a_framework_route_is_not_in_the_site_list():
+    """The `isinstance(route, APIRoute)` conjunct in `_service_routes`,
+    falsified in the direction it exists for.
+
+    FastAPI adds `/openapi.json`, `/docs`, `/docs/oauth2-redirect` and
+    `/redoc` to every application it builds. They are the framework's and not
+    this service's, they carry no `_require_*` dependency, and if they reached
+    the site list the gate check would report four routes gated by neither
+    key. Excluding them is the one thing this conjunct does, and until Phase
+    3c-3g nothing asserted it: the module conjunct that sat beside it was
+    credited with the exclusion in the docstring and did not perform it.
+
+    Asserted against a bare `FastAPI()` rather than the verifier's own app,
+    so the four are present as themselves and the assertion is about the
+    conjunct rather than about which routes this service happens to mount.
+    """
+    from fastapi import Depends, FastAPI
+
+    verifier = _load_verifier()
+    app = FastAPI()
+
+    @app.post("/write-thing")
+    def _handler(_: None = Depends(verifier._require_write_key)):
+        return {}
+
+    stand_in = SimpleNamespace(app=app, __name__="verifier.main")
+    framework = sorted(route.path for route in app.routes
+                       if not isinstance(route, APIRoute))
+    assert framework, (
+        "this test asserts that the framework's own routes are excluded and "
+        "the app under it has none, so it would pass against anything"
+    )
+
+    selected = sorted(route.path for route in _service_routes(stand_in))
+    assert selected == ["/write-thing"], (
+        f"_service_routes selected {selected}. The framework's own routes "
+        f"{framework} are not this service's, carry no _require_* "
+        "dependency, and would be reported by the gate check as routes gated "
+        "by neither key."
+    )
+
+
 def test_the_selector_is_the_gate_and_not_the_path():
     """The gate conjunct in `write_routes()`, falsified in both directions.
 
