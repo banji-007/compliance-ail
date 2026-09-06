@@ -726,3 +726,193 @@ Each confirmed individually.
 The fourth row is the weakest of the six and is stated as such: "no bounded
 read outside the site list" is a claim about a derivation whose limits are
 hand-listed, so it means "none this derivation can see", not "none".
+
+---
+
+## An order interaction this phase found and did not cause
+
+**Not one of the five items.** Found while verifying them, recorded here with
+its reproduction so it is actionable rather than an anecdote. This project's
+order findings have been useful exactly when the order was preserved, as the
+sweep's seeds were, and useless when they were described as "some
+non-alphabetical run".
+
+### The reproduction
+
+Stack under an explicit project name, fresh ledger, module order preserved:
+
+```
+docker compose -p p3c3gfix -f docker-compose.test.yml down -v
+docker compose -p p3c3gfix -f docker-compose.test.yml up -d --wait
+
+python -m pytest \
+  tests/test_backfill_index.py \
+  tests/test_reconciliation.py \
+  tests/test_view_invariants.py \
+  tests/test_audit_ordering.py \
+  tests/test_audit_read_correctness.py \
+  tests/test_raw_ledger_fields.py \
+  tests/test_record_profile.py \
+  tests/test_route_parity.py \
+  tests/test_bounded_reads.py \
+  tests/test_bound_assertions_are_reached.py \
+  tests/test_docs_references_resolve.py \
+  -q -p no:randomly
+```
+
+`9 failed, 106 passed in 244.71s`. Five of the nine are in
+`tests/test_record_profile.py`:
+
+```
+test_audit_response_carries_profile_from_closed_set
+test_audit_response_surfaces_exclusivity_for_mediated_records
+test_one_session_produces_both_observed_and_mediated_records
+test_raw_decision_record_for_mediated_tool_carries_mediated_profile_and_demonstrated_exclusivity
+test_raw_decision_record_for_observed_tool_carries_no_exclusivity_key_at_all
+```
+
+The same module alone, same stack: `8 passed in 62.12s`. CI is green on the
+same commit, alphabetically, on a fresh ledger.
+
+The four modules after `test_record_profile.py` in that order cannot affect
+it, so the control below drops them and keeps the first seven in the same
+sequence.
+
+### The control: the same order against pre-change code
+
+`tests/` and `control_plane/` checked out at `2cdcec3`, fresh ledger, the same
+seven modules in the same sequence. The four modules that ran after
+`test_record_profile.py` are dropped, because a module that runs later cannot
+affect one that ran earlier.
+
+```
+git checkout 2cdcec3 -- tests/ control_plane/
+
+docker compose -p p3c3gfix -f docker-compose.test.yml down -v
+docker compose -p p3c3gfix -f docker-compose.test.yml up -d --wait
+
+python -m pytest \
+  tests/test_backfill_index.py tests/test_reconciliation.py \
+  tests/test_view_invariants.py tests/test_audit_ordering.py \
+  tests/test_audit_read_correctness.py tests/test_raw_ledger_fields.py \
+  tests/test_record_profile.py -q -p no:randomly
+```
+
+`11 failed, 56 passed in 222.78s`, of which **seven** are in
+`tests/test_record_profile.py`:
+
+```
+test_raw_decision_record_carries_observed_profile
+test_raw_tombstone_record_carries_observed_profile
+test_audit_response_carries_profile_from_closed_set
+test_raw_decision_record_for_mediated_tool_carries_mediated_profile_and_demonstrated_exclusivity
+test_raw_decision_record_for_observed_tool_carries_no_exclusivity_key_at_all
+test_one_session_produces_both_observed_and_mediated_records
+test_audit_response_surfaces_exclusivity_for_mediated_records
+```
+
+plus two in `tests/test_raw_ledger_fields.py`.
+
+**The five failures seen with this phase's code are a strict subset of these
+seven**, and the control has two more this phase's run did not. The
+interaction is pre-existing at `2cdcec3` and this phase did not cause it. **No
+claim is made that this phase improved it**: the two runs covered different
+module counts, and the difference between five and seven is not something one
+pair of runs establishes.
+
+### The mechanism is open, and the smaller reproduction failed
+
+A two-module pair was tried, on the reasoning that
+`tests/test_backfill_index.py` pads the decision view past 2600 rows and
+`tests/test_record_profile.py` reads `/audit` at `limit=200` and scans at
+`limit=500`, so its own record could be pushed out of the window it looks in.
+
+```
+docker compose -p p3c3gfix -f docker-compose.test.yml down -v
+docker compose -p p3c3gfix -f docker-compose.test.yml up -d --wait
+python -m pytest tests/test_backfill_index.py tests/test_record_profile.py \
+  -q -p no:randomly
+```
+
+**`11 passed in 122.32s`. The pair is insufficient and the padding alone does
+not cause it.** Something else in the seven-module order is required, and this
+phase did not find out what.
+
+The window story above is therefore recorded as **an unverified hypothesis
+that the two-module control did not support**, not as a diagnosis. It fits
+what the source does; that is not the same as being the cause, and this
+project's standard for a mechanism is the failure text, not the plausibility
+of the code. An earlier draft of this section asserted the window story as the
+cause and also explained the green CI by collection order, which is
+self-contradicting: `test_backfill_index.py` sorts before
+`test_record_profile.py`, so the padding lands first under CI's alphabetical
+collection too. Both were removed before this report was committed.
+
+**The known-good reproduction is the seven-module order above.** Whoever picks
+this up starts there and bisects toward a smaller one; the obvious smaller one
+is already ruled out.
+
+Carried to the next red-team brief as an observation with a reproduction, not
+as a finding this phase closed.
+
+---
+
+## D48's own hole, measured rather than left for the next pass
+
+The instruction pre-committed a failure condition for D48: it has the same
+defect it exists to find if its own coverage check is derived rather than
+mutation-driven. The establishment is described above and it is two hand-typed
+lists that must agree. **That is weaker than it sounds, and here is the
+measurement.**
+
+A third conjunct added to `_service_routes`, recorded in neither
+`D48_CLAUSES` nor `CLAUSES_IN_THE_COVERED_SELECTORS`:
+
+```python
+    return [route for route in verifier.app.routes
+            if isinstance(route, APIRoute)
+            and not route.path.startswith("/internal")]
+```
+
+```
+$ python -m pytest tests/test_selector_clauses.py::test_every_clause_of_a_covered_selector_has_a_recorded_state \
+                  tests/test_selector_clauses.py::test_every_clause_has_exactly_one_state -q
+2 passed
+```
+
+**A clause added to a covered selector and to neither list is undetected.**
+Both lists are typed by hand by the same person in the same commit, so they
+disagree only when someone updates one and forgets the other. They do not
+disagree when someone updates neither, which is the likelier mistake.
+
+This is D48 at level four having the shape D46 had at level three: a claim
+about covering something, with nothing that fails when a site is added and
+missed. It is stated here rather than generalised, per the response this
+phase's instruction pre-committed to: the claim is scoped down to what the
+tests demonstrate and the enumeration limit goes to Residual Limits.
+
+What D48 does buy, and it is not nothing: for the six clauses that **are**
+listed, breaking each one fails a named falsifier that has to run, and two of
+those falsifiers did not exist before this phase because nothing had ever
+broken those clauses on purpose.
+
+---
+
+## CI
+
+| run | head | what it validates | result |
+|---|---|---|---|
+| `34052065067` | `077ccae` | the erratum, P3c3g-1, D48, P3c3g-4, P3c3g-2 | **success** |
+| `34053108493` | `d92157f` | all five items, including P3c3g-3 | **success** |
+| `34053211227` | `39d2e37` | this report as first committed | **success** |
+
+The commit carrying this section is docs-only and is not itself named by a run
+id here, for the reason the instruction gives about forward references: a
+commit cannot cite the run its own push triggers. `d92157f` is the run that
+validates every executable byte this phase changed.
+
+**Local runs are not a regression signal on this host** and are not used as
+one. The host cannot install `sigstore`, and the tests that drive
+`decision_service/main.py` in process cannot resolve the compose service
+names. The local figures quoted in this report are all scoped runs over named
+modules, each stated with its module list.
