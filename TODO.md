@@ -18,6 +18,8 @@ What that phase added to the deferred list rather than closing is recorded in RE
 
 **Closed in Phase 3c-3e (`docs/reports/phase-3c3e.md`, ADR-0014 D43-D45).** The red-team pass against 3c-3d refuted six of ten claims, and what all six had in common was one thing: a rule that has to hold at N sites, with nothing enumerating the sites. That set is closed, and the control that produced the fixes - an enumeration derived from the code, which fails until every site is covered - is now the rule rather than one test. What it added to the deferred list rather than closing is the entry below on per-test isolation, plus three Residual Limits entries in the README.
 
+**Closed in Phase 3c-3h (`docs/reports/phase-3c3h.md`), the last sub-phase of 3c.** The red-team pass against 3c-3g returned one recursive gap, seven applications and three carried findings. The pre-committed response to a recursive gap is not another generalisation: the claim is scoped to what the tests demonstrate, the limit goes to Residual Limits, and the project shares a smaller claim. So this phase added no enumeration machinery. It narrowed the route-parity and exemption-marker claims at every site that stated them, closed `state_read`'s vocabulary with a type, made a stale property cell fail instead of vanishing, corrected two bounds and a detector's stated limit, and closed the one production defect the pass diagnosed: an ordered write whose `ExecAll` reached the wire could be reported as never having happened. What it recorded as carried rather than closing is the four entries below.
+
 ---
 
 ## Deferred (v1.1.0)
@@ -55,6 +57,42 @@ Both return `outcome_type: fault, fault_class: verifier_unreachable` and the cal
 Why it is deferred rather than fixed in 3c-3c. The distinction is cheap to *compute* - the write response already carries `committed`, and `ledger/immudb_ledger.py` would need to raise a typed exception rather than a bare `RuntimeError` for `decision_service/main.py` to map it - but the change is not a rename. It alters ADR-0005's closed set, which is D1's own artifact; it changes the Prometheus label collection that `tests/test_outcome_types.py::test_metric_label_set_matches_closed_collection` asserts, so any alert or dashboard keyed on the class changes meaning; and the right shape is genuinely open, because a call whose record committed unproven may not belong under the same `outcome_type` at all rather than merely under a second `fault_class`. That is an ADR-0005 conversation, and running it inside a remediation phase already closing eight refutations would make the least-examined part of that phase the taxonomy.
 
 What exists in the meantime: the distinction is available to a caller in the write response's `committed` field and on the `/audit` row's `ledger_fault`, and it is stated in ADR-0005's Documented Boundary amendment and README's Residual Limits. What is collapsed is the class name.
+
+### `COMPOSE_FILES` does not read `docker-compose.override.yml` (R7)
+
+Raised by the Phase 3c-3f red team with a control, re-demonstrated by the 3c-3g pass, carried through 3c-3h.
+
+`COMPOSE_FILES = ("docker-compose.yml", "docker-compose.test.yml")` at `tests/test_ledger_state_does_not_survive_teardown.py:33`. `docker compose` loads `docker-compose.override.yml` by default, so a stateful mount or an external volume declared there is never read by the module whose whole subject is that a ledger must not outlive `down -v`. There is no override file in the tree today, which is why this is a hole rather than an instance: the check reads a file set that is narrower than the one Compose actually composes.
+
+**Reproduction:** add `docker-compose.override.yml` binding ImmuDB's data directory to a host path, or declaring a volume `external: true`, and the module stays green.
+
+**Scope.** One line: add the override file to `COMPOSE_FILES`, guarded on existence since the file is optional, and drive it with a fixture override the way `_BOTH_SPELLINGS` drives the parse. Phase 3c-3h's prefix-with-boundary fix (P3c3h-5) changed how a target is matched and did not change which files are read.
+
+### `state_read` is typed at the verifier and untyped at `/audit` (F5, the other half)
+
+Raised by the Phase 3c-3g red team, half closed in 3c-3h by P3c3h-3.
+
+`StateRead.source` and `.status` are `Literal` now, so the verifier cannot construct a value outside the vocabulary. Nothing types the field on the way out of the control plane: `control_plane/main.py::_verification_from_200` passes `vdata.get("state_read")` through verbatim in all four branches, and `GET /audit` carries no `response_model` at all.
+
+**Reproduction (from the red team, against a verifier response constructed by hand):** `state_read = {"source": "moon", "status": "failed", ...}` renders on the row verbatim, as do `state_read = "failed"`, `17` and `["failed"]`. No instance is reachable from this verifier's own code, which is why this is a shape hole and not a live defect: the five construction sites are all inside `_state_read` and all now typed.
+
+**Scope.** A `response_model` on `/audit`, or a typed sibling on the row the control plane builds. The first is the bigger change and the better one, and it is a decision about `/audit`'s whole response shape rather than about this field.
+
+### The five-constructor shape test is itself a hand-list (F8)
+
+Raised by the Phase 3c-3g red team, carried through 3c-3h.
+
+`tests/test_post_proof_reporting.py::test_every_constructor_of_a_verification_object_agrees_on_its_shape` builds its `built` dict by naming five constructors of the `/audit` verification object. A sixth constructor added elsewhere in `control_plane/main.py` is outside it and the test stays green. `docs/reports/r6-headstate.md` states this limit for `POST_PROOF_SITES` and does not state it for this test.
+
+**Scope.** Either derive the constructors (which needs a selector over them, and a selector is a claim - see the route-parity scoping in README's Residual Limits for where that argument goes), or state the limit in the test's own docstring the way `POST_PROOF_SITES` and `UNDETECTED_COMPOSITIONS` state theirs. The second is one paragraph and is the R6 convention.
+
+### `tests/test_record_profile.py` fails in one recorded collection order
+
+Raised in Phase 3c-3g, mechanism unestablished, carried through 3c-3h.
+
+The module passes alone and passes in CI, and fails in a recorded multi-module collection order. Nothing has established why. It is not a flake in the sense of being timing-dependent: the order reproduces it.
+
+**Reproduction pointer:** `docs/reports/phase-3c3g.md` records the order and the failure. `docs/reports/phase-3c3d-order-sweep.md` is the instrument for this class - eleven modules run alone against a destroyed and rebuilt ledger, with the failing set diffed against the alphabetical baseline - and is the shape the diagnosis should take.
 
 ### ImmuDB TLS
 ImmuDB's REST API communicates over plain HTTP on the internal Docker network (`http://immudb:8080`). Internal Docker traffic is isolated from the host, but TLS should be enforced for defence-in-depth and to satisfy stricter SOC2 transport encryption requirements.

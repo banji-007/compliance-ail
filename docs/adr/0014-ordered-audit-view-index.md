@@ -598,6 +598,45 @@ read issued through a helper that takes its bound as an argument is invisible
 to it; one probe script has that shape and it is stated in the module. And no
 enumeration here can see a property nobody stated.
 
+**Scoped in Phase 3c-3h (P3c3h-1), after the 3c-3g red team measured where the
+route-parity derivation stops.** The sentence above - "the site list is
+derived, and the discriminator is named" - is true of the write-route list and
+is not a claim that the list is complete. `tests/test_route_parity.py` reads
+`verifier.app.routes` non-recursively and keys its result by path, and
+`_gate_names` reads one level of a route's declared dependencies by function
+name. Three discriminating positions follow from that and none of them is a
+clause any hand-list could hold:
+
+  * a sub-application mounted with `app.mount` contributes a
+    `starlette.routing.Mount` and never its own routes, so a gated,
+    reachable `POST /ext/write-express` holding none of the four properties
+    left the file at `16 passed` against `3 failed` for the identical handler
+    through `app.include_router`;
+  * a write gate composed behind another `Depends` is enforced (403 on a wrong
+    key) and invisible to `_gate_names`;
+  * `write_routes` keys by `route.path`, so a second verb at an existing path
+    replaces rather than joins - a `PUT /write` doing an unverified write left
+    the file at `16 passed` against `3 failed` at a non-colliding path.
+
+**The corrected claim is therefore:** route parity covers routes registered
+directly on the verifier application and selected by the enumerated clauses.
+The three positions above are outside it, as are the control plane's and the
+decision service's own routes, which this file never reads. D48's clause
+coverage is correspondingly the hand-listed `if`-conjuncts of two selectors
+and not the selectors' discrimination as a whole
+(`tests/test_selector_clauses.py` states it there too).
+
+**Why nothing was added to close them.** Each is fixable exactly as R1 was, by
+widening the selector and adding a falsifier, and the reason for not doing it
+is that there are three at once with one cause: the enumeration reads a
+comprehension's `if` and a selector discriminates in four places, so the count
+of missing falsifiers is not a property of how carefully the list was typed.
+That is the recursive-gap cell, and Phase 3c-3g's merge criterion
+pre-committed the response to it: no further generalisation, the claim is
+scoped to what the tests demonstrate, the limit goes to Residual Limits, and
+the project shares a smaller claim. `docs/reports/phase-3c3g-redteam.md` T1,
+`docs/reports/phase-3c3h.md`.
+
 ## D44. A test's assertions are scoped to the records that test wrote
 
 Added in Phase 3c-3e.

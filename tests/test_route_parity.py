@@ -1,8 +1,54 @@
-"""tests/test_route_parity.py - Phase 3c-3e (D43, P3c3e-1), 3c-3f (D46).
+"""tests/test_route_parity.py - Phase 3c-3e (D43, P3c3e-1), 3c-3f (D46),
+3c-3h (P3c3h-1, P3c3h-6).
 
 Every property this service claims about a write is asserted against every
-write route, and the list of write routes is derived from the application
-object rather than typed here.
+write route **this file's selector can see**, and that site list is derived
+from the application object rather than typed here.
+
+**What "can see" means, stated first because the file used to claim more
+(P3c3h-1, Phase 3c-3h).** The claim is: route parity covers routes registered
+directly on the verifier application and selected by the clauses enumerated in
+`tests/test_selector_clauses.py`. Three kinds of discrimination are outside
+it, each demonstrated live by the 3c-3g red team with a control that produced
+the other outcome:
+
+  * a sub-application mounted with `app.mount`, whose routes `app.routes` does
+    not carry (attack `16 passed`, control through `include_router`
+    `3 failed`);
+  * a write gate arriving through a composite `Depends` deeper than the one
+    level `_gate_names` reads (selector `[]`, route answering 403 to a wrong
+    key);
+  * two verbs registered at one path, which `write_routes`'s path-keyed dict
+    collapses to whichever was registered last (attack `16 passed`, control at
+    a non-colliding path `3 failed`).
+
+`docs/reports/phase-3c3g-redteam.md` T1 carries the mutation table those
+figures come from, and `docs/reports/phase-3c3h.md` Residual Limits carries
+this scoping.
+
+**Why the scoped claim is still worth having, enumerated rather than
+asserted.** No production route on this head arrives by any of the three, and
+that was measured rather than read:
+
+    APIRoutes on verifier.app : /health /state /verify /write /write-ordered
+    Mounts on verifier.app    : []
+    routes whose gate is more than one Depends deep : []
+    grep app.mount / app.include_router in verifier/main.py : 0 hits
+
+Five routes, all registered directly on `app`, each declaring its gate
+directly, each at a distinct path.
+
+**That enumeration is a measurement taken in Phase 3c-3h and NOT a check this
+file runs.** P3c3h-1 added no falsifier, deliberately: the response to a
+recursive gap is to scope the claim, not to grow the mechanism. So a sixth
+route arriving by a mount, behind a composite gate, or colliding on a path
+with an existing one would be outside the site list and this file would stay
+green. The enumeration says why the smaller claim is worth having today; it
+does not extend the claim to tomorrow.
+
+**And which application.** `_service_routes` reads `verifier.app`. The control
+plane and the decision service register routes of their own, and this file
+does not cover them at all.
 
 **The property, stated first and independently of the selector (D46).** This
 paragraph is load-bearing, and it is where Phase 3c-3e went wrong. The file
@@ -180,7 +226,43 @@ UNGATED_BY_DESIGN = {
 
 
 def _service_routes(verifier) -> list[APIRoute]:
-    """Every route this service registers, under any verb.
+    """Every `APIRoute` registered directly on `verifier.app`, under any verb.
+
+    **P3c3h-1 (Phase 3c-3h): this sentence used to read "Every route this
+    service registers, under any verb", and that is false at this head.** It
+    is the sentence a README-level claim would cite, so it is corrected here
+    first rather than only where it is quoted. Three things this traversal
+    does not see, each measured by the 3c-3g red team with a control:
+
+      * **`app.mount`.** `app.routes` is walked non-recursively, so a
+        sub-application mounted with `app.mount` contributes a
+        `starlette.routing.Mount` and never its own routes. A
+        `POST /ext/write-express` behind a mount, gated by
+        `_require_write_key`, answering 200 on the right key and 422 without
+        one, left this file at `16 passed`, byte-identical to baseline; the
+        identical handler at the identical path through `app.include_router`
+        read `3 failed`.
+      * **A composite dependency.** `_gate_names` reads
+        `{dep.call.__name__ for dep in route.dependant.dependencies}`, which
+        is one level deep and name-based. A route whose write gate arrives
+        through `Depends(_authorised)`, where `_authorised` itself depends on
+        `_require_write_key`, enforces the same key - 403 on a wrong one - and
+        is invisible to the selector. That belongs to `write_routes` below
+        and is repeated here because both are places this selector
+        discriminates.
+      * **Two verbs at one path.** See `write_routes`.
+
+    **What is claimed, and it is smaller than what was claimed before.** This
+    file covers routes registered directly on the verifier application and
+    selected by the clauses enumerated in `tests/test_selector_clauses.py`.
+    Discrimination via `app.mount`, composite `Depends` gates deeper than one
+    level, and path-keyed collapsing are outside it. No production route on
+    this head arrives by any of those three paths, which is why the scoped
+    claim is still worth having, and it is a fact about today's tree and not a
+    property this file enforces. It is also worth saying which application:
+    this selector reads `verifier.app` only. The control plane and the
+    decision service register routes of their own and are not covered by this
+    file at all.
 
     **One conjunct, and the second was deleted rather than given a falsifier
     (P3c3g-1, Phase 3c-3g).** Until this phase the comprehension also required
@@ -233,21 +315,41 @@ def _gate_names(route: APIRoute) -> set[str]:
 
 
 def write_routes(verifier) -> dict[str, APIRoute]:
-    """Every route gated by `_require_write_key`, under any verb, by path.
+    """The routes `_service_routes` returns whose declared dependencies name
+    `_require_write_key`, under any verb, keyed by path.
 
-    **The selector, and it is a claim about covering WRITE_ROUTE_PROPERTY
-    rather than a restatement of it.** The discriminator is the dependency
-    and nothing else: `POST /verify` is a read and takes `_require_read_key`,
-    so a rule about "the POST routes" would either sweep it in or leave it
-    out by judgement.
+    **P3c3h-1 (Phase 3c-3h): this used to say "Every route gated by
+    `_require_write_key`", and it is not every one.** Two reasons, on top of
+    whatever `_service_routes` above could not see:
 
-    The method is deliberately not part of it (P3c3f-2, Phase 3c-3f). It used
-    to be - `"POST" in route.methods` - and that was a hand-list wearing a
-    derivation's clothes: FastAPI registers a route under whatever verb its
-    decorator names, so `@app.put` on the identical handler produced a
-    registered, gated, reachable write route that this file could not see.
-    Driven by the Phase 3c-3e red team at `10 passed` with the route present
-    and `2 failed` with the same handler under `@app.post`.
+      * **The gate has to be DECLARED on the route.** `_gate_names` reads one
+        level of `route.dependant.dependencies` by function name, so a gate
+        composed behind another dependency is enforced and unseen. Measured:
+        `_gate_names` gave `[['_authorised']]`, `write_routes` gave `[]`, and
+        the route answered 403 to a wrong key.
+      * **The key is the path, so two verbs at one path collapse.** P3c3f-2
+        removed the method from the selector deliberately, so the selector
+        admits any verb - and then this dict holds one route per path and
+        keeps whichever was registered last. A `@app.put("/write")` declared
+        above the real `POST /write`, gated by the write key and doing an
+        unverified `set` under a caller-supplied key, left this file at
+        `16 passed`; the identical handler at `/write-express`, where the path
+        does not collide, read `3 failed`. `_service_routes` saw both; this
+        function kept one.
+
+    The method is deliberately not part of the selection (P3c3f-2, Phase
+    3c-3f). It used to be - `"POST" in route.methods` - and that was a
+    hand-list wearing a derivation's clothes: FastAPI registers a route under
+    whatever verb its decorator names, so `@app.put` on the identical handler
+    produced a registered, gated, reachable write route that this file could
+    not see. Driven by the Phase 3c-3e red team at `10 passed` with the route
+    present and `2 failed` with the same handler under `@app.post`. Keying by
+    path is the cost of that, and it is recorded here rather than traded back.
+
+    **The discriminator is still the dependency and not the path.** `POST
+    /verify` is a read and takes `_require_read_key`, so a rule about "the
+    POST routes" would either sweep it in or leave it out by judgement.
+
     """
     return {route.path: route for route in _service_routes(verifier)
             if "_require_write_key" in _gate_names(route)}

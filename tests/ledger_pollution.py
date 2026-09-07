@@ -63,6 +63,36 @@ HISTORY_SCORE_IS_ITS_TRANSACTION = (
 # than "unforgeable" and the right one: this registry describes intentions
 # inside this suite, and its job is to stop an ordinary record from drifting
 # into an exemption by looking like one.
+#
+# **P3c3h-2 (Phase 3c-3h): what "deliberately" costs, measured.** The build
+# session's belief was that a real record cannot claim an exemption "because
+# `registered_for` also requires the invariant and the view to match". It
+# does require both, and matching them costs one copied string: the
+# `p3c3d-dup` entry below already names two invariants
+# (ONE_POSITION_PER_KEY, HISTORY_SCORE_IS_ITS_TRANSACTION) and the decision
+# view. The 3c-3g red team drove it through the real `POST /write-ordered`
+# with a control - two verified records with ordinary agent ids, differing in
+# exactly one field of the record value, each then given a second position at
+# score 42.0 in `ail_view:decision:v1` - and `tests/test_view_invariants.py`
+# reported the CONTROL on both ledger-wide invariants and the attack on
+# neither. The ordered route accepts the unknown field without comment.
+#
+# So the sentence above is the claim, exactly and not more: an ordinary
+# record cannot drift into an exemption by RESEMBLING one, which is what the
+# exact-marker match bought (P3c3g-3, closing R4, where
+# `p3c3c-padded-batch-7` inherited `p3c3c-pad`'s exemption). A caller who
+# deliberately writes this field with a matching invariant and view is
+# outside what this registry is for, and reaches a ledger-wide invariant on a
+# record the production write path accepted.
+#
+# **Deliberately not "fixed" in Phase 3c-3h.** Requiring the marker AND a
+# matching `registered_for` entry is what `explains()` and `registered_for()`
+# already do, and it is what the attack satisfied; re-implementing it would
+# match the English of a fix without stopping the attack, which is the P11-7
+# pattern this project has a standing rule against. Closing it means binding
+# the exemption to something the caller does not supply - a marker written by
+# the test process into a place a request body cannot reach, or a writer
+# signature - which is new mechanism and was not in this phase's scope.
 MARKER_FIELD = "ail_deliberate_violation"
 
 

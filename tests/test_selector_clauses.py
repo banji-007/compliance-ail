@@ -45,6 +45,37 @@ with its measured reason recorded here, or it is missing, and missing fails.
 that the recorded outcome is the one that actually happens, so an exemption
 that stops being true fails here.
 
+**P3c3h-1 (Phase 3c-3h): what a "clause" is, and the three discriminating
+places that are not clauses.** D48's unit is a conjunct of a selector
+comprehension's `if`, and its coverage is the two hand-lists below of exactly
+such conjuncts. The 3c-3g red team measured that a selector discriminates in
+four places and that this enumeration reads one of them:
+
+    def _service_routes(verifier):
+        return [route for route in verifier.app.routes      # (1) the traversal
+                if isinstance(route, APIRoute)]             # (2) the listed clause
+
+    def write_routes(verifier):
+        return {route.path: route                           # (4) the key
+                for route in _service_routes(verifier)
+                if "_require_write_key" in _gate_names(route)}   # (3) the helper
+
+Three of the four are live at this head and each hides a route that is gated
+by `_require_write_key`, reachable, and holds none of the four write
+properties: `app.mount` (the traversal), a composite `Depends` deeper than the
+one level `_gate_names` reads (the helper), and two verbs collapsing at one
+dict key. **No faithful application of D48 puts any of them in either list,
+and breaking every listed clause leaves all three untouched.** That is
+recorded here rather than repaired, because repairing it means an enumeration
+over discriminating positions, which is the same regress this file is bounded
+against, one level further out. `docs/reports/phase-3c3g-redteam.md` T1 has
+the instances and the mutation table; `docs/reports/phase-3c3h.md` Residual
+Limits carries the scoping.
+
+So the claim this file supports is: **for the hand-listed `if`-conjuncts of
+the covered selectors, a falsifier fails when the conjunct is broken.** Not
+"the selectors are checked", and not "the falsifiers are sufficient".
+
 **How this file's own coverage is established, and whether that was
 mutation-driven.** It is not established by anything derived. `D48_CLAUSES`
 below is typed out by hand, and
