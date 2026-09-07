@@ -69,11 +69,16 @@ claim otherwise.
 | P3c3h-1 | claim narrowed | F1's three instances, red team | none added, by design | none |
 | P3c3h-2 | claim narrowed | T2, driven through `POST /write-ordered` | none, claim edit | none |
 | P3c3h-3 | closed at the verifier | anchored mutation at `12 passed`, reproduced | 3 driven cases + the type | 3 anchored, all fail |
-| P3c3h-4 | closed | both halves at `committed: false`, reproduced with control | 5 tests | 2 named, both fail |
+| P3c3h-4 | closed, and a second branch found open | both halves at `committed: false`, reproduced with control | 5 tests | 2 named, both fail |
 | P3c3h-5 | 2 closed, 1 bounded | maxscore, stateful path, detector table | 3 | 4, all fail |
 | P3c3h-6 | closed | F2 at 16 node ids to 13, green | staleness on `PROPERTIES` | F2 itself, fails |
 | P3c3h-7 | done | n/a | n/a | n/a |
 | P3c3h-8 | recorded | n/a | n/a | n/a |
+
+**One finding arrived after the work was done and is escalated rather than
+fixed:** the intermittent CI failure this branch has been carrying is a
+*second* `committed: false` branch that P3c3h-4 does not touch, demonstrated
+in the CI section below and recorded in `TODO.md`.
 
 ---
 
@@ -342,6 +347,13 @@ the fifth test above pins it.
 mutations, the two controls, and CI. **Nothing adversarial.** It is the one
 item in this phase that changes production behaviour after the last red-team
 pass, and there is no pass after it.
+
+**And what it does not close.** The intermittent CI failure on
+`test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` is a
+different branch of the same route, identified by `attempts: 1` and
+demonstrated to survive this fix. See the CI section below. This item closes
+the branch the 3c-3g pass diagnosed and drove; it does not close the one CI
+has been failing on, and the two were easy to conflate.
 
 ---
 
@@ -612,9 +624,16 @@ shapes measured as undetected, each one step from a detected one. The bound is
 stated and pinned rather than bought, because buying it needs a measurement on
 the four-image surface that this head did not take.
 
-**Carried and unfixed:** R7, F5's `/audit` half, F8, and
-`tests/test_record_profile.py`'s order interaction. All four in `TODO.md` with
-reproduction pointers.
+**A second `committed: false` branch is open and is the one CI intermittently
+fails on.** `_committed_tx_for_value` answering ABSENT because the ledger
+returned not-found, on a record that is in the ledger. P3c3h-4 does not touch
+it, which is demonstrated rather than argued, and the mechanism is not
+established. It is the only finding in this phase that arrived after the work
+was done, and it is escalated rather than fixed.
+
+**Carried and unfixed:** R7, F5's `/audit` half, F8,
+`tests/test_record_profile.py`'s order interaction, and the branch above. All
+five in `TODO.md` with reproduction pointers.
 
 **And the standing ones this phase did not touch:** the fault record is the
 one write that succeeds without write-time proof; an evidence bundle does not
@@ -654,8 +673,80 @@ Probe scripts are outside the repository, in the session scratchpad under
 
 ## CI
 
-Run: pending at the time of writing; recorded below before this session
-closes.
+**Run `34165919599`, head `d5793e4`, conclusion `success`.**
+
+**The base was already red, and what it was red about matters more than the
+green.** Run `34160811148`, head `4d402a8` - the commit this session started
+from - failed:
+
+```
+FAILED tests/test_committed_is_a_fact.py::
+       test_a_retry_after_a_dropped_response_is_told_the_record_already_exists
+AssertionError: the caller is being told a write that committed did not
+happen, which is the retry D39 refuses forever:
+{'tx_id': None, 'seq': None, 'verified': False, 'committed': False,
+ 'attempts': 1, ..., 'detail': '<_InactiveRpcError ...
+ StatusCode.UNAVAILABLE ... "Stream removed (Socket closed)">'}
+1 failed, 562 passed, 10 skipped
+```
+
+Run `34160511188` on `9eca2cb` was green, and `9eca2cb` and `4d402a8` differ
+by seven lines of a report. So the failure is intermittent and predates
+everything in this phase.
+
+### The failure is NOT the branch P3c3h-4 closes, and it is escalated rather than folded in
+
+This is worth stating plainly because the opposite reading is the natural one:
+P3c3h-4 fixes a `committed: false` on a record that committed, CI fails with
+`committed: false` on a record that committed, so the fix must be the fix. It
+is not.
+
+**`attempts: 1` identifies the branch.** `write_ordered`'s bottom handler -
+the one the flag makes unreachable after an `ExecAll` - passes no `attempts`,
+and `OrderedWriteResponse.attempts` defaults to 0. Every driven reproduction
+of P3c3h-4's branch in this phase carried `attempts: 0` before the fix. The
+CI body carries 1, which only the `OrderedCommitUncertain` handler produces,
+via `attempts=exc.attempts`, on the `state == ABSENT` path.
+
+**Demonstrated rather than inferred.** Driven in process **with the P3c3h-4
+flag in place**, against a stub whose `ExecAll` response is cut (the
+`cutresponse` relay's shape) and whose record-key read then runs and answers
+not-found:
+
+```
+committed: False  attempts: 1  tx_id: None  seq: None
+ExecAlls issued: 1
+detail: <_InactiveRpcError ... StatusCode.UNAVAILABLE ... >
+```
+
+That is the CI body, field for field, on a head that carries the fix.
+
+**What is established:** the read ran, because a read that raises answers
+`null`; it answered not-found; and the test then read the key directly out of
+ImmuDB and found it present, in an assertion that runs *before* the one that
+failed. **What is not established:** why. An ImmuDB index that has not caught
+up with a commit that just happened produces exactly this, and so would other
+things, and nothing here measured it. The 3c-3g red team said it could not
+establish that the branch it diagnosed was what CI hit; this is evidence that
+it was not.
+
+**Why D45 does not already cover it.** D45 separates "the read could not run"
+(`null`) from "the read ran and answered" (`false`). This is a third case: the
+read ran, answered not-found, and was wrong. This phase's pre-registered
+negatives preserve `_committed_tx_for_value` answering ABSENT **for a key
+holding different bytes**, which is honest; here the key holds the same bytes
+and `client.get(key)` returned `None`.
+
+**Not fixed here.** P3c3h-4's instruction scoped the item to one change and
+said to escalate rather than grow it, and this is a different branch. Deciding
+it means deciding what a not-found read licenses immediately after an
+`ExecAll` whose response was lost - a bounded re-read, a fourth state, or
+`null` on that branch - which is a D45-level decision. Recorded in `TODO.md`
+with the run id, the body, the probe shape and the enforcing test that already
+exists.
+
+**So the green on `34165919599` is one green run on an intermittent failure,
+and it is reported as that rather than as a fix.**
 
 ---
 
@@ -669,8 +760,10 @@ about what it does not know: `/audit` is commit-ordered through a view index
 whose positions are allocated under a compare-and-set the ledger enforces in
 the same transaction as the record; a write reports `committed` as a fact read
 back from the ledger, or reports that it does not know, and since this
-sub-phase a write whose request reached the ledger can no longer be reported
-as never having happened; a proof that fails after a record has committed
+sub-phase a write that reached the ledger can no longer be reported as never
+having happened **on the branch where the confirming read could not run** -
+one further branch, where that read runs and answers not-found about a record
+that is there, is open, measured and recorded; a proof that fails after a record has committed
 produces a durable, separately-signed fault record rather than a repairable
 silence; and the reserve those positions are allocated against is bound into
 the ledger itself, where four independent readers refuse to proceed on
@@ -690,7 +783,8 @@ undetected; a bundle is evidence of a record and not of its truth; a writer
 signature names a key and not a service; and external anchoring is the one
 fail-open subsystem in an otherwise fail-closed design. One fix in this
 sub-phase changed production behaviour after the last adversarial pass and is
-backed by its own drivers, its mutations and CI alone. The claim the project
-shares at the end of 3c is smaller than the one it could have written four
-sub-phases ago, and every sentence of it has a test or a measurement behind
-it.
+backed by its own drivers, its mutations and CI alone, and the intermittent
+CI failure it would have been natural to credit it with is a different branch
+that it demonstrably does not close. The claim the project shares at the end
+of 3c is smaller than the one it could have written four sub-phases ago, and
+every sentence of it has a test or a measurement behind it.

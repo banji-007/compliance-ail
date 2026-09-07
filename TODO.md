@@ -68,6 +68,31 @@ Raised by the Phase 3c-3f red team with a control, re-demonstrated by the 3c-3g 
 
 **Scope.** One line: add the override file to `COMPOSE_FILES`, guarded on existence since the file is optional, and drive it with a fixture override the way `_BOTH_SPELLINGS` drives the parse. Phase 3c-3h's prefix-with-boundary fix (P3c3h-5) changed how a target is matched and did not change which files are read.
 
+### The intermittent CI failure is a second `committed: false` branch, still open
+
+Found in Phase 3c-3h while collecting the CI run for the report. **Not closed by P3c3h-4, and the natural reading that it was is wrong.**
+
+CI run `34160811148`, on `4d402a8`, `tests/test_committed_is_a_fact.py::test_a_retry_after_a_dropped_response_is_told_the_record_already_exists`:
+
+```
+AssertionError: the caller is being told a write that committed did not happen,
+which is the retry D39 refuses forever:
+{'tx_id': None, 'seq': None, 'verified': False, 'committed': False,
+ 'attempts': 1, 'error_class': None, ...,
+ 'detail': '<_InactiveRpcError ... StatusCode.UNAVAILABLE ...
+            details = "Stream removed (Socket closed)">'}
+```
+
+**`attempts: 1` is what identifies the branch.** `write_ordered`'s bottom handler - the one P3c3h-4's flag closes - passes no `attempts`, and `OrderedWriteResponse.attempts` defaults to 0, so that body cannot have come from it. It came from the `OrderedCommitUncertain` handler with `_committed_tx_for_value` answering ABSENT, which passes `attempts=exc.attempts`. Driven in process against a stub whose ExecAll response is cut and whose record-key read then runs and answers not-found, **with the P3c3h-4 flag in place**, reproducing the CI body exactly: `committed: False, attempts: 1, tx_id: None, seq: None` and the same detail shape.
+
+**What is established and what is not.** Established: the read ran (it did not raise, or the answer would be `null`), it answered not-found, and the test then read the key directly out of ImmuDB and found it present. Not established: why. An ImmuDB index that has not caught up with a commit that just happened would produce exactly this, and so would other things; nothing here has measured it. The Phase 3c-3g red team said it could not establish that the branch it diagnosed was what CI hit, and this is evidence that it was not.
+
+**Why it is not covered by D45's existing reasoning.** D45 separates "the read could not run" (`null`) from "the read ran and answered" (`false`). This is a third case: the read ran, answered not-found, and was wrong. Phase 3c-3h's pre-registered negatives explicitly preserve `_committed_tx_for_value` answering ABSENT **for a key holding different bytes**, which is honest; here the key holds the same bytes and `client.get(key)` returned `None`.
+
+**Frequency.** Intermittent. `9eca2cb` green, `4d402a8` red, and the two differ by seven lines of a report; `d5793e4` (this phase's head) green. The 3c-3g red team ran the test six times on one host and got six passes.
+
+**Scope, and why it was not taken in 3c-3h.** The phase's instruction scoped P3c3h-4 to one change, the flag, and said to escalate rather than grow it. This is a different branch, so it is escalated here rather than folded in. Taking it means deciding what a read that answers not-found immediately after an ExecAll whose response was lost actually licenses, which is a D45-level decision and not a patch: a bounded re-read, a distinct fourth state, or `null` on that branch. Whichever it is, `test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` is the enforcing test and it already exists.
+
 ### `state_read` is typed at the verifier and untyped at `/audit` (F5, the other half)
 
 Raised by the Phase 3c-3g red team, half closed in 3c-3h by P3c3h-3.
