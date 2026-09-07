@@ -43,6 +43,39 @@ STATEFUL_CONTAINER_PATHS = (
 )
 
 
+def is_stateful(target: str) -> bool:
+    """Is this container-side mount target inside a stateful directory.
+
+    **P3c3h-5 (Phase 3c-3h): a prefix match with a segment boundary, not an
+    exact match.** The rule was `target not in STATEFUL_CONTAINER_PATHS:
+    continue`, so a stateful mount at any path not spelled exactly like one of
+    the three was skipped entirely and `assert covered` was satisfied by the
+    other services' mounts. The 3c-3g red team drove it, with a control:
+
+        ATTACK  ./ledger-on-the-host at /var/lib/immudb/data   -> 6 passed
+        CONTROL ./ledger-on-the-host at /var/lib/immudb        -> 1 failed
+
+    `/var/lib/immudb/data` is where ImmuDB actually writes. One directory
+    deeper than the listed path, the same host bind, and the check that exists
+    to stop a ledger surviving `down -v` said nothing. Both were reproduced in
+    this phase before the fix, at the same counts.
+
+    **The boundary is the other half and it is not decoration.** A bare
+    `startswith` makes `/database-config` a stateful mount under the root
+    `/data`, which turns this fix into a false positive that refuses an
+    ordinary config mount. The rule is therefore `target == root` or
+    `target.startswith(root + "/")`, which is the path-segment reading of
+    "inside". Both cases are driven in
+    `test_a_stateful_mount_one_directory_deeper_is_seen`.
+
+    Matching a prefix rather than a member also means the list stays a list of
+    stateful ROOTS. It does not become an enumeration of every path under one:
+    that is what the exact match was, one level down.
+    """
+    return any(target == root or target.startswith(root + "/")
+               for root in STATEFUL_CONTAINER_PATHS)
+
+
 def _parse(compose_text: str):
     """Service mounts and the file's own top-level `volumes:` names.
 
@@ -159,7 +192,7 @@ def test_every_stateful_mount_is_a_named_volume_that_down_v_removes(compose_name
     offenders = []
     covered = []
     for service, source, target in mounts:
-        if target not in STATEFUL_CONTAINER_PATHS:
+        if not is_stateful(target):
             continue
         if source.startswith(".") or source.startswith("/") or ":" in source:
             offenders.append(
@@ -254,7 +287,7 @@ def test_a_long_form_bind_mount_of_the_ledger_is_seen():
     """
     mounts, _declared = _parse(_BOTH_SPELLINGS)
     stateful = [(service, source, target) for service, source, target in mounts
-                if target in STATEFUL_CONTAINER_PATHS]
+                if is_stateful(target)]
     assert ("immudb", "./ledger-on-the-host", "/var/lib/immudb") in stateful, (
         "the long-form bind mount of ImmuDB's data directory is not a mount "
         f"this parse produced. It produced: {mounts}"
@@ -273,6 +306,77 @@ def test_a_long_form_bind_mount_of_the_ledger_is_seen():
         "the short-form mount stopped being parsed, so a parse that returns "
         f"nothing at all would satisfy the assertion above: {mounts}"
     )
+
+
+_ONE_DIRECTORY_DEEPER = """
+services:
+  immudb:
+    volumes:
+      - type: bind
+        source: ./ledger-on-the-host
+        target: /var/lib/immudb/data
+  control-plane:
+    volumes:
+      - ./config:/database-config
+      - control-plane-data:/data
+
+volumes:
+  control-plane-data:
+"""
+
+
+def test_a_stateful_mount_one_directory_deeper_is_seen():
+    """P3c3h-5 (Phase 3c-3h). The exact match, and the boundary the prefix
+    match needs so that the fix is not a false positive.
+
+    **The sub-path case.** `/var/lib/immudb/data` is where ImmuDB actually
+    writes, one directory below the listed root. Under the old exact match the
+    mount was skipped entirely and `assert covered` was satisfied by the other
+    services' mounts, so a host bind of the ledger read `6 passed` while the
+    identical bind one directory up read `1 failed`. Both reproduced in this
+    phase at those counts before the fix.
+
+    **The boundary case.** `/database-config` starts with `/data` as a string
+    and is not inside it as a path. A bare `startswith` would make an ordinary
+    config bind a stateful mount and refuse it, which turns a missed ledger
+    into a refused config file. Both directions are driven here, because a
+    rule fixed in one direction and broken in the other is one defect traded
+    for another.
+
+    Driven through the check the compose files go through, not through
+    `is_stateful` alone, so this asserts what the test does.
+    """
+    mounts, declared = _parse(_ONE_DIRECTORY_DEEPER)
+
+    stateful = [(service, source, target) for service, source, target in mounts
+                if is_stateful(target)]
+    assert ("immudb", "./ledger-on-the-host", "/var/lib/immudb/data") in stateful, (
+        "a host bind of ImmuDB's real data directory, one level below the "
+        f"listed root, is not seen as a stateful mount: {mounts}")
+
+    offenders = [f"{source} at {target}" for service, source, target in stateful
+                 if source.startswith(".") or source.startswith("/")]
+    assert offenders, (
+        "the ledger bound to a host path one directory below the listed root "
+        "is not refused, so a ledger that survives every `down -v` this "
+        f"project performs passes this module: {stateful}")
+
+    # The boundary. `/database-config` is not inside `/data`.
+    assert not is_stateful("/database-config"), (
+        "`/database-config` is reported as a mount inside the stateful root "
+        "`/data`, so the prefix match has no segment boundary and an ordinary "
+        "config bind is now refused as a ledger")
+    assert ("control-plane", "./config", "/database-config") not in stateful, (
+        f"the config bind was swept into the stateful set: {stateful}")
+
+    # And the control for the boundary: the root itself, and a real path
+    # under it, are both still inside.
+    assert is_stateful("/data"), "the root itself stopped matching"
+    assert is_stateful("/data/verifier-state/immudb.state"), (
+        "a path below a stateful root stopped matching, so the assertion "
+        "above would hold against a rule that matches nothing")
+    assert ("control-plane", "control-plane-data", "/data") in mounts, (
+        f"the short-form mount stopped being parsed: {mounts}")
 
 
 def test_an_external_volume_is_seen_whatever_case_yaml_spells_true_in():

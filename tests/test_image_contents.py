@@ -112,6 +112,42 @@ not found, and `ecdsa/__pycache__/ssh.cpython-311.pyc`, which carries the
 OpenSSH magic string as a constant because it is the module that parses the
 format, is correctly not a hit.
 
+**Phase 3c-3h (P3c3h-5): the composition bound, stated with its measured gap.**
+The detector composes exactly ONE step. `key_material` tries the armour rule
+and the binary rule on the raw head; then it decompresses one gzip member and
+offers the result to those same two rules; then it decodes each base64 run and
+offers the result to those same two rules. It never offers a decoded base64
+body to the gzip rule, never offers a decompressed gzip member to the base64
+loop, and never decodes twice. So a key wrapped twice is not key material to
+this detector, and the 3c-3g red team measured it against the live
+`keys/writer-decision.key`, reproduced here at the same shapes:
+
+    raw PEM                232 -> 'pem'                 base64(gzip(PEM))  284 -> None
+    base64(PEM)            312 -> 'base64-pem'          gzip(base64(PEM))  269 -> None
+    gzip(PEM)              212 -> 'gzip-pem'            base64(base64(PEM))416 -> None
+    raw DER                121 -> 'sec1-der'            base64(gzip(DER))  192 -> None
+    base64(DER)            164 -> 'base64-sec1-der'
+
+Every undetected shape is one composition step from a detected one in the same
+table, which is what makes the right column a measurement rather than a list
+of things a detector does not do. `base64(gzip(key))` is not contrived: a
+Kubernetes Secret is base64 by definition and gzipping before storing is an
+ordinary size optimisation.
+
+**Stated rather than extended, and that is a decision with a reason.** The
+extension is not one conjunct: it is recursion with a depth budget, and its
+cost falls on the base64 loop, which would then re-scan every decoded body for
+base64 runs. The bound this file already keeps - 16 KiB heads, every base64
+run - was bought with a measurement on the real four-image surface (17.7s to
+18.5s for dropping the twenty-run cap, against 57.5s for dropping the head
+bound), and a depth-2 detector cannot be justified on this head without the
+same measurement on the same surface. Phase 3c-3h's standing rule is that no
+mechanism is added unless a demonstrated defect cannot be fixed without it, so
+the bound is stated and pinned instead: `UNDETECTED_COMPOSITIONS` below drives
+every shape in the right column, and closing the gap later fails that test,
+which is the point of writing it down. Buying the second step is a scope call
+and it is not this phase's to make - the same sentence the head bound carries.
+
 Requires the docker CLI and the images the compose stack was built from.
 """
 
@@ -475,6 +511,94 @@ KEY_ENCODINGS = {
     "gzipped-pem":      (_gzipped_pem, "gzip-pem"),
     "base64-behind-21-decoy-runs": (_base64_behind_decoys, "base64-sec1-der"),
 }
+
+
+def _twice_wrapped(outer, inner):
+    """A builder composing two wrappings, for the bound below."""
+    return lambda key: outer(inner(key))
+
+
+def _b64(blob) -> bytes:
+    import base64
+    return base64.b64encode(blob)
+
+
+def _gz(blob) -> bytes:
+    import gzip
+    import io as _io
+    buffer = _io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb") as handle:
+        handle.write(blob)
+    return buffer.getvalue()
+
+
+# P3c3h-5 (Phase 3c-3h). The measured gap of the one-step composition bound
+# stated in the module docstring, as a hand-list with its limit written down -
+# the convention `docs/reports/r6-headstate.md` sets for POST_PROOF_SITES.
+#
+# Every entry is one composition step from an entry in KEY_ENCODINGS above,
+# which is what makes this a bound rather than a list of failures. The left
+# column of that pairing is the control: if a row here started being detected
+# while its one-step neighbour above still is, the detector's shape changed
+# and this bound is stale.
+#
+# **This list is a judgement and it is not closed.** It names the compositions
+# that were built and measured; a composition nobody thought of is outside it,
+# exactly as KEY_ENCODINGS is open in the other direction. What it buys is
+# that the bound cannot drift silently in either direction.
+UNDETECTED_COMPOSITIONS = {
+    "base64-of-gzip-of-a-pem": (lambda key: _b64(_gz(key.to_pem())),
+                                "gzipped-pem"),
+    "gzip-of-base64-of-a-pem": (lambda key: _gz(_b64(key.to_pem())),
+                                "base64-of-a-pem"),
+    "base64-of-base64-of-a-pem": (lambda key: _b64(_b64(key.to_pem())),
+                                  "base64-of-a-pem"),
+    "base64-of-gzip-of-a-der": (lambda key: _b64(_gz(key.to_der())),
+                                "der-sec1"),
+}
+
+
+@pytest.mark.parametrize("composition", sorted(UNDETECTED_COMPOSITIONS))
+def test_a_twice_wrapped_key_is_outside_the_stated_composition_bound(
+        composition):
+    """The bound, driven, in both directions.
+
+    This test asserts a LIMIT rather than a guarantee, which is unusual and is
+    the point: the module docstring says the detector composes one step, and a
+    sentence in a docstring is what the Phase 3c-3d red team got past twice.
+    Driven, the sentence is falsifiable.
+
+    Two assertions per row. The neighbour one step in - the same key with one
+    wrapping removed - must still be detected, which is the control and is
+    what makes the second assertion a statement about composition depth rather
+    than about a broken detector. And the twice-wrapped shape must be
+    undetected, which is the bound.
+
+    **If this fails because a row is now DETECTED, nothing is broken and this
+    test is stale.** Someone closed the gap. Move the row into
+    `KEY_ENCODINGS` with the label the detector now gives it, and correct the
+    composition bound in the module docstring, including the measurement that
+    justified paying for it on the real four-image surface.
+    """
+    build, neighbour = UNDETECTED_COMPOSITIONS[composition]
+    key = _signing_key()
+
+    neighbour_build, neighbour_expected = KEY_ENCODINGS[neighbour]
+    assert key_material(neighbour_build(key)) == neighbour_expected, (
+        f"the control does not hold: {neighbour!r}, which is {composition!r} "
+        "with one wrapping removed, is not detected either. The row below "
+        "would then say nothing about composition depth."
+    )
+
+    blob = build(key)
+    found = key_material(blob)
+    assert found is None, (
+        f"{composition!r} is detected as {found!r}. The detector now composes "
+        "more than the one step the module docstring states, so that bound is "
+        "wrong. This is the good direction: move this row into KEY_ENCODINGS "
+        "with its label and correct the docstring, including what the second "
+        "step costs on the four-image surface."
+    )
 
 
 @pytest.mark.parametrize("encoding", sorted(KEY_ENCODINGS))

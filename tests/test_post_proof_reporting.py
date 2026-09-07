@@ -479,6 +479,149 @@ def test_a_failed_head_read_is_not_a_verification_state(verifier):
         f"positive tamper claim: {vocabulary}")
 
 
+def test_the_anchored_state_read_reports_the_anchor_and_reports_it_as_ok(
+        verifier):
+    """P3c3h-3 (Phase 3c-3h). The anchored half of `state_read`, asserted.
+
+    **The gap this closes.** `_state_read` builds a `StateRead` at five sites
+    and three of them can carry `source="anchor"`. Every assertion in this
+    file about the field drove the head. The 3c-3g red team put
+    `status="failed"` - the one word R6's vocabulary deliberately excludes,
+    because `/audit` renders it as a positive tamper claim about a record - on
+    each of the three anchored constructions in turn, and this module read
+    `12 passed` all three times. The same edit on the head branch read
+    `1 failed`, which is what says the file asserts something and not that the
+    field is unasserted everywhere.
+
+    **Why this pins the member and not the vocabulary.** All five
+    constructions sit inside `_state_read`'s `try`, so with `StateRead`'s
+    fields typed as `Literal` a mutated construction raises `ValidationError`
+    there, the `except Exception` catches it, and the caller gets a
+    well-formed `unavailable`. The forbidden word never reaches the wire -
+    that is the type working - and a test asserting only "the value is in the
+    vocabulary" would read green through exactly that. So this asserts the
+    value this path is supposed to produce: `anchor`, and `ok`.
+
+    Named mutation: `status="failed"` at the anchored OK construction
+    (`verifier/main.py`, the `return state.txId, StateRead(...)` after the
+    `_vk` check). This test must fail on the value moving to `unavailable`.
+    """
+    body = _drive(verifier, _Client(), anchor_tx=ANCHOR_ABOVE_RECORD_TX,
+                  fingerprint=lambda: "sha256:anchored")
+
+    assert body["verified"] is True, (
+        "the proof did not succeed, so this test is not exercising the "
+        f"post-proof read it describes: {body}")
+    state_read = body["state_read"]
+    assert state_read is not None, (
+        f"the anchored path reported no state read at all: {body}")
+    assert state_read["source"] == "anchor", (
+        "the anchor was supplied and a working `_rs.get()` answered, and the "
+        f"read reports it came from somewhere else: {state_read}")
+    assert state_read["status"] == verifier.STATE_READ_OK, (
+        "an anchored read that succeeded with a verifying key configured is "
+        f"`ok`; this reports {state_read['status']!r}. If it reports "
+        "'unavailable' with a ValidationError in the detail, a construction "
+        f"on this path is outside StateRead's vocabulary: {state_read}")
+    assert body["state_id"] == ANCHOR_BELOW_RECORD_TX, (
+        "state_id on the anchored path is the anchor this service persists, "
+        f"which the stub puts at {ANCHOR_BELOW_RECORD_TX}: {body}")
+
+
+def test_the_anchored_state_read_names_its_source_on_every_outcome(verifier):
+    """P3c3h-3. The other two anchored constructions, driven.
+
+    The `Literal` closes the vocabulary and does not, on its own, make a
+    mutated construction fail anything. All five sites are inside
+    `_state_read`'s `try`, so `status="failed"` at the anchored *unchecked*
+    construction raises `ValidationError` there, `except Exception` catches
+    it, and the caller gets a well-formed `unavailable`: the forbidden word
+    never reaches the wire, which is the type working, and the run reads
+    green. Measured that way in this phase - `14 passed` on that mutation with
+    only the pinned-member test above present. That is silence about the
+    mutated site, not about the property, so the two remaining anchored
+    constructions are driven here.
+
+    **One of them is not reachable through the route, and that is measured
+    rather than assumed.** `_state_read`'s anchored branch reports
+    `unchecked` when `client._vk is None`, and `POST /verify` refuses a
+    supplied anchor outright on exactly that condition
+    (`error_class="anchor_signature_failure"`, "no ImmuDB signing key is
+    configured, so a supplied anchor cannot be checked and will not be used")
+    before `_state_read` is called at all. `_state_read` has one call site,
+    `_state_read(client, payload.anchor)`, below that refusal. So the anchored
+    unchecked construction is dead on this head, and driving it through
+    `_drive` produces the route's refusal instead - which is what happened
+    when this test was first written the other way. It is driven at the
+    function, and the fact that it is unreachable from the route is the
+    finding, recorded here rather than papered over by an assertion that
+    quietly measures something else.
+    """
+    # Anchored, no verifying key: the construction, at the function.
+    unchecked_client = _Client(vk=None)
+    state_id, state_read = verifier._state_read(
+        unchecked_client, object())      # any non-None anchor selects the path
+    assert state_read.source == "anchor", state_read
+    assert state_read.status == verifier.STATE_READ_UNCHECKED, (
+        "an anchored read with no IMMUDB_SIGNING_PUBKEY configured was "
+        f"checked by nothing and does not say so: {state_read}")
+    assert "IMMUDB_SIGNING_PUBKEY" in (state_read.detail or ""), (
+        f"the read does not name what is missing: {state_read}")
+    assert state_id == ANCHOR_BELOW_RECORD_TX, state_id
+
+    # And the route does refuse this combination, so the paragraph above is
+    # a measurement and not a reading of the source.
+    refused = _drive(verifier, _Client(vk=None),
+                     anchor_tx=ANCHOR_ABOVE_RECORD_TX)
+    assert refused["verified"] is False, refused
+    assert refused["error_class"] == "anchor_signature_failure", (
+        "the route no longer refuses an anchor it cannot check, so the "
+        "anchored unchecked construction may now be reachable through "
+        f"POST /verify and should be driven there: {refused}")
+
+    # The anchor read itself fails, driven through the route. R6's rule: this
+    # is not a claim about the record, whose proof already succeeded, and the
+    # row still says which read it was that could not run.
+    from ecdsa.keys import BadSignatureError
+    unavailable = _drive(verifier,
+                         _Client(rs=_Rs(raises=BadSignatureError("anchor read"))),
+                         anchor_tx=ANCHOR_ABOVE_RECORD_TX,
+                         fingerprint=lambda: "sha256:anchored-unavailable")
+    assert unavailable["verified"] is True, (
+        "a failed post-proof state read changed the verification verdict, "
+        f"which is R6-1: {unavailable}")
+    assert unavailable["state_id"] is None, unavailable
+    assert unavailable["state_read"]["source"] == "anchor", (
+        "the anchored read failed and the row attributes the failure to the "
+        f"other read: {unavailable['state_read']}")
+    assert unavailable["state_read"]["status"] == verifier.STATE_READ_UNAVAILABLE, (
+        f"{unavailable['state_read']}")
+
+
+def test_the_state_read_vocabulary_is_closed_by_the_type(verifier):
+    """P3c3h-3. The other half: a word outside the vocabulary is refused at
+    construction, not merely absent from the constants.
+
+    `test_a_failed_head_read_is_not_a_verification_state` above asserts that
+    `"failed"` is not among three module constants, which is a statement about
+    the constants. This asserts it about the model, which is what the five
+    construction sites actually go through, and it is the assertion that does
+    not have to enumerate them.
+    """
+    import pydantic
+
+    assert verifier.StateRead(source="anchor",
+                              status=verifier.STATE_READ_OK).status == "ok"
+
+    for bad in ("failed", "OK", "", "unknown"):
+        with pytest.raises(pydantic.ValidationError):
+            verifier.StateRead(source="anchor", status=bad)
+
+    for bad in ("moon", "head_state", ""):
+        with pytest.raises(pydantic.ValidationError):
+            verifier.StateRead(source=bad, status=verifier.STATE_READ_OK)
+
+
 # ---------------------------------------------------------------------------
 # R6-3
 # ---------------------------------------------------------------------------

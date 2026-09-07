@@ -835,6 +835,30 @@ def _drive_committed_position_for():
     answer = verifier._committed_position_for(
         client, b"ail_view:decision:v1", key, 1000000042)
     assert client.asked.get("minscore") == 1000000042.0, client.asked
+    # P3c3h-5 (Phase 3c-3h), C7. `maxscore` is the other half of this site's
+    # declared bound in COVERAGE and it was asserted nowhere. The 3c-3g red
+    # team measured the difference: `maxscore` REMOVED from the call is caught
+    # by `test_every_bound_at_a_driven_read_has_a_driver`, because the
+    # derivation stops attributing the bound to the site; `maxscore` KEPT and
+    # its value destroyed (`float(attempted_seq) + 1e9`) read `24 passed`. A
+    # bound whose name is checked and whose value is not is a bound in the
+    # table only.
+    #
+    # The control for this class is on another entry and was measured in the
+    # same pass: widening `_faults_in_tx_window`'s `endKey` by 1,000,000
+    # transactions, the same shape of mutation, is caught by
+    # `test_the_bounded_read_asserts_its_bound[...]`. So this was one entry's
+    # gap and not the table's shape, which is why the fix is one assertion
+    # here rather than anything structural.
+    #
+    # What limited the harm meanwhile, stated because it is not what makes
+    # this safe: `_committed_position_for` compares the returned score against
+    # `attempted_seq` itself, so on a widened bound the code refuses what the
+    # test did not check.
+    assert client.asked.get("maxscore") == 1000000042.0, (
+        "the zScan is bounded to exactly one score, `[seq, seq]`, and this "
+        f"call asked for maxscore={client.asked.get('maxscore')!r}: "
+        f"{client.asked}")
     assert answer is None, (
         "a zScan bounded to [1000000042, 1000000042] answered with this key "
         f"at 1000000007 and the position reported was {answer}. The position "

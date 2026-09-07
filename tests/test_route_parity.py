@@ -1015,8 +1015,9 @@ def test_every_write_route_has_a_recorded_state_for_every_property():
     file being edited.
     """
     verifier = _load_verifier()
+    sites = sorted(write_routes(verifier))
     missing = []
-    for path in sorted(write_routes(verifier)):
+    for path in sites:
         for prop in PROPERTIES:
             if prop.state(path) is None:
                 missing.append(f"{path} x {prop.name!r}")
@@ -1027,6 +1028,35 @@ def test_every_write_route_has_a_recorded_state_for_every_property():
         "or it is missing. Missing is this failure. Defaulting silently to "
         "either of the other two is how POST /write-ordered went a whole "
         "phase without D40."
+    )
+
+    # P3c3h-6 (Phase 3c-3h), the other direction, and it is the direction the
+    # 3c-3g red team walked through. `missing` above only ever grows when a
+    # route ENTERS the site list. A route that LEAVES it takes its cells with
+    # it: `_cells()` builds the parametrisation from `write_routes()`, so the
+    # F2 mutation - one conjunct, `and route.path != "/write"` - dropped POST
+    # /write out of the selector, three of the four `test_the_property_holds_
+    # on_the_route` cells vanished from collection (16 node ids to 13), and
+    # the run read green. A vanished cell and a passed cell are the same
+    # green.
+    #
+    # This is the assertion `UNGATED_BY_DESIGN` already carries a few lines
+    # up, applied to `PROPERTIES`, which lacked it. Read against the union of
+    # both cell dicts and not `holds_on` alone: `state()` reads both, so a
+    # departed route recorded as does-not-apply would otherwise stay invisible
+    # - the same silence one level in.
+    recorded = set()
+    for prop in PROPERTIES:
+        recorded.update(prop.holds_on)
+        recorded.update(prop.does_not_apply_to)
+    stale = sorted(recorded - set(sites))
+    assert not stale, (
+        f"PROPERTIES records cell(s) for route(s) that are not in the site "
+        f"list: {stale}. Either the route was removed and these cells are "
+        "stale, or the selector stopped seeing a route that is still there - "
+        "and in the second case every property recorded against it silently "
+        "stopped being asserted, because the cells are parametrised from the "
+        f"selector. The site list is {sites}."
     )
 
 

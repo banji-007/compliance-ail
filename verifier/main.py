@@ -91,7 +91,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import grpc
 import uvicorn
@@ -779,10 +779,43 @@ class StateRead(BaseModel):
                         and `detail` says why. **Not a statement about the
                         record**, whose proof had already succeeded before
                         this read was attempted.
+
+    **P3c3h-3 (Phase 3c-3h): the vocabulary is the type, not a convention.**
+    Both fields were `str`, so the three constants above were a naming
+    convention that nothing enforced. The 3c-3g red team put `status="failed"`
+    on each of the three constructions that can carry `source="anchor"`, one
+    at a time, and `tests/test_post_proof_reporting.py` read `12 passed` on
+    all three; the same edit on the head branch read `1 failed`, which is what
+    separates "the assertions do not bite on the anchored path" from "nothing
+    asserts this field". `"failed"` is the one word this vocabulary
+    deliberately excludes, because `/audit` renders it as a positive tamper
+    claim about a record.
+
+    A `Literal` closes all five construction sites and the type at once, and
+    it is the whole fix: no test can enumerate constructions it does not know
+    about, and the type does not have to.
+
+    **The verifier end only.** `control_plane/main.py::_verification_from_200`
+    still passes `state_read` through as an untyped dict and `/audit` carries
+    no `response_model`, so nothing types this row on the way out of the
+    control plane. That half is recorded as carried in `TODO.md` rather than
+    closed here.
+
+    **The consequence, recorded rather than discovered later.** All five
+    constructions sit inside `_state_read`'s `try`, and a `ValidationError`
+    from a mutated site is caught by its `except Exception` and rendered as a
+    well-formed `unavailable` carrying the validation message in `detail`. So
+    a future programming error on this path becomes a silent `unavailable`
+    with a `ValidationError` string in the operator-facing text, rather than a
+    500. That is the right trade on the post-proof path, where nothing may
+    change a verdict that has already been established, and it is the reason
+    the enforcing test pins the expected member rather than testing the
+    vocabulary for membership: membership alone reads green under exactly this
+    behaviour.
     """
 
-    source: str
-    status: str
+    source: Literal["head", "anchor"]
+    status: Literal["ok", "unchecked", "unavailable"]
     detail: str | None = None
 
 
