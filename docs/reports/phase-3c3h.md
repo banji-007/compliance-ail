@@ -682,13 +682,45 @@ Every run this phase produced on `p3c3b-order`, in order:
 | `34165919599` | `d5793e4` | all code changes and the first report | success |
 | `34166518989` | `39decad` | plus the CI section and its `TODO.md` entry | success |
 | `34166913958` | `a0c2e6e` | plus this table | success |
+| `34167332033` | `6949bb1` | plus the table's own commit, docs-only | **failure**, the same defect |
 
-**The last row is the terminal one this report can name.** A commit that
-records a run id cannot contain the id of its own run, so the commit adding
-this table is covered by `34166913958` and the commit after it, if any, is
-covered by a run named in its message rather than here. The tree is unchanged
-below `docs/reports/` and `TODO.md` from `d5793e4` onward, so `34165919599` is
-the run that exercises this phase's code.
+A commit that records a run id cannot contain the id of its own run, so each
+row after `d5793e4` is a docs-only commit named by the run of the one before
+it. The tree is unchanged outside `docs/` and `TODO.md` from `d5793e4` onward,
+so `34165919599` is the run that exercises this phase's code, and it is green.
+
+**`34167332033` is the second firing of the defect above, on a docs-only
+commit**, and it is stronger evidence than the first because it names the
+record's transaction:
+
+```
+FAILED tests/test_committed_is_a_fact.py::
+       test_an_ordered_write_that_committed_is_reported_as_committed_when_its_response_is_dropped
+AssertionError: the record is in the ledger at transaction 255 and the ordered
+route says the write never happened:
+{'tx_id': None, 'seq': None, ..., 'committed': False, 'attempts': 1, ...}
+```
+
+A different test in the same module, the same `attempts: 1`, the same detail
+shape, the same branch. Two tests are exposed to it, so the defect is in the
+route and not in either fixture.
+
+### This phase does not close green on a re-run basis, and that is stated rather than averaged away
+
+The merge criterion for PR #14 was "closes green". The phase's own code is
+green (`34165919599`, and two docs-only runs after it). The branch is not
+reliably green, and it was not before this phase either: four failures in the
+last twenty five runs, of which **two are this defect, both on 2026-09-07**
+(`4d402a8` and `6949bb1`), and two are unrelated tests on 2026-09-05
+(`6f5f51b`, `5ed4779`).
+
+Re-running until it passes would produce a green that means nothing, since a
+green is the common outcome. So the position this phase takes is: the work
+commissioned is complete and green; a pre-existing intermittent defect on the
+central write path is now characterised precisely, reproduced in process,
+demonstrated not to be the one P3c3h-4 fixes, and recorded with its
+reproduction. **Whether that blocks the merge is the owner's call, and this
+report does not make it by choosing which run to quote.**
 
 **The base was already red, and what it was red about matters more than the
 green.** Run `34160811148`, head `4d402a8` - the commit this session started

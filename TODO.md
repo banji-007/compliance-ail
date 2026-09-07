@@ -89,7 +89,23 @@ which is the retry D39 refuses forever:
 
 **Why it is not covered by D45's existing reasoning.** D45 separates "the read could not run" (`null`) from "the read ran and answered" (`false`). This is a third case: the read ran, answered not-found, and was wrong. Phase 3c-3h's pre-registered negatives explicitly preserve `_committed_tx_for_value` answering ABSENT **for a key holding different bytes**, which is honest; here the key holds the same bytes and `client.get(key)` returned `None`.
 
-**Frequency.** Intermittent. `9eca2cb` green, `4d402a8` red, and the two differ by seven lines of a report; `d5793e4` (this phase's head) green. The 3c-3g red team ran the test six times on one host and got six passes.
+**It fired a second time, on a docs-only commit, and named the transaction.** Run `34167332033`, head `6949bb1`, a different test in the same file:
+
+```
+FAILED tests/test_committed_is_a_fact.py::
+       test_an_ordered_write_that_committed_is_reported_as_committed_when_its_response_is_dropped
+AssertionError: the record is in the ledger at transaction 255 and the ordered
+route says the write never happened:
+{'tx_id': None, 'seq': None, 'verified': False, 'committed': False,
+ 'attempts': 1, ..., 'detail': '<_InactiveRpcError ... StatusCode.UNAVAILABLE
+ ... "Stream removed (Socket closed)">'}
+```
+
+Same `attempts: 1`, same detail shape, same branch, and this one states the record's transaction. Two tests in one module are exposed to it, so the defect is in the route rather than in either fixture.
+
+**Frequency.** Four failures in the branch's last twenty five runs, of which two are this defect and both are from 2026-09-07: `4d402a8` and `6949bb1`. The other two (`6f5f51b`, `5ed4779`, 2026-09-05) are unrelated tests. Around this phase's work: `9eca2cb` green, `4d402a8` red, `d5793e4` green, `39decad` green, `a0c2e6e` green, `6949bb1` red. The Phase 3c-3g red team ran one of the two tests six times on one host and got six passes, so a local green says very little about it.
+
+**This is why PR #14 does not close green on a re-run basis**, and the decision to merge is not one this phase can make for the owner. See `docs/reports/phase-3c3h.md`.
 
 **Scope, and why it was not taken in 3c-3h.** The phase's instruction scoped P3c3h-4 to one change, the flag, and said to escalate rather than grow it. This is a different branch, so it is escalated here rather than folded in. Taking it means deciding what a read that answers not-found immediately after an ExecAll whose response was lost actually licenses, which is a D45-level decision and not a patch: a bounded re-read, a distinct fourth state, or `null` on that branch. Whichever it is, `test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` is the enforcing test and it already exists.
 
