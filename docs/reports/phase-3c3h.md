@@ -673,7 +673,22 @@ Probe scripts are outside the repository, in the session scratchpad under
 
 ## CI
 
-**Run `34165919599`, head `d5793e4`, conclusion `success`.** **Run `34166518989`, head `39decad`, conclusion `success`** - the same tree plus this section and its `TODO.md` entry, so it is the run that covers the phase's final head.
+Every run this phase produced on `p3c3b-order`, in order:
+
+| run | head | what the head is | conclusion |
+|---|---|---|---|
+| `34160511188` | `9eca2cb` | before this phase | success |
+| `34160811148` | `4d402a8` | before this phase, docs-only above `9eca2cb` | **failure** |
+| `34165919599` | `d5793e4` | all code changes and the first report | success |
+| `34166518989` | `39decad` | plus the CI section and its `TODO.md` entry | success |
+| `34166913958` | `a0c2e6e` | plus this table | success |
+
+**The last row is the terminal one this report can name.** A commit that
+records a run id cannot contain the id of its own run, so the commit adding
+this table is covered by `34166913958` and the commit after it, if any, is
+covered by a run named in its message rather than here. The tree is unchanged
+below `docs/reports/` and `TODO.md` from `d5793e4` onward, so `34165919599` is
+the run that exercises this phase's code.
 
 **The base was already red, and what it was red about matters more than the
 green.** Run `34160811148`, head `4d402a8` - the commit this session started
