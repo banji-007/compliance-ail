@@ -796,3 +796,10 @@ which removes `p3c3gred_test-immudb-data`, `p3c3gred_test-verifier-state` and
 `p3c3gred_test-control-plane-data`. `docker compose ls` is empty afterwards.
 The scratch clone remains on disk with the generated keys, this report, and
 `env.sh`.
+
+**2026-09-07, after this report and the 3c-3h instruction were committed and
+pushed:** the scratch clone was removed and the generated keys and `env.sh`
+were destroyed with it. The probe scripts under
+`AppData\Local\Temp\claude\probe-p3c3g-red\` were removed in the same pass.
+`docker compose ls` is empty and no container, volume or network from this run
+remains. Nothing this run generated is left on the machine.
