@@ -673,7 +673,7 @@ Probe scripts are outside the repository, in the session scratchpad under
 
 ## CI
 
-**Run `34165919599`, head `d5793e4`, conclusion `success`.**
+**Run `34165919599`, head `d5793e4`, conclusion `success`.** **Run `34166518989`, head `39decad`, conclusion `success`** - the same tree plus this section and its `TODO.md` entry, so it is the run that covers the phase's final head.
 
 **The base was already red, and what it was red about matters more than the
 green.** Run `34160811148`, head `4d402a8` - the commit this session started
@@ -745,8 +745,11 @@ it means deciding what a not-found read licenses immediately after an
 with the run id, the body, the probe shape and the enforcing test that already
 exists.
 
-**So the green on `34165919599` is one green run on an intermittent failure,
-and it is reported as that rather than as a fix.**
+**So the two greens here are two green runs on an intermittent failure, and
+they are reported as that rather than as a fix.** The base failed once in
+the three runs this branch has on record around this work (`9eca2cb` green,
+`4d402a8` red, `d5793e4` and `39decad` green), and nothing in this phase
+changed the branch that failed.
 
 ---
 
