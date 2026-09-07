@@ -1199,3 +1199,331 @@ def test_the_retry_helper_stops_on_an_honest_answer():
         lambda: "tool_call:p3c3f:probe:query_database", drive, _landed)
     assert tries == 1, tries
     assert response.json()["committed"] is True, response.json()
+
+
+# ---------------------------------------------------------------------------
+# P3c3h-4 (Phase 3c-3h). The committed-false branch, closed at the property.
+# ---------------------------------------------------------------------------
+
+def _p3c3h_verifier():
+    """A fresh verifier module, so `_seq_cache` and `_reserve_cache` from one
+    driver cannot reach another. These are module globals and the ordered
+    commit drops both on a precondition refusal, which is the retry this
+    branch turns on."""
+    import importlib.util
+    import uuid as _uuid
+
+    os.environ.setdefault("VERIFIER_WRITE_KEY", VERIFIER_WRITE_KEY)
+    os.environ.setdefault(
+        "AIL_WRITER_SIGNING_KEY", str(REPO_ROOT / "keys" / "writer-decision.key"))
+    name = "p3c3h_verifier_" + _uuid.uuid4().hex[:8]
+    spec = importlib.util.spec_from_file_location(
+        name, REPO_ROOT / "verifier" / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Got:
+    def __init__(self, tx, value):
+        self.tx = tx
+        self.value = value
+
+
+_DEAD_CHANNEL = (
+    "<_InactiveRpcError of RPC that terminated with: "
+    "status = StatusCode.UNAVAILABLE details = \"Socket closed\">"
+)
+
+
+class _DyingChannel:
+    """The ledger serves `dies_after` reads, then every call raises.
+
+    The ExecAll is refused on a PRECONDITION, which is the whole subject: the
+    request reached the wire and came back saying one of three preconditions
+    failed, and one of the three - `KeyMustNotExist` on the record key - is
+    true exactly when the record is already committed. The read that would
+    tell the three apart is `_record_key_present`, and it is the read this
+    fixture starves.
+
+    The reads in one attempt are, in order: the bound reserve, the counter,
+    and then, after the refusal, the record key. `dies_after` is therefore the
+    knob that moves the failure between the two halves of the window and, at
+    3 with the record present, produces the honest 409 control.
+    """
+
+    def __init__(self, verifier, key, value, dies_after, record_present=True):
+        self._seq_key = verifier.SEQUENCE_KEY
+        self._reserve_key = verifier.RESERVE_KEY
+        self._key = key
+        self._value = value
+        self.dies_after = dies_after
+        self.record_present = record_present
+        self.reads = 0
+        self.execalls = 0
+        self._vk = None
+        outer = self
+
+        class _Stub:
+            def ExecAll(self, request):
+                outer.execalls += 1
+                raise RuntimeError("precondition failed: KeyMustNotExist")
+
+            def CurrentState(self, _request):
+                raise RuntimeError(_DEAD_CHANNEL)
+
+        self._stub = _Stub()
+
+    def _alive(self):
+        if self.reads > self.dies_after:
+            raise RuntimeError(_DEAD_CHANNEL)
+
+    def get(self, key):
+        self.reads += 1
+        self._alive()
+        if key == self._reserve_key:
+            return _Got(1, b"1000000000")
+        if key == self._seq_key:
+            return _Got(40, b"1000000016")
+        if key == self._key and self.record_present:
+            return _Got(2, self._value)
+        return None
+
+    def zScan(self, **_kwargs):
+        self._alive()
+        return type("ZEntries", (), {"entries": []})()
+
+    def verifiedGet(self, _key):
+        raise RuntimeError(_DEAD_CHANNEL)
+
+    def set(self, _key, _value):
+        raise RuntimeError(_DEAD_CHANNEL)
+
+
+def _drive_ordered_through_a_dying_channel(dies_after, record_present=True):
+    """One `POST /write-ordered`, in process, against `_DyingChannel`."""
+    verifier = _p3c3h_verifier()
+    call_id = "p3c3h-call-0001"
+    key = f"tool_call:p3c3h-agent:{call_id}:query_database".encode()
+    value = json.dumps({"record_type": "decision", "call_id": call_id,
+                        "outcome_type": "policy_allow"},
+                       separators=(",", ":")).encode()
+    client = _DyingChannel(verifier, key, value, dies_after, record_present)
+    original = verifier._get_client
+    verifier._get_client = lambda: client
+    try:
+        payload = verifier.OrderedWriteRequest(
+            key=base64.b64encode(key).decode(),
+            value=base64.b64encode(value).decode(), view="decision")
+        return verifier.write_ordered(payload), client
+    finally:
+        verifier._get_client = original
+
+
+def test_an_ordered_write_whose_execall_reached_the_wire_never_says_committed_false():
+    """P3c3h-4, half one: the read that tells the preconditions apart cannot
+    run.
+
+    **The branch, and it is not one of D45's four states.** The ExecAll comes
+    back `precondition failed`. `_record_key_present` is the read that says
+    which precondition it was, and it swallows a read failure and answers
+    `False`, which retries. The next attempt's first act is
+    `_read_bound_reserve`, which is not guarded, and on the same dead channel
+    it raises something that is not `OrderedCommitUncertain` - so
+    `write_ordered`'s bottom handler, whose comment says "Nothing reached the
+    wire", answered `committed: false` about a record that can be in the
+    ledger. It refutes P3c3e-2, whose rule was that the exception TYPE carries
+    whether the request reached the wire.
+
+    Measured before the fix in this phase, and it is the CI failure's exact
+    shape: `committed: false`, `attempts: 0`, one ExecAll issued, four reads
+    attempted, `StatusCode.UNAVAILABLE` in the detail.
+
+    **What is pinned here is `not false`, not a particular answer.** On this
+    branch the record-key read is exactly what cannot run, so the service has
+    no evidence for a 409's "already committed" claim either; asserting that
+    would be the same lie pointed the other way, plus a permanent refusal. The
+    honest answers are D45's existing two: `true` when the read-back finds the
+    record, `null` when it cannot.
+    """
+    response, client = _drive_ordered_through_a_dying_channel(dies_after=2)
+
+    assert client.execalls == 1, (
+        "the fixture did not put an ExecAll on the wire, so this test is not "
+        f"exercising the branch it describes: {client.execalls} ExecAlls")
+    assert response.committed is not False, (
+        "an ordered write whose ExecAll reached the wire and came back on a "
+        "precondition reported that the record is not in the ledger. One of "
+        "the three preconditions that produce that refusal is KeyMustNotExist "
+        "on the record key, which is true exactly when the record IS "
+        f"committed: {response}")
+    assert response.committed is None, (
+        "the read-back could not run either, so the honest answer is that "
+        f"whether the record committed is not established: {response}")
+    assert response.attempts == 2, (
+        "the response understates the work the ledger did. `attempts: 0` on "
+        f"this branch was part of the original finding: {response}")
+
+
+def test_the_second_half_of_the_window_is_closed_too():
+    """P3c3h-4, half two: the record-key read RUNS and the channel dies after
+    it, for an unrelated reason.
+
+    This is why the fix is the property and not the named read. Guarding
+    `_record_key_present` alone would close the half above and leave this one
+    open: here that read works and honestly answers "no record", the loop
+    continues because the refusal was one of the two retryable preconditions,
+    and the next attempt's unguarded `_read_bound_reserve` is what meets the
+    dead channel. Nothing about `_record_key_present` is involved, and before
+    the fix this answered `committed: false` with one ExecAll issued, exactly
+    as half one did.
+
+    The flag covers both because it is a fact about the call rather than about
+    which read failed: once an ExecAll has been issued, an exception leaving
+    `_ordered_commit` carries that, and `committed: false` is unreachable from
+    every caller.
+    """
+    response, client = _drive_ordered_through_a_dying_channel(
+        dies_after=3, record_present=False)
+
+    assert client.execalls == 1, client.execalls
+    assert client.reads > 3, (
+        "the channel did not survive the record-key read, so this is half one "
+        f"again rather than the second half: {client.reads} reads")
+    assert response.committed is not False, (
+        "the channel died between attempts for a reason that has nothing to "
+        "do with the record-key read, and the route still reported that the "
+        f"record is not in the ledger: {response}")
+    assert response.committed is None, response
+
+
+def test_the_ordered_route_still_refuses_a_key_it_can_see_is_committed():
+    """P3c3h-4, the control. The 409 is the answer on the branch where the
+    read WORKS, and it is unbroken.
+
+    One read's difference from half one. `RecordKeyExists` passes through
+    `_ordered_commit`'s new handler unconverted on purpose: it is the branch
+    where the record-key read ran and answered yes, so the refusal is
+    established rather than guessed. Without this the two tests above would
+    pass against a route that had simply stopped refusing anything.
+    """
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as refused:
+        _drive_ordered_through_a_dying_channel(dies_after=3,
+                                               record_present=True)
+
+    assert refused.value.status_code == 409, (
+        f"the ordered route answered {refused.value.status_code} where the "
+        f"record key is present in the ledger: {refused.value.detail}")
+    assert "already committed under this key" in str(refused.value.detail), (
+        f"the refusal does not say why: {refused.value.detail}")
+
+
+def test_a_write_that_never_reached_the_wire_still_says_committed_false():
+    """P3c3h-4, the other control, and it is the one that stops the fix from
+    being "never answer false".
+
+    `committed: false` is a real state and D45 keeps it: when nothing was
+    issued, the write did not happen and saying so is a fact. The reserve
+    disagreement is the cleanest instance - `_read_bound_reserve` raises
+    `ReserveMismatch` on the first attempt, before any ExecAll - and the flag
+    must leave it exactly where it was. A fix that answered `null` here would
+    have replaced one dishonest answer with another.
+    """
+    verifier = _p3c3h_verifier()
+    call_id = "p3c3h-call-0002"
+    key = f"tool_call:p3c3h-agent:{call_id}:query_database".encode()
+    value = json.dumps({"record_type": "decision", "call_id": call_id,
+                        "outcome_type": "policy_allow"},
+                       separators=(",", ":")).encode()
+
+    class _DisagreeingReserve(_DyingChannel):
+        def get(self, key):
+            self.reads += 1
+            if key == self._reserve_key:
+                # A reserve that is not this service's configured value.
+                return _Got(1, str(verifier.RESERVED_POSITIONS + 1).encode())
+            return super().get(key)
+
+    client = _DisagreeingReserve(verifier, key, value, dies_after=99)
+    original = verifier._get_client
+    verifier._get_client = lambda: client
+    try:
+        response = verifier.write_ordered(verifier.OrderedWriteRequest(
+            key=base64.b64encode(key).decode(),
+            value=base64.b64encode(value).decode(), view="decision"))
+    finally:
+        verifier._get_client = original
+
+    assert client.execalls == 0, (
+        "the fixture issued an ExecAll, so this is not the nothing-reached-"
+        f"the-wire branch: {client.execalls}")
+    assert response.committed is False, (
+        "a write refused before anything reached the wire is a write that did "
+        "not happen, and the route no longer says so. The flag was applied to "
+        f"a branch it does not belong on: {response}")
+
+
+def test_an_exhausted_retry_budget_reports_committed_false_from_the_ledger():
+    """P3c3h-4, the consequence, pinned rather than left to be discovered.
+
+    The flag changes this path and it is worth saying which way. When the CAS
+    budget runs out, every attempt was refused whole on a precondition, so
+    nothing was written and `committed: false` is the right answer - and it
+    used to be reached by the bottom handler assuming it, on the same rule
+    the branch above refuted. Under the flag an ExecAll HAS been issued, so
+    the exception becomes `OrderedCommitUncertain`, the route asks the ledger,
+    the record is genuinely absent, and the answer is the same `false`
+    established from a read instead of from a guess.
+
+    Two things move with it, both in the honest direction: one extra read on a
+    failure path that has already made `MAX_CAS_ATTEMPTS` round trips, and
+    `attempts` reported as what it was rather than as 0.
+
+    The pre-registered negative for this phase names exactly this case as the
+    one that stays: `_committed_tx_for_value` answering ABSENT is an answer,
+    not a guess.
+    """
+    verifier = _p3c3h_verifier()
+    verifier.MAX_CAS_ATTEMPTS = 3
+    call_id = "p3c3h-call-0003"
+    key = f"tool_call:p3c3h-agent:{call_id}:query_database".encode()
+    value = json.dumps({"record_type": "decision", "call_id": call_id,
+                        "outcome_type": "policy_allow"},
+                       separators=(",", ":")).encode()
+
+    class _AlwaysRefused(_DyingChannel):
+        """Every ExecAll refused on a RETRYABLE precondition, and the record
+        genuinely absent, so the loop runs the budget out."""
+
+        def get(self, key):
+            self.reads += 1
+            if key == self._reserve_key:
+                return _Got(1, b"1000000000")
+            if key == self._seq_key:
+                return _Got(40, b"1000000016")
+            return None
+
+    client = _AlwaysRefused(verifier, key, value, dies_after=10 ** 6,
+                            record_present=False)
+    original = verifier._get_client
+    verifier._get_client = lambda: client
+    try:
+        response = verifier.write_ordered(verifier.OrderedWriteRequest(
+            key=base64.b64encode(key).decode(),
+            value=base64.b64encode(value).decode(), view="decision"))
+    finally:
+        verifier._get_client = original
+
+    assert client.execalls == 3, (
+        f"the budget did not run out, so this is a different branch: "
+        f"{client.execalls} ExecAlls")
+    assert response.committed is False, (
+        "every attempt was refused whole and the record is absent from the "
+        f"ledger, so the write did not happen and the route must say so: "
+        f"{response}")
+    assert response.attempts == 3, (
+        "the response understates the attempts the ledger actually served: "
+        f"{response}")

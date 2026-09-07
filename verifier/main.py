@@ -1934,168 +1934,226 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
     stub = client._stub
     attempts = 0
 
-    while attempts < MAX_CAS_ATTEMPTS:
-        attempts += 1
+    # P3c3h-4 (Phase 3c-3h). The flag, and it is the whole fix.
+    #
+    # D45 made the exception TYPE carry whether the request reached the
+    # wire, and the 3c-3g red team found a path where the type is wrong.
+    # An ExecAll comes back `precondition failed`; `_record_key_present`
+    # is the read that tells the one unretryable cause from the two
+    # retryable ones, and it swallows a read failure and answers False,
+    # documented as costing an attempt. The loop continues, the next
+    # attempt's first act is `_read_bound_reserve`, which is not guarded,
+    # and on the same dead channel it raises something that is not
+    # OrderedCommitUncertain. `write_ordered`'s bottom handler then says
+    # "Nothing reached the wire" and answers `committed: false` about a
+    # record that can be in the ledger: one of the three preconditions
+    # that produce that refusal is KeyMustNotExist on the record key,
+    # which is true exactly when the record is already committed.
+    #
+    # Driven with a control, one read's difference: dies_after=2 gave
+    # `committed: false, attempts: 0` with 1 ExecAll issued, dies_after=3
+    # gave the honest 409. Reproduced in Phase 3c-3h at those numbers.
+    #
+    # **Fixing the named read would leave the property broken.** The
+    # window has two independent halves - the swallowing read and the
+    # unguarded read on the next attempt - and guarding only the first
+    # leaves the second open for any other reason the channel dies
+    # between attempts. So what is fixed is the property, not the read:
+    # once an ExecAll has been issued in this call, an exception leaving
+    # this function carries that fact, and `committed: false` is
+    # unreachable from every caller. That is the structure R6 used on the
+    # read path.
+    #
+    # RecordKeyExists passes through unconverted on purpose. It is the
+    # branch where the record-key read WORKED and answered yes, so the
+    # 409 is established rather than guessed, and the red team's control
+    # exercises it.
+    issued = False
+    next_seq = None
 
-        # D36: the reserve first, because a disagreement means this writer
-        # would allocate against a different seam than the reader pages
-        # against, and no allocation should happen under that condition.
-        bound_reserve = _read_bound_reserve(client)
-        if bound_reserve is not None and bound_reserve != RESERVED_POSITIONS:
-            raise ReserveMismatch(
-                f"this service is configured with AIL_RESERVED_POSITIONS="
-                f"{RESERVED_POSITIONS} and the ledger has {bound_reserve} bound into "
-                "it. The bound value is the one every position in this ledger was "
-                "allocated against and it cannot be moved: positions already "
-                "committed would fall inside a raised reserve, where they are "
-                "neither reconciled nor order-checked. Set this service back to "
-                f"{bound_reserve}. A reserve that is genuinely too small is a "
-                "re-index into a new view, not a moved boundary."
-            )
+    try:
+        while attempts < MAX_CAS_ATTEMPTS:
+            attempts += 1
 
-        with _seq_lock:
-            cached = _seq_cache if _SEQ_CACHE_ENABLED else None
-        if cached is None:
-            observed = _read_counter(client)
-        else:
-            observed = cached
-
-        if observed is None:
-            # First allocation ever. KeyMustNotExist is the precondition that
-            # makes exactly one writer win this, verified live: the second
-            # such ExecAll is rejected with "precondition failed:
-            # KeyMustNotExist".
-            #
-            # It starts above the reserve, not at 1, so the range history is
-            # scored into stays free even on a deployment that never runs a
-            # backfill. Making that conditional on whether history exists
-            # would put the seam in one place on one deployment and another
-            # place on the next.
-            next_seq = RESERVED_POSITIONS + 1
-            precondition = schema.Precondition(
-                keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(
-                    key=SEQUENCE_KEY
+            # D36: the reserve first, because a disagreement means this writer
+            # would allocate against a different seam than the reader pages
+            # against, and no allocation should happen under that condition.
+            bound_reserve = _read_bound_reserve(client)
+            if bound_reserve is not None and bound_reserve != RESERVED_POSITIONS:
+                raise ReserveMismatch(
+                    f"this service is configured with AIL_RESERVED_POSITIONS="
+                    f"{RESERVED_POSITIONS} and the ledger has {bound_reserve} bound into "
+                    "it. The bound value is the one every position in this ledger was "
+                    "allocated against and it cannot be moved: positions already "
+                    "committed would fall inside a raised reserve, where they are "
+                    "neither reconciled nor order-checked. Set this service back to "
+                    f"{bound_reserve}. A reserve that is genuinely too small is a "
+                    "re-index into a new view, not a moved boundary."
                 )
-            )
-        else:
-            last_seq, last_tx = observed
-            next_seq = last_seq + 1
-            precondition = schema.Precondition(
-                keyNotModifiedAfterTX=schema.Precondition.KeyNotModifiedAfterTXPrecondition(
-                    key=SEQUENCE_KEY, txID=last_tx
+
+            with _seq_lock:
+                cached = _seq_cache if _SEQ_CACHE_ENABLED else None
+            if cached is None:
+                observed = _read_counter(client)
+            else:
+                observed = cached
+
+            if observed is None:
+                # First allocation ever. KeyMustNotExist is the precondition that
+                # makes exactly one writer win this, verified live: the second
+                # such ExecAll is rejected with "precondition failed:
+                # KeyMustNotExist".
+                #
+                # It starts above the reserve, not at 1, so the range history is
+                # scored into stays free even on a deployment that never runs a
+                # backfill. Making that conditional on whether history exists
+                # would put the seam in one place on one deployment and another
+                # place on the next.
+                next_seq = RESERVED_POSITIONS + 1
+                precondition = schema.Precondition(
+                    keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(
+                        key=SEQUENCE_KEY
+                    )
                 )
+            else:
+                last_seq, last_tx = observed
+                next_seq = last_seq + 1
+                precondition = schema.Precondition(
+                    keyNotModifiedAfterTX=schema.Precondition.KeyNotModifiedAfterTXPrecondition(
+                        key=SEQUENCE_KEY, txID=last_tx
+                    )
+                )
+
+            # P3c3d-9: the allocator refuses to issue a position that is not a
+            # distinct float64 score. The reserve check catches a seam that is
+            # already past the boundary; this catches the write that would cross
+            # it, which is the other half of the same property. A ledger that
+            # reaches it is out of positions and the honest answer is a failed
+            # write, which the middleware turns into a denied call.
+            if next_seq >= MAX_POSITION:
+                raise RuntimeError(
+                    f"the next commit position would be {next_seq}, at or above 2**53 "
+                    f"({MAX_POSITION}). A position is a float64 score in a zset, so "
+                    "beyond that consecutive integers are not distinct scores and the "
+                    "index stops describing the order the ledger committed in. The "
+                    "write did not happen."
+                )
+
+            # D39: the record key is written once. This is the enforcement, not
+            # a read-then-write check - a pre-read races and this does not,
+            # because the ledger evaluates it inside the same ExecAll that would
+            # do the writing.
+            record_key_precondition = schema.Precondition(
+                keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(key=key)
             )
 
-        # P3c3d-9: the allocator refuses to issue a position that is not a
-        # distinct float64 score. The reserve check catches a seam that is
-        # already past the boundary; this catches the write that would cross
-        # it, which is the other half of the same property. A ledger that
-        # reaches it is out of positions and the honest answer is a failed
-        # write, which the middleware turns into a denied call.
-        if next_seq >= MAX_POSITION:
-            raise RuntimeError(
-                f"the next commit position would be {next_seq}, at or above 2**53 "
-                f"({MAX_POSITION}). A position is a float64 score in a zset, so "
-                "beyond that consecutive integers are not distinct scores and the "
-                "index stops describing the order the ledger committed in. The "
-                "write did not happen."
+            operations = [
+                schema.Op(kv=schema.KeyValue(key=key, value=value)),
+                schema.Op(kv=schema.KeyValue(key=SEQUENCE_KEY, value=str(next_seq).encode())),
+                schema.Op(zAdd=schema.ZAddRequest(
+                    set=view_set, score=float(next_seq), key=key, boundRef=False,
+                )),
+            ]
+            preconditions = [precondition, record_key_precondition]
+
+            if bound_reserve is None:
+                # D36: bind it here, in the same transaction, under
+                # KeyMustNotExist. On a fresh ledger this is the first
+                # allocation. On a ledger that was already allocating before
+                # this phase there is no first allocation left to catch, so the
+                # binding attaches to the next one instead - which is the
+                # earliest moment available and makes the value immutable from
+                # then on. A deployment that had already raised its reserve
+                # before upgrading binds the raised value; nothing can
+                # retroactively distinguish that, and it is stated in the
+                # report's Residual Limits rather than silently assumed away.
+                operations.append(schema.Op(kv=schema.KeyValue(
+                    key=RESERVE_KEY, value=str(RESERVED_POSITIONS).encode())))
+                preconditions.append(schema.Precondition(
+                    keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(
+                        key=RESERVE_KEY
+                    )
+                ))
+
+            request = schema.ExecAllRequest(
+                Operations=operations,
+                preconditions=preconditions,
+                noWait=False,
             )
 
-        # D39: the record key is written once. This is the enforcement, not
-        # a read-then-write check - a pre-read races and this does not,
-        # because the ledger evaluates it inside the same ExecAll that would
-        # do the writing.
-        record_key_precondition = schema.Precondition(
-            keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(key=key)
+            # P3c3h-4: set BEFORE the call and not after it. On a
+            # precondition refusal the call raises, so a flag set on the
+            # return path is never set on exactly the branch this exists for.
+            issued = True
+            try:
+                resp = stub.ExecAll(request)
+            except Exception as exc:
+                if "precondition failed" in str(exc):
+                    # D39: three preconditions can fail here and only two of them
+                    # are worth retrying. ImmuDB names the precondition type and
+                    # not the key it was about, so the one that is not retryable
+                    # is identified by asking the ledger: if the record key is
+                    # present, this attempt lost to it and every later attempt
+                    # would lose to it too, permanently.
+                    if _record_key_present(client, key):
+                        raise RecordKeyExists(
+                            f"a record is already committed under this key "
+                            f"({key.decode('utf-8', 'replace')}); the ordered route "
+                            "writes a record key once. A second write would give the "
+                            "key a second index entry at a second position, both "
+                            "resolving to the key's current transaction, which the "
+                            "order check reads as a disagreement at every limit."
+                        ) from exc
+                    # Someone else advanced the counter, or bound the reserve
+                    # first. Everything this attempt would have written was
+                    # refused together, so there is nothing to undo - drop both
+                    # stale caches and read fresh. Dropping the reserve cache
+                    # matters because KeyMustNotExist on it is the other
+                    # precondition that can fail here, and a writer that kept a
+                    # None reserve cached would retry the same losing bind
+                    # until the budget ran out.
+                    with _seq_lock:
+                        _seq_cache = None
+                    _reserve_cache = None
+                    continue
+                # D45: the request was on the wire when this raised, so whether
+                # it committed is not known here. Everything above this call can
+                # fail with nothing written; from here it cannot, and the two
+                # need different answers.
+                raise OrderedCommitUncertain(exc, next_seq, attempts) from exc
+
+            try:
+                tx_id = int(resp.id)
+            except Exception as exc:
+                # Same reason: the ExecAll returned, so it committed, and this is
+                # a response this process could not read.
+                raise OrderedCommitUncertain(exc, next_seq, attempts) from exc
+            with _seq_lock:
+                _seq_cache = (next_seq, tx_id)
+            if bound_reserve is None:
+                _reserve_cache = RESERVED_POSITIONS
+            return tx_id, next_seq, attempts
+
+        raise RuntimeError(
+            f"sequence allocation gave up after {attempts} rejected attempts; "
+            "the ledger write did not happen"
         )
-
-        operations = [
-            schema.Op(kv=schema.KeyValue(key=key, value=value)),
-            schema.Op(kv=schema.KeyValue(key=SEQUENCE_KEY, value=str(next_seq).encode())),
-            schema.Op(zAdd=schema.ZAddRequest(
-                set=view_set, score=float(next_seq), key=key, boundRef=False,
-            )),
-        ]
-        preconditions = [precondition, record_key_precondition]
-
-        if bound_reserve is None:
-            # D36: bind it here, in the same transaction, under
-            # KeyMustNotExist. On a fresh ledger this is the first
-            # allocation. On a ledger that was already allocating before
-            # this phase there is no first allocation left to catch, so the
-            # binding attaches to the next one instead - which is the
-            # earliest moment available and makes the value immutable from
-            # then on. A deployment that had already raised its reserve
-            # before upgrading binds the raised value; nothing can
-            # retroactively distinguish that, and it is stated in the
-            # report's Residual Limits rather than silently assumed away.
-            operations.append(schema.Op(kv=schema.KeyValue(
-                key=RESERVE_KEY, value=str(RESERVED_POSITIONS).encode())))
-            preconditions.append(schema.Precondition(
-                keyMustNotExist=schema.Precondition.KeyMustNotExistPrecondition(
-                    key=RESERVE_KEY
-                )
-            ))
-
-        request = schema.ExecAllRequest(
-            Operations=operations,
-            preconditions=preconditions,
-            noWait=False,
+    except (OrderedCommitUncertain, RecordKeyExists):
+        # Both already say what they know. Converting either would lose it.
+        raise
+    except Exception as exc:
+        if not issued:
+            raise
+        # An ExecAll was on the wire in this call and something after it
+        # failed. Whether the record committed is a question for the
+        # ledger, which is exactly what OrderedCommitUncertain makes the
+        # caller ask.
+        logger.error(
+            "ordered write: an ExecAll had been issued when this call "
+            "failed with %s: %s. Whether the record committed is not "
+            "known here.", type(exc).__name__, exc,
         )
-
-        try:
-            resp = stub.ExecAll(request)
-        except Exception as exc:
-            if "precondition failed" in str(exc):
-                # D39: three preconditions can fail here and only two of them
-                # are worth retrying. ImmuDB names the precondition type and
-                # not the key it was about, so the one that is not retryable
-                # is identified by asking the ledger: if the record key is
-                # present, this attempt lost to it and every later attempt
-                # would lose to it too, permanently.
-                if _record_key_present(client, key):
-                    raise RecordKeyExists(
-                        f"a record is already committed under this key "
-                        f"({key.decode('utf-8', 'replace')}); the ordered route "
-                        "writes a record key once. A second write would give the "
-                        "key a second index entry at a second position, both "
-                        "resolving to the key's current transaction, which the "
-                        "order check reads as a disagreement at every limit."
-                    ) from exc
-                # Someone else advanced the counter, or bound the reserve
-                # first. Everything this attempt would have written was
-                # refused together, so there is nothing to undo - drop both
-                # stale caches and read fresh. Dropping the reserve cache
-                # matters because KeyMustNotExist on it is the other
-                # precondition that can fail here, and a writer that kept a
-                # None reserve cached would retry the same losing bind
-                # until the budget ran out.
-                with _seq_lock:
-                    _seq_cache = None
-                _reserve_cache = None
-                continue
-            # D45: the request was on the wire when this raised, so whether
-            # it committed is not known here. Everything above this call can
-            # fail with nothing written; from here it cannot, and the two
-            # need different answers.
-            raise OrderedCommitUncertain(exc, next_seq, attempts) from exc
-
-        try:
-            tx_id = int(resp.id)
-        except Exception as exc:
-            # Same reason: the ExecAll returned, so it committed, and this is
-            # a response this process could not read.
-            raise OrderedCommitUncertain(exc, next_seq, attempts) from exc
-        with _seq_lock:
-            _seq_cache = (next_seq, tx_id)
-        if bound_reserve is None:
-            _reserve_cache = RESERVED_POSITIONS
-        return tx_id, next_seq, attempts
-
-    raise RuntimeError(
-        f"sequence allocation gave up after {attempts} rejected attempts; "
-        "the ledger write did not happen"
-    )
+        raise OrderedCommitUncertain(exc, next_seq, attempts) from exc
 
 
 def _committed_position_for(client, view_set: bytes, key: bytes,
@@ -2287,8 +2345,18 @@ def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write
         )
     except Exception as exc:
         # Nothing reached the wire: the client could not be built, the
-        # reserve disagreed, the ceiling was reached, or the retry budget ran
-        # out. `committed: false` is a fact on this branch and on no other.
+        # reserve disagreed, or the ceiling was reached. `committed: false` is
+        # a fact on this branch and on no other.
+        #
+        # P3c3h-4 (Phase 3c-3h): that sentence is now enforced rather than
+        # asserted. It used to rest on the exception TYPE alone (P3c3e-2), and
+        # the 3c-3g red team drove a path that reaches here with an ExecAll on
+        # the wire: a precondition refusal, `_record_key_present` swallowing
+        # its own read failure, and the next attempt's unguarded
+        # `_read_bound_reserve` raising a plain transport error. Everything
+        # that can reach this handler after an ExecAll has been issued is
+        # converted to OrderedCommitUncertain inside `_ordered_commit`, so
+        # this branch is now exactly what its first sentence says.
         logger.error("ordered write error before the ExecAll was issued: %s", exc)
         return OrderedWriteResponse(
             tx_id=None, seq=None, verified=False, committed=False, detail=str(exc),
