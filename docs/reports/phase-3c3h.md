@@ -29,6 +29,14 @@ The first four match the 3c-3g red team's baseline figures exactly.
 
 **This is the last sub-phase of 3c.** There is no red-team pass after it.
 
+**Read the CI section before acting on this report.** The eight commissioned
+items are complete and the code they changed is green. While collecting the CI
+run, this phase found that the intermittent failure this branch has been
+carrying is a **second** `committed: false` branch that P3c3h-4 does not close,
+demonstrated rather than assumed. It fired three times in the branch's last
+seven runs. **PR #14 does not close green, and this report does not ask for
+the merge.**
+
 ---
 
 ## What this phase is, and the one exception in it
@@ -683,6 +691,7 @@ Every run this phase produced on `p3c3b-order`, in order:
 | `34166518989` | `39decad` | plus the CI section and its `TODO.md` entry | success |
 | `34166913958` | `a0c2e6e` | plus this table | success |
 | `34167332033` | `6949bb1` | plus the table's own commit, docs-only | **failure**, the same defect |
+| `34167778194` | `a7a6d93` | plus the paragraph below, docs-only | **failure**, the same defect, same transaction |
 
 A commit that records a run id cannot contain the id of its own run, so each
 row after `d5793e4` is a docs-only commit named by the run of the one before
@@ -705,22 +714,47 @@ A different test in the same module, the same `attempts: 1`, the same detail
 shape, the same branch. Two tests are exposed to it, so the defect is in the
 route and not in either fixture.
 
-### This phase does not close green on a re-run basis, and that is stated rather than averaged away
+### This phase does not close green, and that is the honest verdict
 
-The merge criterion for PR #14 was "closes green". The phase's own code is
-green (`34165919599`, and two docs-only runs after it). The branch is not
-reliably green, and it was not before this phase either: four failures in the
-last twenty five runs, of which **two are this defect, both on 2026-09-07**
-(`4d402a8` and `6949bb1`), and two are unrelated tests on 2026-09-05
-(`6f5f51b`, `5ed4779`).
+The merge criterion for PR #14 was "closes green". **It is not met, and the
+reason is not this phase's work.**
 
-Re-running until it passes would produce a green that means nothing, since a
-green is the common outcome. So the position this phase takes is: the work
-commissioned is complete and green; a pre-existing intermittent defect on the
-central write path is now characterised precisely, reproduced in process,
-demonstrated not to be the one P3c3h-4 fixes, and recorded with its
-reproduction. **Whether that blocks the merge is the owner's call, and this
-report does not make it by choosing which run to quote.**
+The phase's own code run is green: `34165919599` on `d5793e4`, the last commit
+that changes anything outside `docs/` and `TODO.md`, `575 passed`. The two
+docs-only commits after it were green too. The branch then failed twice in a
+row on further docs-only commits, on the same test, with the same body and the
+**same transaction, 255**, which is worth noting: the failure is not random
+noise, it lands at the same point in the suite, and the greens and reds differ
+only by report prose. As of the last run this report can name, the branch's
+recent history is `9eca2cb` green, `4d402a8` red, `d5793e4` green, `39decad`
+green, `a0c2e6e` green, `6949bb1` red, `a7a6d93` red: three firings of this
+defect in seven runs, all on 2026-09-07.
+
+**Re-running until it passes was available and was not done.** A green is a
+common outcome for this defect, so a green obtained that way would be a
+selected observation rather than a result, and this project's standing rule is
+that a described mechanism is not a criterion.
+
+**Why it was not fixed either.** Deciding it means deciding what a not-found
+read licenses immediately after an `ExecAll` whose response was lost: a
+bounded re-read, a distinct fourth state, or `null` on that branch. Those have
+materially different meanings for a caller, `committed`'s semantics are ADR
+material (D40, D45), and this phase's instruction scoped P3c3h-4 to one change
+and said to escalate rather than grow it. This project's standing rule is
+sharper still: no design changes beyond what is explicitly authorised, and if
+a mandated mechanism turns out not to cover what was assumed, stop and report
+rather than substitute. Taking it here would also be a **second** unvalidated
+change to the central write path in a sub-phase with no adversarial pass after
+it, when this report already flags one such change as its single exception.
+
+**So the position is:** the eight commissioned items are complete, their
+demonstrations and mutations are recorded above, and the code they changed is
+green. A pre-existing defect on the central write path, which this phase found
+while collecting its CI run, is characterised precisely, reproduced in
+process, demonstrated not to be the one P3c3h-4 closes, and recorded in
+`TODO.md` with its reproduction and the decision it needs. **PR #14 should not
+merge on the strength of this report alone.** That call, and the design
+decision under it, belong to the owner.
 
 **The base was already red, and what it was red about matters more than the
 green.** Run `34160811148`, head `4d402a8` - the commit this session started

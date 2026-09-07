@@ -105,7 +105,7 @@ Same `attempts: 1`, same detail shape, same branch, and this one states the reco
 
 **Frequency.** Four failures in the branch's last twenty five runs, of which two are this defect and both are from 2026-09-07: `4d402a8` and `6949bb1`. The other two (`6f5f51b`, `5ed4779`, 2026-09-05) are unrelated tests. Around this phase's work: `9eca2cb` green, `4d402a8` red, `d5793e4` green, `39decad` green, `a0c2e6e` green, `6949bb1` red. The Phase 3c-3g red team ran one of the two tests six times on one host and got six passes, so a local green says very little about it.
 
-**This is why PR #14 does not close green on a re-run basis**, and the decision to merge is not one this phase can make for the owner. See `docs/reports/phase-3c3h.md`.
+**It fired a third time**, run `34167778194` on `a7a6d93`, same test, same body, same transaction 255. Three firings in the branch's last seven runs, all on 2026-09-07, with the greens and reds differing only by report prose. **This is why PR #14 does not close green**, and neither the merge nor the design decision under it is one this phase can make for the owner. See `docs/reports/phase-3c3h.md`.
 
 **Scope, and why it was not taken in 3c-3h.** The phase's instruction scoped P3c3h-4 to one change, the flag, and said to escalate rather than grow it. This is a different branch, so it is escalated here rather than folded in. Taking it means deciding what a read that answers not-found immediately after an ExecAll whose response was lost actually licenses, which is a D45-level decision and not a patch: a bounded re-read, a distinct fourth state, or `null` on that branch. Whichever it is, `test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` is the enforcing test and it already exists.
 
