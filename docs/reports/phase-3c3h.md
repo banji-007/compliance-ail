@@ -709,6 +709,7 @@ Every run this phase produced on `p3c3b-order`, in order:
 | `34166913958` | `a0c2e6e` | plus this table | success |
 | `34167332033` | `6949bb1` | plus the table's own commit, docs-only | **failure**, the same defect |
 | `34167778194` | `a7a6d93` | plus the paragraph below, docs-only | **failure**, the same defect, same transaction |
+| `34447611970` | `c232797` | **D49**, the completion pass | success, `583 passed, 10 skipped` |
 
 A commit that records a run id cannot contain the id of its own run, so each
 row after `d5793e4` is a docs-only commit named by the run of the one before
@@ -972,6 +973,16 @@ same false claim in narrower form and needs a history or revision read; it is
 in `TODO.md` with its reproduction shape, beside the bounded re-read that
 would turn some of D49's nulls back into facts as tuning rather than
 correctness.
+
+**The gate.** The gate agreed for this pass was the reproduction test green
+plus **one** ordinary CI run, not a run repeated until it passed. That run is
+`34447611970` on `c232797`: `583 passed, 10 skipped`, no failures. The
+deterministic in-process reproduction carries the inferential weight; the CI
+run confirms nothing else moved. It is worth saying why one run is enough here
+when this report argued at length that one green means little: before D49 the
+green was being asked to prove the absence of an intermittent defect, which it
+cannot; now the defect has an enforcing test that fails deterministically
+under five mutations, and CI is checking the rest of the suite.
 
 **Validation, with its limit.** Drivers, five mutations, the fixture check and
 CI. **Nothing adversarial.** This is the third change to the write path made
