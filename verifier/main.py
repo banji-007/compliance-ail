@@ -1478,13 +1478,31 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
                 detail="proof verification failed and the ledger could not be "
                        "read back; whether the record committed is not established",
             )
-        if state == ABSENT:
-            # Nothing under this key: the write genuinely did not land, and
-            # the bottom state is the honest one.
-            logger.error("verifiedSet: proof failed and no record is present for the key")
+        if state == NOT_FOUND:
+            # D49. **This is the sharpest of the three sites, because here the
+            # commit is not merely possible, it is known.** `verifiedSet`
+            # commits at service.VerifiableSet and every proof failure is
+            # raised after that line, so a record IS in the ledger under this
+            # key and a read that answers nothing can only be the index not
+            # having caught up.
+            #
+            # This branch used to answer `committed: false` under the comment
+            # "the write genuinely did not land", three lines below the
+            # UNKNOWN branch's comment saying the commit already happened.
+            # The two contradicted each other, and `_committed_tx_for`'s own
+            # docstring had already named this answer as "the same false claim
+            # D40 removed one branch over" while its caller went on making it.
+            # D45 fixed the read and left the caller.
+            logger.error(
+                "verifiedSet: proof failed, so the commit precedes it, and the "
+                "read that would name its transaction found nothing under the "
+                "key; whether the record committed is not established"
+            )
             return WriteResponse(
-                tx_id=None, verified=False, committed=False, error_class=error_class,
-                detail="proof verification failed; no record was committed",
+                tx_id=None, verified=False, committed=None, error_class=error_class,
+                detail="proof verification failed; the commit precedes the proof "
+                       "and the ledger reported nothing under this key, so whether "
+                       "the record committed is not established",
             )
         fault_key, fault_error = _write_fault_record(
             client, record_key=key, record_value=value, tx_id=tx_id, seq=None,
@@ -1532,7 +1550,23 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
                 detail=f"{exc}; the ledger could not be read back, so whether "
                        "the record committed is not established",
             )
+        if state == NOT_FOUND:
+            # D49: the write raised, so it may have committed, and the read
+            # answered nothing - which in this window is not evidence that it
+            # did not. Same treatment as the ordered route's branch.
+            logger.error(
+                "verifiedSet: the write raised and the ledger reported nothing "
+                "under the key, which does not establish that it did not "
+                "commit: %s", exc,
+            )
+            return WriteResponse(
+                tx_id=None, verified=False, committed=None,
+                detail=f"{exc}; the ledger reported nothing under this key, "
+                       "which does not establish that the write did not commit",
+            )
         if state == ABSENT:
+            # A different record holds this key. That is a positive read and
+            # it does say this write did not land.
             return WriteResponse(tx_id=None, verified=False, committed=False,
                                  detail=str(exc))
         logger.error(
@@ -1584,10 +1618,30 @@ def write(payload: WriteRequest, _: None = Depends(_require_write_key)):
 # tombstone committed at 121, 772 bytes of payload still in the store and
 # content writes for that call_id frozen at 409.
 #
-# Three answers, so the caller is never told a fact this service does not
-# have. `unknown` is what a response reports as `committed: null`.
+# Four answers, so the caller is never told a fact this service does not
+# have. `unknown` and `not found` are what a response reports as
+# `committed: null`.
+#
+# D49 (Phase 3c-3h completion, run `d49-absent`): `absent` used to carry two
+# readings and only one of them is evidence.
+#
+#   * `not found` - the ledger answered and nothing is under this key. Taken
+#     in the window right after a commit was issued, that answer is not
+#     evidence of absence: a key this call just wrote is invisible until the
+#     index catches up, and a not-found is indistinguishable from lag at the
+#     moment it is taken. D45 separated "the read could not run" from "the
+#     read ran and answered"; this is a third case, the read ran, answered,
+#     and the answer was not evidence.
+#   * `absent` - the ledger answered and something ELSE is under this key,
+#     holding different bytes. That is a positive read and it does say this
+#     write did not land, so it stays what it was.
+#
+# The split is internal. The response vocabulary is unchanged and still
+# `true` / `false` / `null`: a fourth wire state would push a distinction
+# into every consumer when `null` already means "cannot assert".
 PRESENT = "present"
 ABSENT = "absent"
+NOT_FOUND = "not found"
 UNKNOWN = "unknown"
 
 
@@ -1608,7 +1662,11 @@ def _committed_tx_for_value(client, key: bytes, value: bytes) -> tuple[str, int 
     except Exception as exc:
         logger.error("Could not read back a key whose write raised: %s", exc)
         return UNKNOWN, None
-    if got is None or got.value != value:
+    if got is None:
+        # D49: nothing under the key. Not evidence of absence in the window
+        # this is called in; see the vocabulary above.
+        return NOT_FOUND, None
+    if got.value != value:
         return ABSENT, None
     return PRESENT, int(got.tx)
 
@@ -1635,7 +1693,9 @@ def _committed_tx_for(client, key: bytes) -> tuple[str, int | None]:
         logger.error("Could not read back a key whose proof failed: %s", exc)
         return UNKNOWN, None
     if got is None:
-        return ABSENT, None
+        # D49: the only reading this function has, and on this path the
+        # commit is known to have happened, so it can only be lag.
+        return NOT_FOUND, None
     return PRESENT, int(got.tx)
 
 
@@ -1815,6 +1875,37 @@ class ReserveMismatch(RuntimeError):
     """The ledger's bound reserve is not the reserve this service is configured
     with. Fail closed: a writer allocating against one seam and a reader
     paging against another is the condition D36 exists to make impossible."""
+
+
+class SequenceBudgetExhausted(RuntimeError):
+    """Every attempt was refused by the ledger, on a precondition.
+
+    D49. This is the one way out of `_ordered_commit` where an `ExecAll`
+    reached the wire and its outcome IS established: each attempt came back
+    with an explicit `precondition failed` response, so nothing was written
+    by any of them and there is no window for anything to become visible in.
+    `committed: false` is knowledge here, not a guess, and D49's rule about a
+    not-found read does not apply because there is nothing to be late.
+
+    Distinguished by type rather than by inspecting a message, and raised at
+    exactly one line. It is still converted to `OrderedCommitUncertain` by the
+    guard below, because P3c3h-4's flag is deliberately untouched; what the
+    type carries is which of the two readings the confirmation read's answer
+    should be given.
+
+    **Why the flag was not restructured instead.** "An ExecAll was issued
+    whose outcome is not known" was the first wording of this rule, and
+    implemented faithfully it makes the outcome "established" whenever
+    `_record_key_present`'s read ran, which turns P3c3h-4's second half from
+    `null` back into `false`. Measured: that spelling failed
+    `test_the_second_half_of_the_window_is_closed_too`. It is wrong for D49's
+    own reason one level in - the read that would establish nothing-under-the-
+    key is itself a not-found in the same lag window, and if the refusal came
+    from `KeyMustNotExist` on a concurrent commit then `false` sends the
+    caller into D39's permanent 409, which is the harm this whole line of work
+    exists to prevent. Only the ledger refusing every attempt establishes an
+    outcome, and that is this class.
+    """
 
 
 class OrderedCommitUncertain(RuntimeError):
@@ -2134,7 +2225,7 @@ def _ordered_commit(client, key: bytes, value: bytes, view_set: bytes):
                 _reserve_cache = RESERVED_POSITIONS
             return tx_id, next_seq, attempts
 
-        raise RuntimeError(
+        raise SequenceBudgetExhausted(
             f"sequence allocation gave up after {attempts} rejected attempts; "
             "the ledger write did not happen"
         )
@@ -2325,7 +2416,32 @@ def write_ordered(payload: OrderedWriteRequest, _: None = Depends(_require_write
                 detail=f"{exc.cause}; the ledger could not be read back, so "
                        "whether the record committed is not established",
             )
-        if state == ABSENT:
+        if state == NOT_FOUND and not isinstance(exc.cause,
+                                                 SequenceBudgetExhausted):
+            # D49, and this is the branch CI was failing on. The ExecAll's
+            # own response was lost, so the record may be committed, and the
+            # confirmation read answered nothing - which in this window is
+            # lag and not evidence. Measured in CI twice at the same
+            # transaction: the record was in the ledger at tx 255 and this
+            # route said the write never happened, with `attempts: 1`.
+            logger.error(
+                "ordered write: the ExecAll was issued, its outcome was lost, "
+                "and the ledger reported nothing under the key, which does not "
+                "establish that it did not commit"
+            )
+            return OrderedWriteResponse(
+                tx_id=None, seq=None, verified=False, committed=None,
+                attempts=exc.attempts,
+                detail=f"{exc.cause}; the ledger reported nothing under this "
+                       "key, which does not establish that the write did not "
+                       "commit",
+            )
+        if state in (ABSENT, NOT_FOUND):
+            # Two ways here and both are knowledge. A different record holds
+            # this key, which is a positive read; or every attempt was refused
+            # by the ledger on a precondition (SequenceBudgetExhausted), where
+            # nothing was written and there is no window for anything to be
+            # late in.
             return OrderedWriteResponse(
                 tx_id=None, seq=None, verified=False, committed=False,
                 attempts=exc.attempts, detail=str(exc.cause),

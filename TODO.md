@@ -68,46 +68,27 @@ Raised by the Phase 3c-3f red team with a control, re-demonstrated by the 3c-3g 
 
 **Scope.** One line: add the override file to `COMPOSE_FILES`, guarded on existence since the file is optional, and drive it with a fixture override the way `_BOTH_SPELLINGS` drives the parse. Phase 3c-3h's prefix-with-boundary fix (P3c3h-5) changed how a target is matched and did not change which files are read.
 
-### The intermittent CI failure is a second `committed: false` branch, still open
+### A bounded re-read would turn some D49 nulls back into facts (deferred tuning)
 
-Found in Phase 3c-3h while collecting the CI run for the report. **Not closed by P3c3h-4, and the natural reading that it was is wrong.**
+Raised when D49 was decided (Phase 3c-3h completion pass, run `d49-absent`, `docs/adr/0014-ordered-audit-view-index.md`).
 
-CI run `34160811148`, on `4d402a8`, `tests/test_committed_is_a_fact.py::test_a_retry_after_a_dropped_response_is_told_the_record_already_exists`:
+D49 makes a confirmation read that answers *nothing under the key* report `committed: null` when it is taken after a commit was issued, because in that window a not-found is indistinguishable from the index not having caught up. That is a correctness fix and it is complete. What it is not is optimal: every one of those calls now reports `null` where a short re-read would often have found the record and reported `true`.
 
-```
-AssertionError: the caller is being told a write that committed did not happen,
-which is the retry D39 refuses forever:
-{'tx_id': None, 'seq': None, 'verified': False, 'committed': False,
- 'attempts': 1, 'error_class': None, ...,
- 'detail': '<_InactiveRpcError ... StatusCode.UNAVAILABLE ...
-            details = "Stream removed (Socket closed)">'}
-```
+**This is tuning, not correctness.** `null` is the honest answer at the moment it is given, and `verified` is false either way so the call denies regardless. A re-read reduces how often the ledger's own account of a write says "not established" when the write in fact committed, which matters for `/audit` legibility rather than for safety.
 
-**`attempts: 1` is what identifies the branch.** `write_ordered`'s bottom handler - the one P3c3h-4's flag closes - passes no `attempts`, and `OrderedWriteResponse.attempts` defaults to 0, so that body cannot have come from it. It came from the `OrderedCommitUncertain` handler with `_committed_tx_for_value` answering ABSENT, which passes `attempts=exc.attempts`. Driven in process against a stub whose ExecAll response is cut and whose record-key read then runs and answers not-found, **with the P3c3h-4 flag in place**, reproducing the CI body exactly: `committed: False, attempts: 1, tx_id: None, seq: None` and the same detail shape.
+**Shape of the work.** A bounded retry inside `_committed_tx_for_value` and `_committed_tx_for` - a small fixed number of attempts with a short delay, bounded so a dead ledger still answers promptly - with the bound derived from a measurement of ImmuDB's actual index-visibility window rather than picked. `tests/test_committed_is_a_fact.py`'s D49 tests are the enforcing set and would need a case pinning that the bound is finite.
 
-**What is established and what is not.** Established: the read ran (it did not raise, or the answer would be `null`), it answered not-found, and the test then read the key directly out of ImmuDB and found it present. Not established: why. An ImmuDB index that has not caught up with a commit that just happened would produce exactly this, and so would other things; nothing here has measured it. The Phase 3c-3g red team said it could not establish that the branch it diagnosed was what CI hit, and this is evidence that it was not.
+### On the plain route, a stale prior version can still read as honest absence (D49 narrowing)
 
-**Why it is not covered by D45's existing reasoning.** D45 separates "the read could not run" (`null`) from "the read ran and answered" (`false`). This is a third case: the read ran, answered not-found, and was wrong. Phase 3c-3h's pre-registered negatives explicitly preserve `_committed_tx_for_value` answering ABSENT **for a key holding different bytes**, which is honest; here the key holds the same bytes and `client.get(key)` returned `None`.
+Raised and deliberately not closed when D49 was decided.
 
-**It fired a second time, on a docs-only commit, and named the transaction.** Run `34167332033`, head `6949bb1`, a different test in the same file:
+D49 splits a confirmation read's not-found (`committed: null`, not evidence) from its different-bytes answer (`committed: false`, a positive read). On the **ordered** route that split is exact: `KeyMustNotExist` means the record key has no prior version, so different bytes can only be a genuinely different record.
 
-```
-FAILED tests/test_committed_is_a_fact.py::
-       test_an_ordered_write_that_committed_is_reported_as_committed_when_its_response_is_dropped
-AssertionError: the record is in the ledger at transaction 255 and the ordered
-route says the write never happened:
-{'tx_id': None, 'seq': None, 'verified': False, 'committed': False,
- 'attempts': 1, ..., 'detail': '<_InactiveRpcError ... StatusCode.UNAVAILABLE
- ... "Stream removed (Socket closed)">'}
-```
+On the **plain** route there is no such precondition, so a key can carry prior versions. If a write commits, its response is lost, and the index has not caught up, a read can return the **previous version's** bytes. That is different-bytes, so it keeps `committed: false`, and it is the same false claim D49 removes one reading over, surviving in narrower form.
 
-Same `attempts: 1`, same detail shape, same branch, and this one states the record's transaction. Two tests in one module are exposed to it, so the defect is in the route rather than in either fixture.
+**Why it was not closed.** Telling a stale prior version from a genuinely different record needs a history or revision read (`atRevision` / `history`, both available over ImmuDB's REST API), which is new mechanism, and the window needs three things at once: a prior version under the same key, a transport failure on the write, and lag. Adding it was outside the completion pass's scope.
 
-**Frequency.** Four failures in the branch's last twenty five runs, of which two are this defect and both are from 2026-09-07: `4d402a8` and `6949bb1`. The other two (`6f5f51b`, `5ed4779`, 2026-09-05) are unrelated tests. Around this phase's work: `9eca2cb` green, `4d402a8` red, `d5793e4` green, `39decad` green, `a0c2e6e` green, `6949bb1` red. The Phase 3c-3g red team ran one of the two tests six times on one host and got six passes, so a local green says very little about it.
-
-**It fired a third time**, run `34167778194` on `a7a6d93`, same test, same body, same transaction 255. Three firings in the branch's last seven runs, all on 2026-09-07, with the greens and reds differing only by report prose. **This is why PR #14 does not close green**, and neither the merge nor the design decision under it is one this phase can make for the owner. See `docs/reports/phase-3c3h.md`.
-
-**Scope, and why it was not taken in 3c-3h.** The phase's instruction scoped P3c3h-4 to one change, the flag, and said to escalate rather than grow it. This is a different branch, so it is escalated here rather than folded in. Taking it means deciding what a read that answers not-found immediately after an ExecAll whose response was lost actually licenses, which is a D45-level decision and not a patch: a bounded re-read, a distinct fourth state, or `null` on that branch. Whichever it is, `test_a_retry_after_a_dropped_response_is_told_the_record_already_exists` is the enforcing test and it already exists.
+**Reproduction shape.** Plain route, `verifiedSet` raising a transport error, and a client whose `get` answers with an older value for the same key. The existing `test_a_different_record_under_the_key_is_still_honest_absence` is the test that would need a sibling distinguishing the two.
 
 ### `state_read` is typed at the verifier and untyped at `/audit` (F5, the other half)
 

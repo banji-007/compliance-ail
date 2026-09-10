@@ -734,6 +734,98 @@ both ends - a caller who retries anyway gets a 409 that names the key and says
 a record is already committed under it, and a caller whose write genuinely did
 not land can retry and succeed.
 
+## D49. A not-found read taken after a commit was issued is not evidence of absence
+
+Added in the Phase 3c-3h completion pass (run `d49-absent`), closing the
+intermittent CI failure that phase found and escalated rather than fixed.
+
+**What D45 left.** D45 separated two facts that had been collapsed onto one
+answer: the ledger holds nothing under this key, and this process could not
+ask. The second became `committed: null`. There is a third case, and it is the
+one CI kept failing on: **the read ran, it answered, and its answer was not
+evidence.** A key this call just wrote is invisible until the index catches
+up, so a not-found taken in that window is indistinguishable from lag at the
+moment it is taken. D45's "ran and answered" presumes the answer is evidence,
+and here it is not.
+
+**Measured, twice, at the same transaction.** Runs `34167332033` and
+`34167778194` on `p3c3b-order`:
+
+```
+AssertionError: the record is in the ledger at transaction 255 and the ordered
+route says the write never happened:
+{'tx_id': None, 'seq': None, 'verified': False, 'committed': False,
+ 'attempts': 1, ..., 'detail': '<_InactiveRpcError ...
+ StatusCode.UNAVAILABLE ... "Stream removed (Socket closed)">'}
+```
+
+`attempts: 1` is what identifies the branch, and it is why P3c3h-4's flag does
+not close this: the bottom handler that flag makes unreachable passes no
+`attempts` and the field defaults to 0, so this body came from the
+`OrderedCommitUncertain` handler on the ABSENT path. Same transaction twice
+says timing rather than corruption. Reproduced in process at
+`committed: False, attempts: 1` before the fix and `committed: None,
+attempts: 1` after.
+
+**The decision.** At every site where the confirmation read is taken after a
+commit was issued, or is known to have happened, a read answering **nothing
+under the key** reports `committed: null` with detail saying the read answered
+not-found. Three such sites, all in `verifier/main.py`:
+
+  * the ordered route's `OrderedCommitUncertain` handler (the CI branch);
+  * the plain route's transport-failure handler, which is the same epistemics
+    through a different door - fixing one of two identical branches is the
+    shape D45's own predecessor got wrong;
+  * the plain route's **proof-failure** handler, which is the sharpest of the
+    three. `verifiedSet` commits at `service.VerifiableSet` and every proof
+    failure is raised after that line, so there the commit is not merely
+    possible, it is **known**, and a read answering nothing can only be lag.
+    That branch answered `committed: false` under a comment reading "the write
+    genuinely did not land", three lines below a comment stating the commit
+    already happened, while `_committed_tx_for`'s own docstring already named
+    the answer as "the same false claim D40 removed one branch over". D45
+    fixed the read and left the caller. Both comments were corrected with this
+    change.
+
+**Different bytes stay honest absence.** `ABSENT` carried two readings and
+only one of them is lag. A read answering with a record that holds *different*
+bytes is a positive read: the ledger answered, something is there, and it is
+not what this call wrote. That is evidence and it keeps `committed: false`.
+The split is internal - a fourth constant, `NOT_FOUND` - and the response
+vocabulary is unchanged at `true` / `false` / `null`, because a fourth wire
+state would push a distinction into every consumer when `null` already means
+"cannot assert".
+
+**One exception, carried by type.** When the CAS retry budget runs out, every
+attempt came back with an explicit `precondition failed` **response**. The
+ledger refused each one, nothing was written by any of them, and there is no
+window for anything to become visible in, so `committed: false` is knowledge.
+`SequenceBudgetExhausted` is raised at exactly one line and the ABSENT branch
+reads its type.
+
+**Why the flag was not restructured instead**, recorded because the first
+wording of this rule was "an ExecAll was issued whose outcome is not known"
+and that wording is wrong. Implemented faithfully it makes the outcome
+established whenever `_record_key_present`'s read ran, which turns P3c3h-4's
+second half from `null` back into `false`; measured, that spelling failed
+`test_the_second_half_of_the_window_is_closed_too`. It is wrong for D49's own
+reason one level in: the read that would establish nothing-under-the-key is
+itself a not-found in the same lag window, and if the refusal came from
+`KeyMustNotExist` on a concurrent commit then `false` there sends the caller
+into D39's permanent 409, which is the harm this whole line of work exists to
+prevent. Only the ledger refusing every attempt establishes an outcome.
+
+**Execution is unchanged.** `verified` is false on every branch this touches,
+so `ledger/immudb_ledger.py` raises and the decision service denies the call
+exactly as before. What changes is the recorded fact and the safety of a
+retry, which is what makes this a low-risk change to a high-stakes path.
+
+**Validation, stated with its limit.** Drivers, five mutations (one per site,
+one on the vocabulary split, one on the budget tag), the fixture-termination
+check, and CI. **Nothing adversarial:** this is the third change to the write
+path made after the last red-team pass, and there is no pass after it. See
+`docs/reports/phase-3c3h.md` Residual Limits, which counts all three.
+
 ## D34. The serialisation ceiling is accepted, documented, and measured
 
 The CAS globally serialises the ledger write path: every write contends on

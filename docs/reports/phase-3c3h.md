@@ -29,13 +29,20 @@ The first four match the 3c-3g red team's baseline figures exactly.
 
 **This is the last sub-phase of 3c.** There is no red-team pass after it.
 
-**Read the CI section before acting on this report.** The eight commissioned
-items are complete and the code they changed is green. While collecting the CI
-run, this phase found that the intermittent failure this branch has been
-carrying is a **second** `committed: false` branch that P3c3h-4 does not close,
-demonstrated rather than assumed. It fired three times in the branch's last
-seven runs. **PR #14 does not close green, and this report does not ask for
-the merge.**
+**Read the CI section and the completion pass before acting on this report.**
+The eight commissioned items are complete and the code they changed is green.
+While collecting the CI run, this phase found that the intermittent failure
+this branch has been carrying is a **second** `committed: false` branch that
+P3c3h-4 does not close, demonstrated rather than assumed; it fired three times
+in the branch's last seven runs, and this report as first written escalated it
+rather than fixing it.
+
+**It was then decided as D49 and closed in a completion pass, run
+`d49-absent`**, whose section is at the end of this report. The escalation and
+the ruling that resolved it are both left standing above rather than edited
+into a single tidy account, because the sequence is the point: the phase
+reported two failures and an unruled design instead of a reconciled green, and
+the design that came back was narrower than the one first proposed.
 
 ---
 
@@ -632,16 +639,26 @@ shapes measured as undetected, each one step from a detected one. The bound is
 stated and pinned rather than bought, because buying it needs a measurement on
 the four-image surface that this head did not take.
 
-**A second `committed: false` branch is open and is the one CI intermittently
-fails on.** `_committed_tx_for_value` answering ABSENT because the ledger
-returned not-found, on a record that is in the ledger. P3c3h-4 does not touch
-it, which is demonstrated rather than argued, and the mechanism is not
-established. It is the only finding in this phase that arrived after the work
-was done, and it is escalated rather than fixed.
+**A second `committed: false` branch was open and is now closed as D49**, in
+the completion pass at the end of this report. `_committed_tx_for_value`
+answering ABSENT because the ledger returned not-found, on a record that is in
+the ledger. P3c3h-4 does not touch it, which was demonstrated rather than
+argued. It was the only finding in this phase that arrived after the work was
+done; it was escalated rather than fixed, then ruled on and fixed at three
+sites.
+
+**Three changes to the write path now sit under P3c3h-4's heading**, not one:
+the flag, D49's three sites, and the internal vocabulary split. All are
+validated by drivers, mutations and CI, and by nothing adversarial. Counting
+them as one would break the precision the termination paragraph depends on.
+
+**D49's own narrowing stays open:** on the plain route a stale prior version
+can read as different-bytes and keep the old answer. `TODO.md`.
 
 **Carried and unfixed:** R7, F5's `/audit` half, F8,
-`tests/test_record_profile.py`'s order interaction, and the branch above. All
-five in `TODO.md` with reproduction pointers.
+`tests/test_record_profile.py`'s order interaction, D49's plain-route
+narrowing, and the bounded re-read as deferred tuning. All six in `TODO.md`
+with reproduction pointers.
 
 **And the standing ones this phase did not touch:** the fault record is the
 one write that succeeds without write-time proof; an evidence bundle does not
@@ -714,7 +731,13 @@ A different test in the same module, the same `attempts: 1`, the same detail
 shape, the same branch. Two tests are exposed to it, so the defect is in the
 route and not in either fixture.
 
-### This phase does not close green, and that is the honest verdict
+### This phase did not close green as first written, and that was the honest verdict
+
+**Superseded by the completion pass below, and kept.** What follows is the
+position this report took before D49 was decided. It is not edited away: the
+verdict was right when it was written, and a report that silently became
+confident once the blocker was removed would be the thing this section exists
+to argue against.
 
 The merge criterion for PR #14 was "closes green". **It is not met, and the
 reason is not this phase's work.**
@@ -775,7 +798,7 @@ Run `34160511188` on `9eca2cb` was green, and `9eca2cb` and `4d402a8` differ
 by seven lines of a report. So the failure is intermittent and predates
 everything in this phase.
 
-### The failure is NOT the branch P3c3h-4 closes, and it is escalated rather than folded in
+### The failure is NOT the branch P3c3h-4 closes, and it was escalated rather than folded in
 
 This is worth stating plainly because the opposite reading is the natural one:
 P3c3h-4 fixes a `committed: false` on a record that committed, CI fails with
@@ -834,6 +857,127 @@ changed the branch that failed.
 
 ---
 
+## Completion pass: D49, run `d49-absent`
+
+The escalated finding above was ruled on and closed. This section is the pass
+that did it.
+
+### What was verified before anything changed
+
+The design as first stated was **"an ExecAll was issued whose outcome is not
+known"**, with two sites. Verifying it against the tree found it differed in
+two ways, and both were reported before any change was made rather than
+adapted to fit.
+
+**The condition was too broad.** Implemented faithfully - propagate whether
+`_record_key_present`'s read ran, guard on `issued and not
+outcome_established` - it made the outcome established whenever that read
+answered, which turns P3c3h-4's second half from `null` back into `false`:
+
+```
+FAILED test_the_second_half_of_the_window_is_closed_too
+       expected committed: None, got committed: False
+FAILED test_an_exhausted_retry_budget_reports_committed_false_from_the_ledger
+       attempts 0 != 3
+```
+
+The second was incidental (the bottom handler drops `attempts`) and isolating
+it left the first standing alone. That one is real: half two is `issued`-true
+with a definitive precondition refusal and a record-key read that ran, so by
+the wording's own reasoning it becomes `false` - revoking a behaviour pinned
+one phase earlier. It is wrong for D49's own reason one level in, because the
+read that would establish nothing-under-the-key is itself a not-found in the
+same lag window, and if the refusal came from `KeyMustNotExist` on a
+concurrent commit then `false` sends the caller into D39's permanent 409.
+
+The resolution taken was to leave P3c3h-4's flag untouched and mark the one
+case where the **ledger** established the outcome, `SequenceBudgetExhausted`,
+raised at one line. Measured before adoption: all five P3c3h-4 tests pass.
+
+**There were three ABSENT sites, not two**, and the third is the sharpest.
+`verifier/main.py:1481`, the plain route's proof-failure branch, is fed by
+`_committed_tx_for`, whose own docstring already said the answer was false:
+
+> "On this path the commit is already known to have happened ... so answering
+> `absent` here reported a committed record as never having been written,
+> which is the same false claim D40 removed one branch over."
+
+D45 fixed the read and left the caller, which went on answering
+`committed: false` under a comment reading "the write genuinely did not land",
+three lines below a comment saying the commit already happened. Two
+contradictory comments bracketing one branch. Both were corrected with the
+fix.
+
+**One instruction was declined as dead code, with the reason.** Carrying
+`attempts` on the budget-exhaustion raise was asked for as an incidental fix.
+Under the adopted design it is unreachable: the budget raise reaches the
+bottom handler only when nothing was issued, and there `attempts` is 0
+already. `attempts` on that path is correct via `exc.attempts` on the
+uncertain handler, measured at 3.
+
+### The fix
+
+| site | path | before | after |
+|---|---|---|---|
+| `verifier/main.py:1481` | plain, proof failure | `committed: false` | `committed: null` |
+| `verifier/main.py:1535` | plain, transport failure | `committed: false` | `committed: null` |
+| `verifier/main.py:2328` | ordered, uncertain (the CI branch) | `committed: false` | `committed: null` |
+
+`ABSENT` split internally into `ABSENT` (different bytes, a positive read,
+still `false`) and `NOT_FOUND` (nothing under the key, not evidence in this
+window). The response vocabulary is unchanged at `true` / `false` / `null`.
+
+**Demonstration.** The CI body reproduced in process, the same probe either
+side of the fix:
+
+```
+before:  CI shape -> committed: False  attempts: 1
+after:   CI shape -> committed: None   attempts: 1
+```
+
+**Enforcement.** Seven tests. One per site; one pinning that different bytes
+stay honest `false` on both routes; one pinning that an exhausted budget stays
+`false`; and two on the fixture, because converting a formerly-`false` branch
+to `null` moves it from "stop and assert" to "retry", which changes how many
+attempts the one call site using that predicate makes.
+
+**Fixture termination, driven rather than assumed.**
+`test_the_retry_helper_terminates_when_every_attempt_answers_null` drives the
+pathological input D49 makes newly reachable, every attempt answering null,
+and pins that it stops at the bound of 4 and hands the last result back.
+`cut_until_it_lands` is a bounded `for`, not a `while`, so termination is
+structural; its control test pins that `true` and `false` still stop at 1, so
+the first is not passing against a helper that always runs to the bound.
+
+**Mutations, five, each reverted before the next.**
+
+| mutation | result |
+|---|---|
+| site 3 (ordered) NOT_FOUND falls back to `false` | 1 failed, the ordered test |
+| site 2 (plain, transport) NOT_FOUND falls back to `false` | 1 failed, the plain test |
+| site 1 (plain, proof failure) NOT_FOUND falls back to `false` | 1 failed, the proof test |
+| the vocabulary split collapsed back into one ABSENT | 2 failed |
+| the budget tag removed | 2 failed, both budget tests |
+
+### What D49 does not do
+
+`verified` is false on every branch it touches, so `ledger/immudb_ledger.py`
+raises and the decision service denies the call exactly as before. **Execution
+and denial are unchanged.** What changes is the recorded fact and the safety
+of a retry.
+
+It does not distinguish a **stale prior version** from a genuinely different
+record on the plain route, where no `KeyMustNotExist` applies. That is the
+same false claim in narrower form and needs a history or revision read; it is
+in `TODO.md` with its reproduction shape, beside the bounded re-read that
+would turn some of D49's nulls back into facts as tuning rather than
+correctness.
+
+**Validation, with its limit.** Drivers, five mutations, the fixture check and
+CI. **Nothing adversarial.** This is the third change to the write path made
+after the last red-team pass, and there is no pass after it. Residual Limits
+above counts all three under one entry, which is the honest count.
+
 ## What the system claims, in full, at the end of phase 3c
 
 Every tool call an agent makes is intercepted, validated against a schema,
@@ -845,9 +989,9 @@ whose positions are allocated under a compare-and-set the ledger enforces in
 the same transaction as the record; a write reports `committed` as a fact read
 back from the ledger, or reports that it does not know, and since this
 sub-phase a write that reached the ledger can no longer be reported as never
-having happened **on the branch where the confirming read could not run** -
-one further branch, where that read runs and answers not-found about a record
-that is there, is open, measured and recorded; a proof that fails after a record has committed
+having happened, neither when the confirming read could not run nor when it
+ran and answered not-found about a record the index had not yet made visible,
+which D49 closed at all three sites that took that read; a proof that fails after a record has committed
 produces a durable, separately-signed fault record rather than a repairable
 silence; and the reserve those positions are allocated against is bound into
 the ledger itself, where four independent readers refuse to proceed on
@@ -865,10 +1009,12 @@ record resembling an exemption and not a caller writing one; the image
 detector composes one step and four twice-wrapped shapes are measured as
 undetected; a bundle is evidence of a record and not of its truth; a writer
 signature names a key and not a service; and external anchoring is the one
-fail-open subsystem in an otherwise fail-closed design. One fix in this
-sub-phase changed production behaviour after the last adversarial pass and is
-backed by its own drivers, its mutations and CI alone, and the intermittent
-CI failure it would have been natural to credit it with is a different branch
-that it demonstrably does not close. The claim the project shares at the end
+fail-open subsystem in an otherwise fail-closed design. Three changes in this
+sub-phase altered production behaviour after the last adversarial pass and are
+backed by their own drivers, their mutations and CI alone; the intermittent CI
+failure it would have been natural to credit the first of them with was a
+different branch that it demonstrably did not close, and closing that one took
+a separate decision whose first wording was refuted by its own reasoning
+before it was implemented. The claim the project shares at the end
 of 3c is smaller than the one it could have written four sub-phases ago, and
 every sentence of it has a test or a measurement behind it.

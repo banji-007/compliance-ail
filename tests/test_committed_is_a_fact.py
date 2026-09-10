@@ -1527,3 +1527,327 @@ def test_an_exhausted_retry_budget_reports_committed_false_from_the_ledger():
     assert response.attempts == 3, (
         "the response understates the attempts the ledger actually served: "
         f"{response}")
+
+
+def test_the_retry_helper_terminates_when_every_attempt_answers_null():
+    """D49's interaction with the fixture, driven rather than assumed.
+
+    **Why this needed checking.** The retry predicate is
+    `committed is not None`: it stops on `true` and on `false`, and retries on
+    `null`, because null is the confirming read not having run, which is a
+    fixture condition. D49 converts a branch that used to answer `false` into
+    `null`. Everything that branch produced therefore moves from "stop and
+    assert" to "retry the fixture", and that is the correct move - the route is
+    no longer lying, and the answer genuinely does mean the read could not
+    establish it.
+
+    What that changes is how many attempts the one call site using this
+    predicate makes, so "it should still terminate" is driven here. It does,
+    and structurally: `cut_until_it_lands` is a bounded `for` over `attempts`,
+    not a while loop, and it returns the last result whether it worked or not
+    so the caller's own guards report a fixture that never managed it.
+
+    The pathological input is the one D49 makes newly reachable: every attempt
+    answering null.
+    """
+    drive, calls = _replaying([_UNKNOWN])
+    _subject, (response, _log), tries = cut_until_it_lands(
+        lambda: "tool_call:d49:probe:query_database", drive, _landed)
+
+    assert tries == 4, (
+        f"the helper made {tries} attempts against a route answering null "
+        "every time. The bound is what makes this terminate at all.")
+    assert len(calls) == 4, calls
+    assert response.json()["committed"] is None, (
+        "the helper did not hand the last answer back, so a caller's guards "
+        f"cannot report a fixture that never managed it: {response.json()}")
+
+
+def test_the_retry_helper_still_stops_on_the_answers_d49_did_not_change():
+    """The control for the test above, so it is not passing against a helper
+    that simply always runs to the bound.
+
+    Neither of these two answers is affected by D49: `true` is the fixture
+    working, and `false` from a route that can still honestly say it - a
+    different record under the key, or every attempt refused by the ledger -
+    is an answer the caller must see rather than retry past.
+    """
+    drive, _calls = _replaying([_HONEST])
+    _subject, _result, tries = cut_until_it_lands(
+        lambda: "tool_call:d49:probe:query_database", drive, _landed)
+    assert tries == 1, tries
+
+    drive, _calls = _replaying([_A41])
+    _subject, (response, _log), tries = cut_until_it_lands(
+        lambda: "tool_call:d49:probe:query_database", drive, _landed)
+    assert tries == 1, (
+        f"the helper retried past a `committed: false` answer: {tries}")
+    assert response.json()["committed"] is False, response.json()
+
+
+# ---------------------------------------------------------------------------
+# D49 (run `d49-absent`). A not-found from the confirmation read, taken in the
+# window right after a commit was issued, is not evidence of absence.
+# ---------------------------------------------------------------------------
+
+class _CommittedButNotYetVisible:
+    """The ledger commits, its response is lost, and the read-back sees nothing.
+
+    This is the CI failure's shape and the whole subject of D49. The record IS
+    in the ledger; the confirmation read answers not-found because the index
+    has not caught up, and a not-found on a key this call just wrote is
+    indistinguishable from lag at the moment it is taken.
+
+    `ordered=False` drives the plain route instead, where `verifiedSet` raises
+    a transport error after committing.
+    """
+
+    _LOST = ('<_InactiveRpcError of RPC that terminated with: '
+             'status = StatusCode.UNAVAILABLE '
+             'details = "Stream removed (Socket closed)">')
+
+    def __init__(self, verifier, *, proof_failure=None, under_key=None):
+        self._seq_key = verifier.SEQUENCE_KEY
+        self._reserve_key = verifier.RESERVE_KEY
+        self._under_key = under_key      # what the read finds, or None
+        self.execalls = 0
+        self._vk = None
+        outer = self
+
+        class _Stub:
+            def ExecAll(self, request):
+                outer.execalls += 1
+                raise RuntimeError(outer._LOST)
+
+        self._stub = _Stub()
+        self._proof_failure = proof_failure
+
+    def get(self, key):
+        if key == self._reserve_key:
+            return _Got(1, b"1000000000")
+        if key == self._seq_key:
+            return _Got(40, b"1000000016")
+        return self._under_key
+
+    def zScan(self, **_kwargs):
+        return type("ZEntries", (), {"entries": []})()
+
+    def verifiedSet(self, _key, _value):
+        if self._proof_failure is not None:
+            raise self._proof_failure
+        raise RuntimeError(self._LOST)
+
+    def set(self, _key, _value):
+        raise RuntimeError(self._LOST)
+
+
+def _plain_write(verifier, client, key, value):
+    original = verifier._get_client
+    verifier._get_client = lambda: client
+    try:
+        return verifier.write(verifier.WriteRequest(
+            key=base64.b64encode(key).decode(),
+            value=base64.b64encode(value).decode()))
+    finally:
+        verifier._get_client = original
+
+
+def _ordered_write_inproc(verifier, client, key, value):
+    original = verifier._get_client
+    verifier._get_client = lambda: client
+    try:
+        return verifier.write_ordered(verifier.OrderedWriteRequest(
+            key=base64.b64encode(key).decode(),
+            value=base64.b64encode(value).decode(), view="decision"))
+    finally:
+        verifier._get_client = original
+
+
+def _d49_record(call_id, ordered=True):
+    """A record each route accepts.
+
+    D39 refuses a `tool_call:` key on the plain route - those allocate a
+    commit position and must take `POST /write-ordered` - so the plain-route
+    cases use the control plane's erasure tombstone, which is the one
+    production write left on that route.
+    """
+    if ordered:
+        key = f"tool_call:d49-agent:{call_id}:query_database".encode()
+        value = json.dumps({"record_type": "decision", "call_id": call_id,
+                            "outcome_type": "policy_allow"},
+                           separators=(",", ":")).encode()
+    else:
+        key = f"content_erasure:{call_id}".encode()
+        value = json.dumps({"record_type": "content_erasure",
+                            "call_id": call_id},
+                           separators=(",", ":")).encode()
+    return key, value
+
+
+def test_a_not_found_readback_after_an_issued_ordered_commit_is_not_absence():
+    """D49, site three: the branch CI was failing on.
+
+    **The measured failure.** Twice on this branch, at the same transaction:
+
+        AssertionError: the record is in the ledger at transaction 255 and the
+        ordered route says the write never happened:
+        {'committed': False, 'attempts': 1, ...
+         StatusCode.UNAVAILABLE ... "Stream removed (Socket closed)"}
+
+    `attempts: 1` is what identified it. The bottom handler passes no
+    `attempts` and the field defaults to 0, so that body came from the
+    `OrderedCommitUncertain` handler on the ABSENT path - not from the branch
+    P3c3h-4's flag closed, which is why that fix did not touch it.
+
+    D45 separated "the read could not run" (`null`) from "the read ran and
+    answered" (`false`). This is a third case: the read ran, answered
+    not-found, and the answer was not evidence, because a key this call just
+    wrote is invisible until the index catches up.
+
+    Reproduced in process at `committed: False, attempts: 1` before the fix
+    and `committed: None, attempts: 1` after.
+    """
+    verifier = _p3c3h_verifier()
+    key, value = _d49_record("d49-ordered-0001")
+    client = _CommittedButNotYetVisible(verifier)
+    response = _ordered_write_inproc(verifier, client, key, value)
+
+    assert client.execalls == 1, (
+        f"no ExecAll reached the wire, so this is a different branch: "
+        f"{client.execalls}")
+    assert response.committed is not False, (
+        "the ledger reported nothing under a key whose write was issued and "
+        "whose response was lost, and the route turned that into a positive "
+        f"claim that the record is not there: {response}")
+    assert response.committed is None, response
+    assert response.attempts == 1, (
+        f"the branch changed: this is no longer the CI shape: {response}")
+
+
+def test_a_not_found_readback_after_an_issued_plain_write_is_not_absence():
+    """D49, site two: the plain route's transport-failure branch.
+
+    `_committed_tx_for_value` is called from `write` as well, after a
+    `verifiedSet` transport error. Same epistemics, same window, same answer.
+    Fixing one of two identical branches is the P3c3e-2 shape, so both moved.
+    """
+    verifier = _p3c3h_verifier()
+    key, value = _d49_record("d49-plain-0001", ordered=False)
+    client = _CommittedButNotYetVisible(verifier)
+    response = _plain_write(verifier, client, key, value)
+
+    assert response.committed is not False, (
+        "the plain route turned a not-found read taken right after a write "
+        f"that may have committed into a claim of absence: {response}")
+    assert response.committed is None, response
+    assert response.verified is False, response
+
+
+def test_a_not_found_readback_after_a_failed_proof_is_not_absence():
+    """D49, site one, and the sharpest of the three.
+
+    Here the commit is not merely possible, it is **known**: `verifiedSet`
+    commits at `service.VerifiableSet` and every proof failure is raised after
+    that line. So a read answering nothing under the key can only be the index
+    lagging, and `committed: false` there was the false claim D40 removed one
+    branch over.
+
+    `_committed_tx_for`'s own docstring said exactly that, and its caller went
+    on making the claim anyway, under a comment reading "the write genuinely
+    did not land" three lines below the UNKNOWN branch's comment saying the
+    commit already happened. D45 fixed the read and left the caller. Both
+    comments were corrected with this change.
+    """
+    from immudb.exceptions import ErrCorruptedData
+
+    verifier = _p3c3h_verifier()
+    key, value = _d49_record("d49-proof-0001", ordered=False)
+    client = _CommittedButNotYetVisible(verifier,
+                                        proof_failure=ErrCorruptedData())
+    response = _plain_write(verifier, client, key, value)
+
+    assert response.error_class == "consistency_failure", (
+        f"this is not the proof-failure branch: {response}")
+    assert response.committed is not False, (
+        "the proof failed, which means the commit already happened, and the "
+        "route reported the record as never having been written because a "
+        f"read answered nothing: {response}")
+    assert response.committed is None, response
+
+
+def test_a_different_record_under_the_key_is_still_honest_absence():
+    """D49's other direction, and the reason the split is `got is None` rather
+    than the whole of ABSENT.
+
+    A read that answers with a record holding *different bytes* is a positive
+    read: the ledger answered, something is there, and it is not what this
+    call wrote. That is evidence, it is not lag, and Phase 3c-3h's
+    pre-registered negatives preserved it explicitly. Sweeping it into `null`
+    would have revoked a negative from the preceding phase silently, and would
+    have thrown away a fact the service actually holds.
+
+    Both routes, because both call `_committed_tx_for_value`.
+    """
+    verifier = _p3c3h_verifier()
+    other = _Got(9, b'{"record_type":"decision","call_id":"somebody-else"}')
+
+    key, value = _d49_record("d49-other-0001")
+    ordered = _ordered_write_inproc(
+        verifier, _CommittedButNotYetVisible(verifier, under_key=other),
+        key, value)
+    assert ordered.committed is False, (
+        "a different record holds this key, which is a positive read saying "
+        f"this write did not land, and the route hedged it: {ordered}")
+
+    key, value = _d49_record("d49-other-0002", ordered=False)
+    plain = _plain_write(
+        verifier, _CommittedButNotYetVisible(verifier, under_key=other),
+        key, value)
+    assert plain.committed is False, (
+        f"the same positive read on the plain route: {plain}")
+
+
+def test_every_attempt_refused_by_the_ledger_is_still_committed_false():
+    """D49's exception, and the one case where an issued ExecAll leaves an
+    established outcome.
+
+    When the CAS budget runs out, every attempt came back with an explicit
+    `precondition failed` **response**. The ledger refused each one, nothing
+    was written by any of them, and there is therefore no window for anything
+    to become visible in. `committed: false` is knowledge here, and D49's rule
+    about a not-found read does not apply because there is nothing to be late.
+
+    Carried by type, `SequenceBudgetExhausted`, raised at exactly one line,
+    rather than by restructuring P3c3h-4's flag. The first wording of D49's
+    condition was "an ExecAll was issued whose outcome is not known", and
+    implemented faithfully that makes the outcome established whenever
+    `_record_key_present`'s read ran, which turns P3c3h-4's second half from
+    `null` back into `false`. Measured: that spelling failed
+    `test_the_second_half_of_the_window_is_closed_too`. It is wrong for D49's
+    own reason one level in, and this test plus that one pin both halves of
+    the distinction.
+    """
+    verifier = _p3c3h_verifier()
+    verifier.MAX_CAS_ATTEMPTS = 3
+    key, value = _d49_record("d49-budget-0001")
+
+    class _AlwaysRefused(_DyingChannel):
+        def get(self, key):
+            self.reads += 1
+            if key == self._reserve_key:
+                return _Got(1, b"1000000000")
+            if key == self._seq_key:
+                return _Got(40, b"1000000016")
+            return None
+
+    client = _AlwaysRefused(verifier, key, value, dies_after=10 ** 6,
+                            record_present=False)
+    response = _ordered_write_inproc(verifier, client, key, value)
+
+    assert client.execalls == 3, client.execalls
+    assert response.committed is False, (
+        "every attempt was refused by the ledger on a precondition, so "
+        "nothing was written and nothing can be late; the route may state "
+        f"that as a fact: {response}")
+    assert response.attempts == 3, (
+        f"the response understates what the ledger served: {response}")
