@@ -88,13 +88,25 @@ def _network_available():
 # Helpers that drive the real services
 # ---------------------------------------------------------------------------
 
-def _write(key: bytes, value: bytes) -> dict:
+def _write(key: bytes, value: bytes, view: str | None = "decision") -> dict:
+    # D32 (Phase 3c-3b): a decision or intent record takes /write-ordered,
+    # because it needs a commit position in the same transaction that
+    # commits it and a record with no position is absent from every ordered
+    # page. P3c3c-2 (Phase 3c-3c) made that a rule the route enforces rather
+    # than a convention, so the plain route now refuses such a record
+    # outright. `view=None` keeps the plain route for the record kinds that
+    # take no position, which is what a tombstone is.
+    body = {
+        "key": base64.b64encode(key).decode(),
+        "value": base64.b64encode(value).decode(),
+    }
+    route = "/write"
+    if view is not None:
+        route = "/write-ordered"
+        body["view"] = view
     resp = httpx.post(
-        f"{VERIFIER_URL}/write",
-        json={
-            "key": base64.b64encode(key).decode(),
-            "value": base64.b64encode(value).decode(),
-        },
+        f"{VERIFIER_URL}{route}",
+        json=body,
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=30,
     )
@@ -564,27 +576,92 @@ def test_writes_continue_and_records_are_produced_with_anchoring_broken():
     """
     P3b-5, the enforcing test for the write path.
 
-    anchor-service is absent from docker-compose.test.yml, so external
-    anchoring against this stack is not merely failing, it does not exist.
-    That absence is asserted here from the compose file itself rather than
+    External anchoring against this stack is not merely failing, it does not
+    exist. That is asserted here from the compose file itself rather than
     assumed, the same way tests/test_host_port_bindings.py asserts port
-    bindings from the YAML - otherwise a future edit that quietly added the
-    service would turn this into a test of nothing.
+    bindings from the YAML - otherwise a future edit could turn this into a
+    test of nothing.
+
+    **What is asserted changed shape in Phase 3c-3c, twice.**
+
+    It used to be "anchor-service is absent from this file". P3c3c-4 puts
+    the service in the file in `AIL_ANCHOR_MODE=reconcile-only`, because the
+    sequence reconciliation lives in it and was covered by no test at all
+    while it was absent. Absence by name was never the property that
+    mattered; not anchoring is.
+
+    The first replacement enumerated the three credentials an anchoring
+    cycle needs and required each to be absent. **That was not equivalent to
+    the absence check it replaced, and a review caught it.** A blacklist
+    holds only if the enumeration is complete, and it cannot be: adding a
+    fourth path to anchoring under a name the list does not carry leaves the
+    test passing while anchoring is possible. Demonstrated rather than
+    argued - adding `AIL_ANCHOR_SUBMISSION_TOKEN` to the service left this
+    test green (`docs/reports/phase-3c3c-complete.md`).
+
+    So it is a **whitelist**. The reconcile-only service may hold exactly
+    the settings reconciliation needs and nothing else, and it may mount
+    nothing but the directory it writes its verdict to. Any addition fails,
+    whether or not anyone thought to name it, which is the property the
+    absence check had and the blacklist did not.
 
     Writes succeed anyway, records are produced, and bundles export. That is
     D23's fail-open half, running on every CI job rather than staged once.
     """
     import yaml
 
+    # Exactly what a reconcile-only pass reads. Not "the credentials we
+    # thought of": anything outside this set has to be justified by editing
+    # this list, which is the point.
+    RECONCILE_ONLY_SETTINGS = {
+        "AIL_ANCHOR_MODE",
+        "IMMUDB_URL",
+        "IMMUDB_USER",
+        "IMMUDB_PASSWORD",
+        "AIL_RESERVED_POSITIONS",
+        "AIL_RECONCILE_INTERVAL_SECONDS",
+        "AIL_RECONCILE_REPORT_PATH",
+    }
+    # And the one path it writes. A `./keys` mount would hand it signing
+    # material without any environment variable naming a credential at all,
+    # which is the second way a blacklist over `environment` misses.
+    RECONCILE_ONLY_MOUNTS = {"./tests/.reconcile"}
+
     compose = yaml.safe_load(
         (REPO_ROOT / "docker-compose.test.yml").read_text(encoding="utf-8")
     )
-    assert "anchor-service" not in compose["services"], (
-        "anchor-service is now in docker-compose.test.yml; this suite would "
-        "then depend on a shared public transparency log and on CI having "
-        "egress, and the fail-open demonstration would no longer be running "
-        "against genuinely broken anchoring"
-    )
+    anchor = compose["services"].get("anchor-service")
+    if anchor is not None:
+        environment = anchor.get("environment") or []
+        settings = dict(
+            item.split("=", 1) for item in environment if "=" in item
+        ) if isinstance(environment, list) else dict(environment)
+
+        assert settings.get("AIL_ANCHOR_MODE") == "reconcile-only", (
+            "anchor-service is in docker-compose.test.yml and is not in "
+            "reconcile-only mode; this suite would then depend on a shared "
+            "public transparency log and on CI having egress, and the "
+            "fail-open demonstration would no longer be running against "
+            f"genuinely broken anchoring. environment: {settings}"
+        )
+        unexpected = sorted(set(settings) - RECONCILE_ONLY_SETTINGS)
+        assert not unexpected, (
+            f"the reconcile-only anchor-service carries settings reconciliation "
+            f"does not read: {unexpected}. This is a whitelist on purpose - a "
+            "blacklist of the credentials an anchoring cycle needs holds only "
+            "if the enumeration is complete, and a new path to anchoring under "
+            "a name it does not carry would pass. If this setting is genuinely "
+            "needed by reconciliation, add it to RECONCILE_ONLY_SETTINGS and "
+            "say why; if it is needed by anchoring, it does not belong in this "
+            "file at all."
+        )
+        mounts = {str(v).split(":", 1)[0] for v in (anchor.get("volumes") or [])}
+        unexpected_mounts = sorted(mounts - RECONCILE_ONLY_MOUNTS)
+        assert not unexpected_mounts, (
+            f"the reconcile-only anchor-service mounts {unexpected_mounts}; a "
+            "key mount would hand it signing material with no environment "
+            "variable naming a credential at all"
+        )
 
     key, tx = _write_signed_record()
     assert tx > 0

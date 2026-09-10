@@ -302,7 +302,7 @@ All false at the end. Each derived individually.
 | Each of the four summary cards reads exactly one of the page rows or the ledger count, and its label names that scope | `tests/test_audit_read_correctness.py::test_every_stat_card_label_states_the_scope_it_is_computed_at` | test |
 | The audit page's empty state is decided by the rendered rows rather than by the ledger count | `tests/test_audit_read_correctness.py::test_the_empty_state_is_not_keyed_off_the_ledger_count` | test |
 | A page with records behind it reports `has_more` true | `tests/test_audit_read_correctness.py::test_has_more_is_true_when_records_exist_behind_the_page` | test |
-| A page that covers the whole ledger reports `has_more` false | `tests/test_audit_read_correctness.py::test_has_more_is_false_when_the_page_covers_everything_behind_it` | test |
+| A page that covers the whole ledger reports `has_more` false | `tests/test_audit_read_correctness.py::test_has_more_agrees_with_whether_the_page_was_actually_truncated` | test |
 | The response carries no cursor, continuation token or offset field | `tests/test_audit_read_correctness.py::test_the_response_carries_no_cursor` | test |
 | An erased record reads `erased` with its tombstone outside the window a page limit imposes | `tests/test_audit_read_correctness.py::test_erased_record_reads_erased_even_when_its_tombstone_is_far_down_the_ledger` | test |
 | A tombstoned record whose row survived reads `erasure_conflict` and returns no payload, with its tombstone outside that window | `tests/test_audit_read_correctness.py::test_conflicted_record_withholds_its_payload_even_when_its_tombstone_is_far_down` | test |
@@ -375,3 +375,35 @@ This is recorded rather than smoothed over. It is also worth stating plainly tha
 | `tools/audit_read_cost_probe.py` | New. The component cost breakdown in section 7.2. |
 | `TODO.md` | Blocking entry records which two halves closed; the ordering half stays open. |
 | `readME.md` | Two Residual Limits; dashboard card claims; `/audit` route description. |
+
+
+---
+
+## Erratum, 2026-09-02 (Phase 3c-3e)
+
+**Row 6's test was renamed and strengthened, and its claim stands.**
+`test_has_more_is_false_when_the_page_covers_everything_behind_it` is now
+`test_has_more_agrees_with_whether_the_page_was_actually_truncated`, and the
+backing cell is repointed rather than marked.
+
+Why it changed. The old form asked for `total + 100` rows and asserted
+`has_more is False`. That is a claim about the size of the ledger and not
+about this page: `/audit` serves at most `min(limit + 1, 2500) - 1` rows, so
+once the view holds 2499 rows the flag can never read false and the test fails
+permanently. It was one of the four order-dependent tests the Phase 3c-3d
+order sweep found - `tests/test_backfill_index.py` takes the decision view
+past 2600 rows on purpose, and alphabetical collection is the only reason CI
+never saw it (`docs/reports/phase-3c3d-order-sweep.md`).
+
+The claim in the row is unchanged because the new assertion entails it:
+`has_more` is asserted to agree with whether truncation actually happened, in
+both directions, against the view the page is selected from. A page that
+covers everything behind it still reports false, and now a page that does not
+is asserted to report true. That is strictly more than the row claims, which
+is why the row is repointed and not weakened.
+
+Section 5's table, which lists this test by name, is left as it was written:
+it is a record of what that phase did, and the name it used is the name that
+existed then.
+
+See `docs/reports/phase-3c3e.md`.

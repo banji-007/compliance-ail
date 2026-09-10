@@ -109,12 +109,22 @@ def b64(s: str) -> str:
     return base64.b64encode(s.encode()).decode()
 
 
-def verifier_write(key_raw: str, value_raw: str) -> dict:
+def verifier_write(key_raw: str, value_raw: str, view: str | None = "decision") -> dict:
+    # D32 (Phase 3c-3b): /write-ordered, because a decision or intent
+    # record now takes a commit position in the same transaction that
+    # commits it, and a record with no position is absent from every
+    # ordered page. `view` picks which view index it lands in; a
+    # tombstone is neither and keeps the plain /write route.
+    body = {"key": b64(key_raw), "value": b64(value_raw)}
+    route = "/write"
+    if view is not None:
+        route = "/write-ordered"
+        body["view"] = view
     resp = httpx.post(
-        f"{VERIFIER_URL}/write",
-        json={"key": b64(key_raw), "value": b64(value_raw)},
+        f"{VERIFIER_URL}{route}",
+        json=body,
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
-        timeout=15,
+        timeout=30,
     )
     resp.raise_for_status()
     return resp.json()
@@ -198,7 +208,15 @@ def test_per_record_route_verifies_a_written_record():
     assert verification["state"] == "verified", verification
     # Same object shape /audit puts on every row - not a different one that
     # happens to carry a state.
-    assert set(verification) == {"state", "state_id", "detail", "error_class"}, verification
+    #
+    # R6 added state_read, the sibling of state_id carrying the outcome of the
+    # read that produced it. It is in this set rather than excluded from it:
+    # every constructor of this object carries the key, null where no state
+    # was read, so that a row whose state_id is null is never bare. This
+    # assertion caught the shape splitting in two when only
+    # _verification_from_200 had been updated.
+    assert set(verification) == {"state", "state_id", "state_read", "detail",
+                                 "error_class"}, verification
     assert verification["state_id"] is not None, verification
 
 

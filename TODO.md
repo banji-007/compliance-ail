@@ -1,24 +1,120 @@
 # AIL v1.1.0 Backlog
 
-Items explicitly deferred from the hardening sprints. One item is blocking, in the section directly below; everything after it is deferred and the current build is stable and production-hardened.
+Items explicitly deferred from the hardening sprints. Nothing is blocking.
 
 ---
 
-## Blocking for Phase 3c-3
+## Blocking
 
-### `GET /audit` returns the wrong records once the ledger exceeds `limit`
-`desc: true` sorts by key, `tool_call:` keys lead with `agent_id`, so a page returns the lexicographically-largest agent ids rather than the newest decisions, and a record written seconds ago can be absent once the ledger exceeds `limit`. Observed during `p3c2-defer` at 211 entries: the newest transaction was 573 and the page's first row was not it (`docs/reports/phase-3c2.md`).
+Nothing is blocking. The current build is stable and production-hardened; everything below is deferred.
 
-**Still open. This is the ordering half, and it is Phase 3c-3b's.** Two other halves of this entry closed in Phase 3c-3a (`docs/reports/phase-3c3a.md`) and are recorded here so the remainder is not read as larger than it is:
+**Closed in Phase 3c-3b (`docs/reports/phase-3c3b.md`, ADR-0014).** `GET /audit` used to return the lexicographically-largest agent ids and call them recent, because `desc: true` walks keys and a `tool_call:` key leads with `agent_id` - so a record written seconds ago was absent once the ledger exceeded `limit` (observed during `p3c2-defer` at 211 entries, reproduced at 501 during 3c-3b). No read parameter could fix it: `scan` has no ordering option, `TxScan` is not routed over REST, and no key this project writes is temporal or monotonic. The page is now selected through a view index whose score is a position allocated under a compare-and-set the ledger enforces, committed in the same transaction as the record it indexes. The count and tombstone halves of this entry closed earlier, in Phase 3c-3a (`docs/reports/phase-3c3a.md`).
 
-- *The page no longer reports numbers it did not measure.* `total` is the ledger's own count of `tool_call:` keys rather than the page's length, `has_more` states whether records exist behind the page, and each of the four dashboard stat cards is labelled with the scope it is actually computed at. None of that changes which records a page returns, which is what this entry is about.
-- *A tombstone can no longer be hidden from the record it belongs to by an unrelated limit.* The `content_erasure:` join is an exact keyed lookup on the page's own `call_id`s, not a bounded prefix scan.
+What that phase added to the deferred list rather than closing is recorded in README's Residual Limits: the CAS globally serialises the ledger write path, so concurrency stops buying throughput, and the retry budget is an availability parameter that can deny traffic if it is set too low.
 
-What remains is exactly the ordering: the page is still served in ImmuDB key order, so it is not the most recent activity, and `has_more` is deliberately worded to claim only that more records exist behind this page - never that more recent ones do. No cursor was introduced in 3c-3a, on purpose: a cursor is a position in an ordering, and this entry is the decision to replace that ordering.
+**Closed in Phase 3c-3c (`docs/reports/phase-3c3c.md`, ADR-0014 D35/D36/D37).** The red-team pass against 3c-3b refuted eight of ten claims; that set is closed. What it added to the deferred list rather than closing is the entry immediately below, plus three Residual Limits entries in the README.
+
+**Closed in Phase 3c-3d (`docs/reports/phase-3c3d.md`, ADR-0014 D38-D42).** The red-team pass against 3c-3c refuted nine of ten claims, and a key-shape probe then established that the decision taken in response, D38 as originally written, was a rename that closed nothing. That set is closed. What it added to the deferred list rather than closing is the entry below on `/write-ordered` and a key of any shape, plus two Residual Limits entries in the README.
+
+**Closed in Phase 3c-3e (`docs/reports/phase-3c3e.md`, ADR-0014 D43-D45).** The red-team pass against 3c-3d refuted six of ten claims, and what all six had in common was one thing: a rule that has to hold at N sites, with nothing enumerating the sites. That set is closed, and the control that produced the fixes - an enumeration derived from the code, which fails until every site is covered - is now the rule rather than one test. What it added to the deferred list rather than closing is the entry below on per-test isolation, plus three Residual Limits entries in the README.
+
+**Closed in Phase 3c-3h (`docs/reports/phase-3c3h.md`), the last sub-phase of 3c.** The red-team pass against 3c-3g returned one recursive gap, seven applications and three carried findings. The pre-committed response to a recursive gap is not another generalisation: the claim is scoped to what the tests demonstrate, the limit goes to Residual Limits, and the project shares a smaller claim. So this phase added no enumeration machinery. It narrowed the route-parity and exemption-marker claims at every site that stated them, closed `state_read`'s vocabulary with a type, made a stale property cell fail instead of vanishing, corrected two bounds and a detector's stated limit, and closed the one production defect the pass diagnosed: an ordered write whose `ExecAll` reached the wire could be reported as never having happened. What it recorded as carried rather than closing is the four entries below.
 
 ---
 
 ## Deferred (v1.1.0)
+
+### Per-test isolation was never measured
+
+Raised in Phase 3c-3d's order sweep and carried through 3c-3e.
+
+The sweep ran eleven modules alone against a destroyed and rebuilt ledger and found zero hidden dependence across 118 tests, which is what bounded D44's remediation to assertion scope rather than a suite-wide rewrite of preconditions. Two residuals stand:
+
+- **Thirty-five modules were not isolated.** Nothing in the sweep data points at them and nothing excludes them.
+- **Isolation was per module, not per test.** A dependence that one test in a module satisfies for a later test in the same module is invisible to it. Per-test isolation is 442 runs, and nothing measured indicates it.
+
+The shape of the work, when it is taken: `pytest --forked` or one process per test id, against a ledger destroyed between each, with the failing set diffed against the alphabetical baseline the way the module sweep does it.
+
+### `/write-ordered` accepts a key of any shape into a view
+
+Raised in Phase 3c-3d and deliberately not taken there.
+
+D39 made both write routes refuse a `ledger_fault` record, which is what the measured injection used: a caller holding only `VERIFIER_WRITE_KEY` wrote the ledger's own account of another record's standing, and because the ordered route allocates a position, that write became a page row with `outcome_type: null` so `entries` exceeded `total`. What is not closed is the general form. The ordered route does not require the key prefix to match the requested view, so a key of some other shape written into the decision view still becomes a page row.
+
+Why it was not closed here: requiring the match would also refuse the writes `tests/test_reconciliation.py` uses to prove the reconciler finds a record indexed into the wrong view (D37, closing red-team C6a). Those writes are deliberately mismatched, and the enforcing test for a Phase 3c-3c fix would have to be rewritten to inject into the index directly. That is a design change, and this phase's rule is to escalate rather than substitute.
+
+The shape of the fix, when it is taken: a view contract in `verifier/main.py` pairing each view with the key prefix and `record_type` it indexes, refused at the route the way D39's refusal is, with the reconciliation tests re-expressed as direct `zAdd` injections.
+
+### `fault_class: verifier_unreachable` covers two materially different outcomes
+
+Raised in review of Phase 3c-3c and deliberately **not** taken as a decision in that phase. Since D35 this one closed-set class covers both:
+
+- the verifier could not be reached, or the write did not commit, so **no ledger entry exists** (the original meaning, and the structural limit ADR-0005's Documented Boundary describes: nothing can write a durable record of "the durable-record writer is down");
+- the write **committed** and its proof did not check out, so the record is in the ledger at a real transaction and position, indexed, with the counter advanced, and a `ledger_fault:` record qualifies it.
+
+Both return `outcome_type: fault, fault_class: verifier_unreachable` and the call denies either way. **This is the same collapse D1 exists to prevent, one level down**: D1's point was that a fault is distinguishable from a denial, and here two faults with opposite consequences for the audit record are not distinguishable from each other by the field a consumer switches on.
+
+Why it is deferred rather than fixed in 3c-3c. The distinction is cheap to *compute* - the write response already carries `committed`, and `ledger/immudb_ledger.py` would need to raise a typed exception rather than a bare `RuntimeError` for `decision_service/main.py` to map it - but the change is not a rename. It alters ADR-0005's closed set, which is D1's own artifact; it changes the Prometheus label collection that `tests/test_outcome_types.py::test_metric_label_set_matches_closed_collection` asserts, so any alert or dashboard keyed on the class changes meaning; and the right shape is genuinely open, because a call whose record committed unproven may not belong under the same `outcome_type` at all rather than merely under a second `fault_class`. That is an ADR-0005 conversation, and running it inside a remediation phase already closing eight refutations would make the least-examined part of that phase the taxonomy.
+
+What exists in the meantime: the distinction is available to a caller in the write response's `committed` field and on the `/audit` row's `ledger_fault`, and it is stated in ADR-0005's Documented Boundary amendment and README's Residual Limits. What is collapsed is the class name.
+
+### `COMPOSE_FILES` does not read `docker-compose.override.yml` (R7)
+
+Raised by the Phase 3c-3f red team with a control, re-demonstrated by the 3c-3g pass, carried through 3c-3h.
+
+`COMPOSE_FILES = ("docker-compose.yml", "docker-compose.test.yml")` at `tests/test_ledger_state_does_not_survive_teardown.py:33`. `docker compose` loads `docker-compose.override.yml` by default, so a stateful mount or an external volume declared there is never read by the module whose whole subject is that a ledger must not outlive `down -v`. There is no override file in the tree today, which is why this is a hole rather than an instance: the check reads a file set that is narrower than the one Compose actually composes.
+
+**Reproduction:** add `docker-compose.override.yml` binding ImmuDB's data directory to a host path, or declaring a volume `external: true`, and the module stays green.
+
+**Scope.** One line: add the override file to `COMPOSE_FILES`, guarded on existence since the file is optional, and drive it with a fixture override the way `_BOTH_SPELLINGS` drives the parse. Phase 3c-3h's prefix-with-boundary fix (P3c3h-5) changed how a target is matched and did not change which files are read.
+
+### A bounded re-read would turn some D49 nulls back into facts (deferred tuning)
+
+Raised when D49 was decided (Phase 3c-3h completion pass, run `d49-absent`, `docs/adr/0014-ordered-audit-view-index.md`).
+
+D49 makes a confirmation read that answers *nothing under the key* report `committed: null` when it is taken after a commit was issued, because in that window a not-found is indistinguishable from the index not having caught up. That is a correctness fix and it is complete. What it is not is optimal: every one of those calls now reports `null` where a short re-read would often have found the record and reported `true`.
+
+**This is tuning, not correctness.** `null` is the honest answer at the moment it is given, and `verified` is false either way so the call denies regardless. A re-read reduces how often the ledger's own account of a write says "not established" when the write in fact committed, which matters for `/audit` legibility rather than for safety.
+
+**Shape of the work.** A bounded retry inside `_committed_tx_for_value` and `_committed_tx_for` - a small fixed number of attempts with a short delay, bounded so a dead ledger still answers promptly - with the bound derived from a measurement of ImmuDB's actual index-visibility window rather than picked. `tests/test_committed_is_a_fact.py`'s D49 tests are the enforcing set and would need a case pinning that the bound is finite.
+
+### On the plain route, a stale prior version can still read as honest absence (D49 narrowing)
+
+Raised and deliberately not closed when D49 was decided.
+
+D49 splits a confirmation read's not-found (`committed: null`, not evidence) from its different-bytes answer (`committed: false`, a positive read). On the **ordered** route that split is exact: `KeyMustNotExist` means the record key has no prior version, so different bytes can only be a genuinely different record.
+
+On the **plain** route there is no such precondition, so a key can carry prior versions. If a write commits, its response is lost, and the index has not caught up, a read can return the **previous version's** bytes. That is different-bytes, so it keeps `committed: false`, and it is the same false claim D49 removes one reading over, surviving in narrower form.
+
+**Why it was not closed.** Telling a stale prior version from a genuinely different record needs a history or revision read (`atRevision` / `history`, both available over ImmuDB's REST API), which is new mechanism, and the window needs three things at once: a prior version under the same key, a transport failure on the write, and lag. Adding it was outside the completion pass's scope.
+
+**Reproduction shape.** Plain route, `verifiedSet` raising a transport error, and a client whose `get` answers with an older value for the same key. The existing `test_a_different_record_under_the_key_is_still_honest_absence` is the test that would need a sibling distinguishing the two.
+
+### `state_read` is typed at the verifier and untyped at `/audit` (F5, the other half)
+
+Raised by the Phase 3c-3g red team, half closed in 3c-3h by P3c3h-3.
+
+`StateRead.source` and `.status` are `Literal` now, so the verifier cannot construct a value outside the vocabulary. Nothing types the field on the way out of the control plane: `control_plane/main.py::_verification_from_200` passes `vdata.get("state_read")` through verbatim in all four branches, and `GET /audit` carries no `response_model` at all.
+
+**Reproduction (from the red team, against a verifier response constructed by hand):** `state_read = {"source": "moon", "status": "failed", ...}` renders on the row verbatim, as do `state_read = "failed"`, `17` and `["failed"]`. No instance is reachable from this verifier's own code, which is why this is a shape hole and not a live defect: the five construction sites are all inside `_state_read` and all now typed.
+
+**Scope.** A `response_model` on `/audit`, or a typed sibling on the row the control plane builds. The first is the bigger change and the better one, and it is a decision about `/audit`'s whole response shape rather than about this field.
+
+### The five-constructor shape test is itself a hand-list (F8)
+
+Raised by the Phase 3c-3g red team, carried through 3c-3h.
+
+`tests/test_post_proof_reporting.py::test_every_constructor_of_a_verification_object_agrees_on_its_shape` builds its `built` dict by naming five constructors of the `/audit` verification object. A sixth constructor added elsewhere in `control_plane/main.py` is outside it and the test stays green. `docs/reports/r6-headstate.md` states this limit for `POST_PROOF_SITES` and does not state it for this test.
+
+**Scope.** Either derive the constructors (which needs a selector over them, and a selector is a claim - see the route-parity scoping in README's Residual Limits for where that argument goes), or state the limit in the test's own docstring the way `POST_PROOF_SITES` and `UNDETECTED_COMPOSITIONS` state theirs. The second is one paragraph and is the R6 convention.
+
+### `tests/test_record_profile.py` fails in one recorded collection order
+
+Raised in Phase 3c-3g, mechanism unestablished, carried through 3c-3h.
+
+The module passes alone and passes in CI, and fails in a recorded multi-module collection order. Nothing has established why. It is not a flake in the sense of being timing-dependent: the order reproduces it.
+
+**Reproduction pointer:** `docs/reports/phase-3c3g.md` records the order and the failure. `docs/reports/phase-3c3d-order-sweep.md` is the instrument for this class - eleven modules run alone against a destroyed and rebuilt ledger, with the failing set diffed against the alphabetical baseline - and is the shape the diagnosis should take.
 
 ### ImmuDB TLS
 ImmuDB's REST API communicates over plain HTTP on the internal Docker network (`http://immudb:8080`). Internal Docker traffic is isolated from the host, but TLS should be enforced for defence-in-depth and to satisfy stricter SOC2 transport encryption requirements.
@@ -61,7 +157,22 @@ The `workload-registrar` script currently runs exactly once at startup. If it ex
 
 - SPIRE `insecure_bootstrap` and `trust_domain` (`spire/agent/agent.conf`, `spire/server/server.conf`) are documented only in an inline comment, with no project-docs claim and no test (found in the Phase 2 completion pass B config sweep, `docs/reports/phase-2-completion-b.md`).
 - Vault tool round trip is ~15s (a fresh Python interpreter per call, no persistent MCP session); Envoy's route timeout was raised to 45s to accommodate it (`docs/reports/phase-2.md`).
-- Writing a new mapping row can retire a historical baseline entry by making a stem generic; instanced by `docs/reports/phase-1-3.md` row 16 during `p3c1-complete` (`docs/adr/0013-mapping-table-self-check.md`). The same coupling runs the other way and is easier to trip: ordinary prose added to a *cited* document can make a word distinctive that was previously absent from it, which rewrites the reason string of a historical baseline entry and fails the build on a row nobody touched. Instanced during `p3c2-defer`: one word in a new README bullet changed `docs/reports/phase-3a.md` row 8's baselined reason from one selected term to two. Resolved by rewording the new prose, not by editing the quarantine record, since the row itself had not changed (`docs/reports/phase-3c2.md`).
+### Every service mounts every writer's private key (D22 item)
+
+Raised in review of the Phase 3c-3c completion pass. `./keys:/keys:ro` is mounted by `ail-control-plane`, `verifier`, `decision-service`, `anchor-service` and `immudb` in `docker-compose.yml`, so each of them holds **every** writer's private key. The services are separated only by which path their own `AIL_WRITER_SIGNING_KEY` points at, which is a configuration convention rather than a boundary.
+
+**What this costs.** D22's stated purpose was that "a bundle's `writer_key_fingerprint` names which service wrote the record". It does not: any of those services can read `/keys/writer-decision.key` and produce a signature indistinguishable from the decision service's own. The fingerprint names a key, and the key does not name a component. That matters exactly when it would be relied on, which is after one of them is compromised: a compromised control plane can forge a record attributed to the decision service, and no check in this project distinguishes that from the real thing.
+
+**What is unaffected.** Per-key revocation, because `tools/ail_verify_bundle.py`'s deny-list operates on key fingerprints rather than on services. And the refusal of an unsigned record.
+
+**Scope.** Give each service a mount of only the key it is configured to use (`./keys/writer-decision.key:/keys/writer-decision.key:ro` and so on).
+
+**`immudb` gets its own directory holding only the signing key** (decided in review of the completion pass, and the awkward part of the split). It mounts `keys/` for `--signingKey=/keys/signing.key` and has no writer key of its own, so a naive per-service split still leaves the ledger server able to read every writer key it has no use for - which is the same defect this item exists to close, moved rather than removed. A separate directory is the answer rather than a per-file mount, because `--signingKey` names a path inside a directory the server also walks, and because it makes "what may ImmuDB see" a question with a directory listing for an answer instead of a mount list to audit. The claim in `docs/adr/0012-writer-signing-and-external-anchoring.md` and `readME.md` §5 is corrected to what the mechanism actually supports in the meantime, rather than left standing until this is done.
+
+### Corpus coupling in the mapping check
+
+- Writing a new mapping row can retire a historical baseline entry by making a stem generic; instanced by `docs/reports/phase-1-3.md` row 16 during `p3c1-complete` (`docs/adr/0013-mapping-table-self-check.md`). The same coupling runs the other way and is easier to trip: ordinary prose added to a *cited* document can make a word distinctive that was previously absent from it, which rewrites the reason string of a historical baseline entry and fails the build on a row nobody touched. Instanced during `p3c2-defer`: one word in a new README bullet changed `docs/reports/phase-3a.md` row 8's baselined reason from one selected term to two. Resolved by rewording the new prose, not by editing the quarantine record, since the row itself had not changed (`docs/reports/phase-3c2.md`). Both directions fired again in Phase 3c-3c, three times in one phase, always resolved the same way.
+- A third shape, and the one no run of the checker reports: **a row can cite a document that is itself wrong.** Class (b) asks whether a cited section contains a distinctive term from the claim, so a claim that is false and a cited section that repeats the same false thing agree perfectly and the row passes. Instanced in the Phase 3c-3c completion pass: `readME.md` §5 said a `writer_key_fingerprint` names which service wrote a record, citing `docs/adr/0012-writer-signing-and-external-anchoring.md`, which is where the claim originates and where it was equally wrong - and `readME.md` §3.4 said a proof failure produces no ledger entry, citing `docs/adr/0005-outcome-taxonomy.md`, same shape. Correcting only the citing document leaves the citation pointing at the uncorrected source, and correcting only the source leaves the citing document wrong; the checker is satisfied either way, and in both instances above it was satisfied while both documents were wrong. Nothing mechanical catches this. What it means in practice: when a phase changes behaviour, sweep for the old claim's *wording* across the corpus rather than fixing the sites a review happened to name, and fix the cited source as well as the citing row.
 
 ---
 

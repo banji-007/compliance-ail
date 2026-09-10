@@ -180,13 +180,25 @@ def _check_offline(bundle: dict, key_path=None):
 # Helpers that drive the real services
 # ---------------------------------------------------------------------------
 
-def _write(key: bytes, value: bytes) -> dict:
+def _write(key: bytes, value: bytes, view: str | None = "decision") -> dict:
+    # D32 (Phase 3c-3b): a decision or intent record takes /write-ordered,
+    # because it needs a commit position in the same transaction that
+    # commits it and a record with no position is absent from every ordered
+    # page. P3c3c-2 (Phase 3c-3c) made that a rule the route enforces rather
+    # than a convention, so the plain route now refuses such a record
+    # outright. `view=None` keeps the plain route for the record kinds that
+    # take no position, which is what a tombstone is.
+    body = {
+        "key": base64.b64encode(key).decode(),
+        "value": base64.b64encode(value).decode(),
+    }
+    route = "/write"
+    if view is not None:
+        route = "/write-ordered"
+        body["view"] = view
     resp = httpx.post(
-        f"{VERIFIER_URL}/write",
-        json={
-            "key": base64.b64encode(key).decode(),
-            "value": base64.b64encode(value).decode(),
-        },
+        f"{VERIFIER_URL}{route}",
+        json=body,
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
         timeout=30,
     )

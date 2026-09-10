@@ -106,6 +106,24 @@ credentialed or not.
   same discipline ADR-0007 already established for the control plane's own
   two keys.
 
+  **What that validates is route separation, and it says nothing about side
+  effects (corrected 2026-09-03, Phase 3c-3f, P3c3f-11).** Which routes a
+  credential opens is a different claim from what those routes do, and the
+  natural reading of "read tier" - a credential that cannot change durable
+  state - was false here for two phases. `POST /verify` is gated by the read
+  key and advanced the verifier's persisted trust anchor on every call,
+  because it reported the ledger head with `client.currentState()` and the
+  SDK's handler persists what it reports. Driven by the Phase 3c-3e red team
+  on the read credential alone: four writes made straight to ImmuDB moved the
+  head from 11 to 15, the anchor stayed at 11 because nothing had asked the
+  verifier anything, and one `POST /verify` moved it to 15.
+
+  D47 (Phase 3c-3f) removed that mutation, so the read tier is side-effect
+  free on the routes that exist today - and that is a property with a test
+  behind it now (`tests/test_trust_anchor.py`) rather than an inference from
+  this bullet. The two claims stay separate: this ADR validates which routes a
+  key opens, and that file validates what those routes change.
+
 **Unchanged:**
 
 - **Reach, not just credentials, still matters.** `ail-control-plane` and

@@ -212,10 +212,18 @@ class ImmuDBLedger:
         encoded_val = base64.b64encode(serialized.encode()).decode()
 
         try:
-            with httpx.Client(timeout=15) as client:
+            # D32 (Phase 3c-3b): /write-ordered, not /write. One ExecAll
+            # commits the record, the advanced sequence counter and the view
+            # index entry in a single transaction, gated by a CAS on the
+            # counter, so a record cannot exist without its position. The
+            # caller's contract is unchanged: verified false or a transport
+            # error raises, and decision_service turns that into a denied
+            # call. The sequence is what makes /audit's page ordered by
+            # commit rather than by agent id.
+            with httpx.Client(timeout=30) as client:
                 resp = client.post(
-                    f"{self.verifier_url}/write",
-                    json={"key": encoded_key, "value": encoded_val},
+                    f"{self.verifier_url}/write-ordered",
+                    json={"key": encoded_key, "value": encoded_val, "view": "decision"},
                     headers={"X-API-Key": _VERIFIER_WRITE_KEY},
                 )
                 resp.raise_for_status()
@@ -226,7 +234,10 @@ class ImmuDBLedger:
                 raise RuntimeError(f"Ledger write not verified by SDK: {detail}")
 
             tx_id = result["tx_id"]
-            logging.info("Ledger write verified: tx=%d", tx_id)
+            logging.info(
+                "Ledger write verified: tx=%d seq=%s attempts=%s",
+                tx_id, result.get("seq"), result.get("attempts"),
+            )
             return tx_id
 
         except Exception as exc:
@@ -284,10 +295,16 @@ class ImmuDBLedger:
         encoded_val = base64.b64encode(serialized.encode()).decode()
 
         try:
-            with httpx.Client(timeout=15) as client:
+            # D32: intents take a position from the same shared counter and
+            # land in their own view index. One counter, two views, so the
+            # positions are comparable across both and "the newest N
+            # intents" is answerable without walking the key prefix - which
+            # is what P3c3b-7's bounded window needs in order for its bound
+            # to mean recency rather than lexicographic agent id.
+            with httpx.Client(timeout=30) as client:
                 resp = client.post(
-                    f"{self.verifier_url}/write",
-                    json={"key": encoded_key, "value": encoded_val},
+                    f"{self.verifier_url}/write-ordered",
+                    json={"key": encoded_key, "value": encoded_val, "view": "intent"},
                     headers={"X-API-Key": _VERIFIER_WRITE_KEY},
                 )
                 resp.raise_for_status()

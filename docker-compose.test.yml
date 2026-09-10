@@ -14,15 +14,22 @@
 #                         (tests/test_dashboard_auth.py); no other test
 #                         exercises it.
 #
-# anchor-service (D23, Phase 3b) is NOT included either, and its absence is
-# load-bearing rather than an omission. Anchoring is the project's one
+#   anchor-service     P3c3c-4, and in AIL_ANCHOR_MODE=reconcile-only only.
+#                         The sequence reconciliation lives in this service
+#                         and had no test coverage at all while the service
+#                         was absent.
+#
+# The ANCHORING half of anchor-service is still NOT included, and its absence
+# is load-bearing rather than an omission. Anchoring is the project's one
 # deliberately fail-open subsystem, so the whole integration suite runs with
 # it entirely broken: every bundle this stack exports says not_anchored, and
 # every write still succeeds. That is the P3b-5 demonstration, run on every
 # CI job rather than staged once. It is also why no test here submits to a
 # public transparency log: the live submission is a command-backed claim
 # (docs/reports/phase-3b.md), never a CI test that would make this suite
-# depend on a shared public service and on CI having egress.
+# depend on a shared public service and on CI having egress. reconcile-only
+# mode never calls anchor_once, never reads /state and holds no anchoring
+# key, so running the reconciler here takes nothing back from that.
 #
 # SPIRE, Envoy, Grafana, and Prometheus are NOT included. Tests run with
 # SPIRE_DISABLED=true so mTLS is bypassed - this file has no edge/backend
@@ -72,8 +79,21 @@ services:
       - VERIFIER_READ_KEY=${VERIFIER_READ_KEY:-test-verifier-read-key}
       - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY:-test-verifier-write-key}
       # D22 (Phase 3b): this service's own writer key - see
-      # docker-compose.yml's ail-control-plane service for why there are two.
+      # docker-compose.yml's ail-control-plane service for why there is one
+      # per writer.
       - AIL_WRITER_SIGNING_KEY=/keys/writer-control-plane.key
+      # D41 (Phase 3c-3d): the public half of the key the verifier signs
+      # fault records with. A ledger fault is presented on /audit as
+      # authoritative metadata about ANOTHER record's standing, so it is
+      # checked before it is rendered; a decision record's own state is
+      # reported as `asserted` and is never self-certified (D2), which is
+      # why that check is not extended to every row.
+      - AIL_FAULT_WRITER_PUBLIC_KEY=/keys/writer-verifier.pub
+      # D36 (Phase 3c-3c): declared, not left to four independent defaults.
+      # The reserve is bound into the ledger at first allocation and every
+      # reader refuses on disagreement, so this value and the verifier's and
+      # the anchor service's have to be the same string.
+      - AIL_RESERVED_POSITIONS=${AIL_RESERVED_POSITIONS:-1000000000}
     volumes:
       - ./policy:/policy:ro
       - ./keys:/keys:ro
@@ -147,13 +167,21 @@ services:
 
   verifier:
     build:
-      context: ./verifier
+      # D35 (Phase 3c-3c): built from the repo root so the image can
+      # carry provenance/ - this service signs the fault record it writes.
+      context: .
+      dockerfile: verifier/Dockerfile
     ports:
       # Loopback-only (P13-2) - see docker-compose.yml's verifier service for
       # why. tests/ run on the host (localhost), which this still reaches.
       - "127.0.0.1:8003:8003"
     environment:
-      - IMMUDB_ADDR=immudb:3322
+      # Substituted at invocation time so a test can put an interposer
+      # between this service and ImmuDB without changing anything on disk
+      # (P3c3d-6: the attack that proves `committed` is a fact about the
+      # ledger needs the write to commit and the NEXT RPC on the same
+      # connection to fail). Default unchanged.
+      - IMMUDB_ADDR=${IMMUDB_ADDR:-immudb:3322}
       - IMMUDB_USER=${IMMUDB_USER:-immudb}
       - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
       - IMMUDB_SIGNING_PUBKEY=/keys/signing.pub
@@ -162,6 +190,11 @@ services:
       # for the reasoning.
       - VERIFIER_READ_KEY=${VERIFIER_READ_KEY:-test-verifier-read-key}
       - VERIFIER_WRITE_KEY=${VERIFIER_WRITE_KEY:-test-verifier-write-key}
+      # D22/D35: this service's own writer key, for the fault record it
+      # writes about its own failed proofs.
+      - AIL_WRITER_SIGNING_KEY=/keys/writer-verifier.key
+      # D36: see ail-control-plane above.
+      - AIL_RESERVED_POSITIONS=${AIL_RESERVED_POSITIONS:-1000000000}
     volumes:
       - ./keys:/keys:ro
       - test-verifier-state:/data/verifier-state
@@ -216,6 +249,51 @@ services:
       timeout: 3s
       retries: 6
       start_period: 15s
+
+  # P3c3c-4 (Phase 3c-3c): the reconciler, running as a service, with
+  # anchoring entirely absent.
+  #
+  # Reconciliation lives in anchor_service because that service is already
+  # the right shape - a periodic loop that observes and never gates a write.
+  # Until this phase it was therefore exercised by no test at all, because
+  # anchor-service is absent from this file and its absence is load-bearing
+  # (see the header): the suite running with anchoring entirely broken is
+  # P3b-5's demonstration, and adding the anchoring loop here would destroy
+  # that property and make CI depend on egress to a public Rekor instance.
+  #
+  # AIL_ANCHOR_MODE=reconcile-only is what separates the two. The image is
+  # the same image; the loop runs reconciliation on its own interval and
+  # never calls anchor_once, never reads the verifier's /state, never
+  # submits anything, and needs no anchoring key. So the reconciler is
+  # genuinely running here and anchoring is still entirely absent from this
+  # stack - tests/test_reconciliation.py asserts both halves, the second by
+  # exporting a bundle and requiring it to say not_anchored.
+  anchor-service:
+    build:
+      context: .
+      dockerfile: anchor_service/Dockerfile
+    environment:
+      - AIL_ANCHOR_MODE=reconcile-only
+      - IMMUDB_URL=http://immudb:8080
+      - IMMUDB_USER=${IMMUDB_USER:-immudb}
+      - IMMUDB_PASSWORD=${IMMUDB_PASSWORD:-immudb}
+      # D36: see ail-control-plane above.
+      - AIL_RESERVED_POSITIONS=${AIL_RESERVED_POSITIONS:-1000000000}
+      # Short enough that a test can create a condition and see the next
+      # pass find it, rather than mocking a pass and asserting on the mock.
+      - AIL_RECONCILE_INTERVAL_SECONDS=${AIL_RECONCILE_INTERVAL_SECONDS:-5}
+      # Every pass writes its verdict here. A file rather than a log line
+      # because a test has to read the running service's own output, and a
+      # file it can parse says the same thing without teaching the suite to
+      # scrape a log format. Removing the service leaves this file stale,
+      # which is what makes P3c3c-4's mutation fail loudly rather than skip.
+      - AIL_RECONCILE_REPORT_PATH=/reconcile/last.json
+    volumes:
+      - ./tests/.reconcile:/reconcile
+    depends_on:
+      immudb:
+        condition: service_healthy
+    restart: unless-stopped
 
   # D6 (Phase 1.1) only - dashboard/middleware.ts's own caller auth, tested
   # by tests/test_dashboard_auth.py. No other test in this suite depends on

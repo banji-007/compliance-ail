@@ -74,3 +74,7 @@ keys/*.pub
 # delivered to the decision-service container only via a Compose secret.
 # Never commit it, same reasoning as the signing key above.
 decision_service/secrets/vault_api_token.txt
+# P3c3c-4: the reconcile-only anchor-service's per-pass verdict, written
+# into a bind mount so a test can read the running service's own output.
+tests/.reconcile/*.json
+tests/.reconcile/*.json.tmp

@@ -230,11 +230,14 @@ def test_orphaned_intent_with_no_completion_surfaces_as_unknown():
         "content_state": "present",
         "profile": "mediated",
     }
+    # D32 (Phase 3c-3b): /write-ordered, because a record of this kind now
+    # takes a commit position in the same transaction that commits it, and
+    # a record with no position is absent from every ordered page.
     write_resp = httpx.post(
-        f"{VERIFIER_URL}/write",
-        json={"key": b64(key), "value": b64(json.dumps(entry))},
+        f"{VERIFIER_URL}/write-ordered",
+        json={"key": b64(key), "value": b64(json.dumps(entry)), "view": "intent"},
         headers={"X-API-Key": VERIFIER_WRITE_KEY},
-        timeout=15,
+        timeout=30,
     )
     write_resp.raise_for_status()
     assert write_resp.json().get("verified"), write_resp.json()

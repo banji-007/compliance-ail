@@ -39,12 +39,14 @@ keygen:
 	@# operational matter, not a credential the platform mints.
 	@#   writer-decision      decision-service signs decision + intent records
 	@#   writer-control-plane the control plane signs erasure tombstones
+	@#   writer-verifier      the verifier signs the fault record (D35)
 	@#   anchor-signing       anchor-service signs Rekor submissions
-	@# Two writer keys, not one, so a bundle's writer_key_fingerprint names
-	@# which service wrote the record, and so one writer can be put on a
-	@# checker's deny-list without revoking the other. See
-	@# docs/adr/0012-writer-signing-and-external-anchoring.md.
-	@for name in writer-decision writer-control-plane anchor-signing; do \
+	@# One writer key per writer, not one shared key, so a bundle's
+	@# writer_key_fingerprint names which service wrote the record, and so one
+	@# writer can be put on a checker's deny-list without revoking the others.
+	@# Three writers since D35 (Phase 3c-3c) gave the verifier a record of its
+	@# own. See docs/adr/0012-writer-signing-and-external-anchoring.md.
+	@for name in writer-decision writer-control-plane writer-verifier anchor-signing; do \
 	  if [ -f keys/$$name.key ]; then \
 	    echo "keygen: keys/$$name.key already exists - reusing existing key."; \
 	  else \
