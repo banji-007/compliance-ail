@@ -6,6 +6,65 @@
 
 ---
 
+## What this is, and what it does not claim
+
+Every tool call an autonomous agent makes is intercepted, validated against a
+schema, decided by policy, and written to a tamper-evident ledger **before it
+executes**. A failure anywhere in that chain denies the call. That is the
+whole product; the rest of this file is how each link is built and what each
+one is worth.
+
+**What is enforced.** A call reaches its tool only after a cryptographic
+workload identity is presented (SPIFFE/SPIRE, mutual TLS), its arguments
+satisfy a Pydantic schema, an OPA policy evaluates to allow, and the decision
+is committed to ImmuDB. The four are ordered and none is skippable.
+
+**What is fail-closed.** Policy engine unreachable, ledger unreachable,
+identity unavailable, an unregistered tool, an empty credential: every one of
+these denies. There is exactly one subsystem in this project that fails open,
+external transparency-log anchoring, and it is bounded by fail-closed-on-the-
+claim: a bundle covering a state no log has seen says so in a field rather
+than staying silent.
+
+**What the ledger's account of itself guarantees.** The audit page is ordered
+by commit position, allocated under a compare-and-set the ledger enforces in
+the same transaction as the record it indexes. A write reports whether it
+committed as a fact read back from the ledger, or reports that it does not
+know; it never reports a committed record as never written, and it never
+treats a not-found read taken in the window right after a commit as evidence
+of absence. A proof that fails after a record has committed produces a
+durable, separately signed fault record rather than a repairable silence.
+
+**What is not claimed**, at the same resolution:
+
+- **Prompt injection is not prevented.** It is structurally constrained. The
+  model can be talked into anything; the gateway refuses the call anyway, and
+  section 4.4's Test 2 is that happening. What is claimed is that the denial
+  is a policy decision on a well-formed payload, not a text filter.
+- **Tamper-evidence is not forgery-resistance.** The proofs protect a record
+  already written. Anything holding the verifier's network position and a
+  valid credential can write a record this system treats as authentic.
+- **A bundle proves a record, not its truth.** It proves the record was
+  committed and has not changed. It does not prove the policy that produced
+  it was correct.
+- **A writer signature names a key, not a service.** Every service currently
+  mounts every writer key.
+- **Three of the four demo tools are `observed`**, meaning the agent retains
+  their real authority and a bypassed call produces no record at all. One
+  tool is mediated, and the difference is stated per tool rather than averaged
+  into a deployment-wide claim.
+- **The Helm chart does not deploy.** Section 4.7.
+
+Section 5's Residual Limits is the long form of this list, and nothing in this
+section is stronger than what is there.
+
+**Start here if you want to check a claim rather than read one:**
+`docs/walkthrough/README.md` verifies one real record, a prompt injection
+being refused, on your own machine with Python and one dependency. No Docker,
+no credentials, no network, and nothing from this project running anywhere.
+
+---
+
 ## 1. The Problem: LLM System Prompts Are Not a Security Boundary
 
 There is a critical architectural gap in enterprise security today. Organizations are deploying autonomous AI agents without enforceable controls.
@@ -271,6 +330,10 @@ The CISO Control Plane dashboard (Next.js 15, Tailwind, Shadcn UI) authenticates
 - Docker Desktop (Compose v2)
 - An OpenAI API key
 - 8 GB RAM available to Docker
+- `openssl` on PATH, for the signing keys in section 4.1a
+- Python 3.11+ if you want to verify an evidence bundle without running any
+  of this. That path needs nothing else on this list: see
+  `docs/walkthrough/README.md`.
 
 ### 4.1 Environment Configuration
 
@@ -328,6 +391,35 @@ with an environment variable naming only the path:
 `keys/*.key` and `keys/*.pub` are gitignored as a glob, so a key pair added
 later is ignored by default rather than committed by default.
 
+### 4.1a Generate the Signing Keys
+
+The stack will not come up without these. `make keygen` wraps them; the raw
+commands are published because `make` is not present on every machine, and
+these are what it runs:
+
+```bash
+mkdir -p keys decision_service/secrets
+
+for name in signing writer-decision writer-control-plane writer-verifier anchor-signing; do
+  openssl ecparam -genkey -name prime256v1 -noout -out keys/$name.key
+  openssl ec -in keys/$name.key -pubout -out keys/$name.pub
+  chmod 644 keys/$name.key keys/$name.pub
+done
+
+openssl rand -hex 32 > decision_service/secrets/vault_api_token.txt
+chmod 600 decision_service/secrets/vault_api_token.txt
+```
+
+Five P-256 pairs and one token. `keys/*.key` and `keys/*.pub` are gitignored
+as a glob, so a pair added later is ignored by default rather than committed
+by default. Re-running is safe only if you mean to rotate: replacing
+`keys/signing.key` invalidates the verifier's persisted trust anchor, so
+delete its volume (`docker compose down -v`) in the same pass.
+
+The test suite needs these too. Without them `tests/test_route_parity.py`
+reports one failure that looks like a code regression and is not: the writer
+key path it reads simply does not exist.
+
 ### 4.2 Boot the Full Stack
 
 ```bash
@@ -349,9 +441,9 @@ Allow approximately 60 seconds for all health checks to pass. Monitor with:
 docker compose ps
 ```
 
-This lists 13 of the 16 defined services as `healthy` or `running`. Three
+This lists 15 of the 18 defined services as `healthy` or `running`. Three
 (`token-generator`, `policy-validator`, `workload-registrar`) are one-shot
-init jobs that run once, exit `0`, and are gone by the time you check —
+init jobs that run once, exit `0`, and are gone by the time you check -
 `docker compose ps` does not list exited containers at all. To confirm
 those three actually succeeded, run `docker compose ps -a` and look for
 `Exited (0)` next to each.
@@ -367,7 +459,7 @@ The dashboard provides live policy management and the cryptographic audit ledger
 Attach to the running agent:
 
 ```bash
-docker attach compliance-ail-langgraph-demo-1
+docker compose attach langgraph-demo
 ```
 
 **Test 1 - Trigger a multi-framework denial (SOC2 + FinOps):**
@@ -420,7 +512,7 @@ Wait until `tenant_id` in the response reads `tenant_finance` and `allowed_cost_
 **Step 2.** Attach to the agent (unchanged, no tenant flag needed - it never reads one) and submit a request that would pass under the default tenant:
 
 ```bash
-docker attach compliance-ail-langgraph-demo-1
+docker compose attach langgraph-demo
 ```
 
 ```
@@ -439,6 +531,19 @@ Provision a t3.micro in eu-central-1 for the finance team for $5/hour. Tags: env
 ```
 
 Expected result: `APPROVED` - finance cost center is in the allowlist, encryption is satisfied, region is within GDPR-approved boundaries.
+
+**A warning that costs an afternoon if you skip it.** The tenant pin lives in
+the `opa` container's own environment, and it is only there because Step 1 put
+it there. Any later `docker compose` command that re-evaluates that service's
+configuration without `AIL_TENANT_ID` set in your shell will recreate `opa`
+against the **default** tenant, silently. `docker compose run langgraph-demo`
+does exactly this, because it starts the service's dependencies. Measured
+during this quickstart's last verification: the same Step 2 request was
+approved rather than denied, twice, because `opa` had been reverted without
+any message saying so. If a denial you expect does not appear, re-run the
+confirmation command above before assuming the policy is wrong; and prefer
+`docker compose attach langgraph-demo`, which touches nothing, over anything
+that starts containers.
 
 **Step 4.** Restore the default tenant when done:
 
@@ -622,20 +727,37 @@ Three consecutive phases required every mapping row to be derived and three cons
 | Control Plane API | FastAPI + SQLAlchemy + SQLite | Python 3.11 |
 | CISO Dashboard | Next.js 15, React 19, Tailwind CSS, Shadcn UI | Node 20 |
 | Observability | Prometheus + Grafana | 3.10.0 / 10.4.2 |
-| Container Runtime | Docker Compose | v2 (16 services) |
+| Container Runtime | Docker Compose | v2 (18 services) |
 | CI | GitHub Actions | ubuntu-latest |
 
 ---
 
 ## 8. Running the Integration Test Suite
 
-The integration test suite runs the enforcement pipeline against a minimal Docker stack (control plane + OPA + ImmuDB). SPIRE is bypassed via `SPIRE_DISABLED=true`.
+The integration test suite runs the enforcement pipeline against a minimal Docker stack. SPIRE is bypassed via `SPIRE_DISABLED=true`.
 
 ```bash
 make test-integration
 ```
 
-The CI pipeline (`.github/workflows/ci.yml`) runs this suite on every push to `main` and every pull request.
+`make` is not present on every machine, so the raw commands that target wraps are published too. Run them from the repository root, with the signing keys from section 4.1a already generated:
+
+```bash
+docker compose -f docker-compose.test.yml down -v
+docker compose -f docker-compose.test.yml up -d --build --wait
+sleep 15   # OPA's first bundle poll; opa-config.yaml sets min_delay_seconds: 10
+
+set -a; . ./.env; set +a
+SPIRE_DISABLED=true   OPA_URL=http://localhost:8181/v1/data/ail/main/evaluation   DECISION_SERVICE_URL=http://localhost:8010/decide   AIL_BUNDLE_NAME=${AIL_BUNDLE_NAME:-ail-policies}   CONTROL_PLANE_URL=http://localhost:8002   IMMUDB_URL=http://localhost:8080   VERIFIER_URL=http://localhost:8003   python -m pytest tests/ -q
+
+docker compose -f docker-compose.test.yml down -v
+```
+
+The test stack is seven services, not the eighteen of the full one.
+
+**Expect this to be far slower away from CI's Linux runner.** Measured on Windows while writing this section: the invocation above reached 99 of 583 tests in about 25 minutes, with no failures, where CI completes all 583 in under four. It is the wall-clock that differs, not the verdict, at least as far as that run got. Two host-specific causes are known and recorded: `sigstore` cannot be installed alongside this project's `spiffe` pin on Windows, so the tests covering an anchored bundle cannot run there at all; and tests that drive service modules in-process resolve Compose service names (`verifier:8003`, `immudb`, `ail-control-plane:8002`) that do not exist outside the Compose network, which costs a resolver timeout per attempt.
+
+**Treat CI, not a local run, as the signal.** `.github/workflows/ci.yml` runs this suite on every push to `main` and every pull request. If you want a fast local check of one area, run that module directly (`python -m pytest tests/test_route_parity.py -q`), which needs the keys from section 4.1a and no stack at all.
 
 ---
 
