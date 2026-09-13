@@ -418,7 +418,14 @@ the repo's own wording.
 
 ## CI
 
-Recorded before this session closes.
+**Run `34763307518`, head `9bc5983`, conclusion `success`: 583 passed, 10
+skipped, no failures, in 3m19s.**
+
+That run covers every file this phase changed except the two corrections
+made after it (section 8's failure count and this section), which are
+documentation only. The phase changed no production code, so CI is confirming
+that the documentation edits broke nothing, not that behaviour is unchanged;
+behaviour is unchanged by construction.
 
 ---
 
@@ -433,11 +440,17 @@ Answered honestly, which is what the item asks for.
 - Both service counts, the directory-dependent attach command, the silently
   reversible tenant pin: fixed in place.
 - The local test suite not behaving like CI: stated in section 8 with a
-  measurement (99 of 583 in about 25 minutes on this host, no failures,
-  against CI's 583 in under four) and a pointer to run one module instead.
-  The raw commands in section 8 were all run in this session; the pytest
-  invocation was left running rather than driven to completion, and section 8
-  says what it reached rather than implying a full local pass.
+  measurement and a pointer to run one module instead. The raw commands there
+  were all run in this session; the pytest invocation was **left incomplete**
+  at 106 of 583 tests after about 40 minutes, with **2 failures**, against
+  CI's 583 in under four with none. Section 8 publishes those as a floor
+  rather than a total and says the run did not finish. The two failures were
+  not individually diagnosed, because identifying them would have meant
+  driving a multi-hour run that CI already answers in under four minutes;
+  they are consistent with the two recorded host-specific causes and that is
+  as far as this phase can honestly put it. An earlier draft of this report
+  and of section 8 said "no failures" on the strength of the first 99 tests,
+  which was wrong, and is corrected rather than quietly dropped.
 - What the system does not claim: now the first screen rather than the last
   section.
 
