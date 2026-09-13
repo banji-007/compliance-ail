@@ -87,6 +87,22 @@ Also here: the SPIRE-absent exit currently exists only as a side effect of `veri
 
 This is where the project becomes shareable.
 
+#### Phase 3d is split (decided in run `p3dshare`, 2026-09-13)
+
+The exit criterion above bundles two unrelated things: **verify-without-running**, which is about whether an outside party can check a claim, and **minimum footprint**, which is about how cheaply the thing deploys. Only the first gates a share.
+
+**3d-share (done, `docs/reports/phase-3dshare.md`).** The share's definition of done is verify-without-running plus claims-match-reality. Both existed already and neither had been assembled into something a stranger could follow: bundle verification was documented across ADRs and phase reports, and the quickstart had not been run end to end since seven sub-phases changed the system under it. `docs/walkthrough/README.md` is the front door; the README now leads with what the system does and does not claim.
+
+**Post-share phases, each with its own adversarial pass:**
+
+- **Policy as WASM.** The first named risk is the spike's own landmine: `data.system.bundles` is undefined under WASM, and every deny rule that reads it therefore denies everything. That is a fail-closed failure, which is the good direction, and it is also a total outage that no unit test of the Rego would catch. It gets named first in that phase's brief rather than found in its red-team pass.
+- **Periodic anchoring instead of ImmuDB**, which is what removes the ledger from the minimum deployment.
+- **Docker-free Observed**, the "running in minutes" half.
+
+**Why footprint was not the gate.** Footprint is adoption; it changes how many people try the thing. Verify-without-running and claims-match-reality are truth; they change whether what those people are told is accurate. A smaller footprint carrying overstated claims is worse than a large one carrying honest ones, and the ordering follows from that rather than from effort.
+
+Trajectory policy remains the post-share contribution, after the three above.
+
 ### Phase 4: Hosted deployment. Optional.
 
 Workers with the packs compiled to WASM, Durable Objects for session state, D1 for records, Rekor for anchoring. The spike returned GO WITH CHANGES: Rego stops carrying the revision, the host hashes module and data in the isolate, and the tenant id is bound into the data document with the policy asserting the match, so a concurrency mistake cannot decide one tenant's call against another's config.
