@@ -116,6 +116,38 @@ The module passes alone and passes in CI, and fails in a recorded multi-module c
 
 **Reproduction pointer:** `docs/reports/phase-3c3g.md` records the order and the failure. `docs/reports/phase-3c3d-order-sweep.md` is the instrument for this class - eleven modules run alone against a destroyed and rebuilt ledger, with the failing set diffed against the alphabetical baseline - and is the shape the diagnosis should take.
 
+### The startup diagnostic blames bundle naming when the cause is an empty credential
+
+Raised in Phase 3d-share (`docs/reports/phase-3dshare.md`, finding 1), which forbade production code changes and so could only fix the discoverable half. **This is the first fix of the next phase allowed to touch code.**
+
+A stranger who leaves one of `CONTROL_PLANE_READ_KEY`, `CONTROL_PLANE_WRITE_KEY`, `VERIFIER_READ_KEY` or `VERIFIER_WRITE_KEY` empty gets a stack that does not come up, and three layers of error message that all point somewhere else. The control plane answers 503 to every request whose gating key is empty, which is correct and documented (`readME.md` section 4.1). OPA then logs `Bundle load failed: server replied with Service Unavailable`, which names no cause. `decision_service/main.py` then crash-loops on the only message in the chain that carries a suggestion, and the suggestion is wrong:
+
+```
+STARTUP: bundle 'ail-policies' has no revision on OPA after 30s -
+opa-config.yaml's bundles: key and AIL_BUNDLE_NAME may not name the same bundle.
+RuntimeError: OPA bundle 'ail-policies' not loaded at startup - refusing to serve.
+```
+
+Bundle naming was fine in the observed instance and is not what fails here. The failure is fail-closed and therefore safe; it is the diagnosis that costs the time.
+
+**Reproduction:** set any one of the four credential variables to the empty string in `.env`, then `docker compose up -d --build`. The stack halts with `dependency failed to start: container <project>-decision-service-1 is unhealthy` and the message above. Confirmed in Phase 3d-share against `main`; the credential state was read with `docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}'`, because `.env` reads are blocked by policy in that environment.
+
+**Scope.** `decision_service/main.py`'s startup probe already distinguishes "OPA answered 200 with no revision" from "OPA is unreachable". What it does not do is ask OPA *why* it has no bundle. OPA's own status is available at `/v1/status` on its admin surface, and the bundle plugin reports its last activation error there. Either surface that in the raised message, or narrow the existing suggestion so it stops asserting a cause it has not checked. `readME.md` section 4.1a and the Prerequisites list now make the credential requirement hard to miss, which reduces how often this message is met and does not improve the message.
+
+### The `immuclient` reproduction is claimed and has never been run
+
+Raised in Phase 3d-share when the share draft's `immuclient` sentence was cut.
+
+`readME.md` line 244 states that "an auditor can reproduce the result offline with `immuclient` against the same signed state", and section 3.5 repeats it for the dashboard's audit table. No session in this project's history has run it. It survived Phase 3c's claim sweeps because nothing changed the lines carrying it, and a sweep checks the claims a phase touches.
+
+The related claim that *is* demonstrated, and should not be confused with this one: `tools/ail_verify_bundle.py` implements no cryptography of its own and runs every check inside `immudb-py==1.5.0`'s own code through `immudb.handler.verifiedGet.call()`, which `tests/test_offline_verify.py` asserts against the source. That covers "you do not have to trust this project's verifier". It does not cover "you can reproduce this without running any of this project's code at all", which is what the `immuclient` claim offers.
+
+**Why it matters more than its size.** It is an invitation aimed at the most sceptical reader. Someone who takes it up finds no walkthrough step, no worked command, and no recorded output, on a path the project told them to take. A subset of a documented claim is still a claim that has to be standable behind when someone acts on it.
+
+**Reproduction:** there is none yet, which is the item. Start from `docs/walkthrough/injection-denied.json` and the signed state it names, and establish whether `immuclient` can verify that record from the bundle's material alone.
+
+**Scope.** Drive it. If it works, document it as an optional walkthrough step in `docs/walkthrough/README.md` with its transcript, at which point the sentence becomes a demonstrated claim and can return to a share draft. If it does not work, or needs a running ImmuDB to be useful, `readME.md` line 244 and section 3.5 are a latent overclaim and get corrected instead. Either outcome closes it; the current state is that nobody knows which.
+
 ### ImmuDB TLS
 ImmuDB's REST API communicates over plain HTTP on the internal Docker network (`http://immudb:8080`). Internal Docker traffic is isolated from the host, but TLS should be enforced for defence-in-depth and to satisfy stricter SOC2 transport encryption requirements.
 
