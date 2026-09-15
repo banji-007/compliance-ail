@@ -1,8 +1,8 @@
 # Agentic Integrity Ledger (AIL)
 
-### Enterprise AI Compliance Gateway - Zero-Trust Policy Enforcement for Autonomous AI Agents
+A policy enforcement gateway for AI agent tool calls, with a tamper-evident audit ledger. Deterministic, fail-closed, and honest about its limits.
 
-[![Architecture: Zero-Trust](https://img.shields.io/badge/Architecture-Zero%20Trust-blue)](#) [![Identity: SPIFFE/SPIRE](https://img.shields.io/badge/Identity-SPIFFE%2FSPIRE-green)](#) [![Policy: OPA](https://img.shields.io/badge/Policy-Open%20Policy%20Agent-orange)](#) [![Audit: ImmuDB](https://img.shields.io/badge/Audit-ImmuDB%20Immutable-red)](#) [![CI: GitHub Actions](https://img.shields.io/badge/CI-GitHub%20Actions-black)](#) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](#)
+[![Integration Tests](https://github.com/banji-007/compliance-ail/actions/workflows/ci.yml/badge.svg)](https://github.com/banji-007/compliance-ail/actions/workflows/ci.yml)
 
 ---
 
@@ -67,9 +67,7 @@ no credentials, no network, and nothing from this project running anywhere.
 
 ## 1. The Problem: LLM System Prompts Are Not a Security Boundary
 
-There is a critical architectural gap in enterprise security today. Organizations are deploying autonomous AI agents without enforceable controls.
-
-As organizations deploy autonomous AI agents - systems built on LangGraph, AutoGen, CrewAI, or bespoke orchestration frameworks - they are commonly relying on **LLM system prompts** to enforce compliance rules. A typical implementation looks like this:
+Agents built on LangGraph, AutoGen, CrewAI or bespoke orchestration commonly rely on **LLM system prompts** to enforce compliance rules. A typical implementation looks like this:
 
 ```
 SYSTEM: You are a helpful cloud provisioning assistant. You must never
@@ -88,14 +86,6 @@ This approach is **not a security control**. It is a polite suggestion written i
 | **Model Drift** | A model update from your LLM provider can silently alter how system instructions are interpreted, breaking compliance guarantees you have never re-tested. |
 | **Hallucination** | Even a well-intentioned model can produce a tool call payload that violates a constraint it was instructed to follow, especially under complex multi-step reasoning chains. |
 | **Non-Determinism** | The same prompt does not produce the same output. A system that passes compliance testing today may fail in production tomorrow under identical conditions. |
-
-For a SOC2 Type II audit, GDPR Article 25 (Data Protection by Design), or any regulatory framework that requires **demonstrable, verifiable controls**, a language model instruction is inadmissible as a security boundary. An auditor will reject it and a breach attorney will exploit it.
-
-**The required architecture is a deterministic enforcement layer the LLM's own output cannot talk its way past.**
-
-The Agentic Integrity Ledger (AIL) is that layer. Through Phase 1 it was an **in-process hook**, not a network appliance beside the agent - `intercept_tool_call` ran inside the agent's own Python process, holding every credential the policy engine and ledger needed. Phase 2 moved the decision itself out: `interceptor/middleware.py::intercept_tool_call` is now a thin client that sends the tool call to a separate `decision_service` over an mTLS-authenticated channel and returns its verdict - the agent's own network position no longer reaches OPA's management API, the ledger's verifier, or the control plane at all (`docs/adr/0008-decision-service-boundary.md`). A cooperating agent - including one whose LLM has been successfully prompt-injected or jailbroken - cannot evade this, because the call is evaluated on its parameters regardless of what token sequence produced it. **This still does not make every tool call unbypassable.** For the three Python-function tools (`provision_cloud_server`, `query_database`, `deploy_to_production`), arbitrary code execution in the agent's own container can still call the underlying dummy function directly, or send one tool call to the decision service for evaluation and then act on a different one - their authority was never the gateway's to take away. Exactly one tool, `read_vault_secret`, is different: the gateway holds its credential exclusively, delivered to the decision service alone across an OS boundary the agent's container cannot cross, and an agent with arbitrary code execution in its own container cannot reach it by any means in the spike's own bypass list (`docs/reports/spike-mcp-mediation.md`). See the Residual Limits section (§5) for what this distinction means precisely, per tool.
-
-The LLM is treated as an **untrusted client**. The interceptor is the authority the LLM's output must pass through - it is not a perimeter the agent process itself is outside of.
 
 ---
 
@@ -176,9 +166,7 @@ There is no code path in which an infrastructure failure results in a silent app
 
 ## 3. Core Capabilities
 
-### 3.1 Zero-Trust Data Plane: Cryptographic Workload Identity
-
-Static API keys are a liability. They can be leaked, rotated incorrectly, shared across workloads, and do not encode any information about the actual workload making a request.
+### 3.1 Workload Identity: Ephemeral Certificates, Not Static Keys
 
 AIL uses **SPIFFE/SPIRE** (the CNCF standard for workload identity) to issue ephemeral X.509 SVIDs (SPIFFE Verifiable Identity Documents) to each AI agent at runtime.
 
@@ -206,7 +194,7 @@ This catches hallucinated or malformed payloads - missing required fields, wrong
 
 ### 3.3 Multi-Tenant Policy Isolation
 
-AIL is architected for SaaS deployment. Each tenant receives a **dynamically generated OPA bundle** served by the control plane.
+Each tenant receives a **dynamically generated OPA bundle** served by the control plane, so two tenants' policies are different Rego, not one policy branching on a tenant field. Section 4.5 drives that difference: the same request is approved under `tenant_default` and denied under `tenant_finance`, with the denial naming that tenant's own allowlist.
 
 The bundle contains:
 - The tenant's enabled compliance framework Rego policies (toggleable: GDPR, SOC2, FinOps, HIPAA)
